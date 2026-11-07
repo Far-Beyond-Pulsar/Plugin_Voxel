@@ -6934,8 +6934,8 @@ impl ChunkWorld {
         (moved, prev)
     }
 
-    /// The sun's occlusion by the terrain (`helio_pass_shadow_matrix::
-    /// sun_occlusion`, `sun_pages`): the pages the shadow passes asked for
+    /// The sun's occlusion by the terrain (`helio_light_api::sun_occlusion`):
+    /// the pages the shadow passes asked for
     /// (read back), those the terrain changed under (chunks generated or
     /// dug, volumes moved), the epochs for the sun toward `sun`; then the
     /// pages planned, traced as orthographic views along their epoch's sun
