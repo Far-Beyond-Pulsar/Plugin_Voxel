@@ -39,8 +39,6 @@ tracing = { workspace = true }
 helio = { workspace = true }
 helio-feature-api = { workspace = true }
 helio-settings = { workspace = true }
-helio-pass-volumetric-fog = { workspace = true }
-helio-pass-sky = { workspace = true }
 # The plugin's api (data formats) and feature crates.
 helio-voxel-data = { workspace = true }
 helio-pass-voxel-planet = { workspace = true }
@@ -54,6 +52,9 @@ fog_component = { workspace = true }
 post_component = { workspace = true }
 foliage_component = { workspace = true }
 sky_component = { workspace = true }
+# Their rows, which the tests compare the composed instances with.
+helio-pass-volumetric-fog = { workspace = true }
+helio-pass-sky = { workspace = true }
 helio-pass-foliage-place = { workspace = true }
 bytemuck = { workspace = true }
 wgpu = { workspace = true }

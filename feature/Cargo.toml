@@ -28,7 +28,6 @@ helio-mats = { workspace = true }
 helio-gi-api = { workspace = true }
 # Foliage grows on the terrain (`chunks::ground`).
 helio-foliage-api = { workspace = true }
-helio-pass-shadow-matrix = { workspace = true }
 image = { workspace = true }
 # Kept chunks in edit snapshots (`ChunkWorld::kept_snapshot`).
 miniz_oxide = { version = "0.8" }

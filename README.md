@@ -31,7 +31,7 @@ draw phases and api crates.
 - **Requires**: nothing. A project enables or disables the plugin in its
   `Pulsar.toml` (`[plugins]`); disabled, the kind is absent and the frame
   draws without it.
-- **Reads other kinds through**: `helio-pass-volumetric-fog` (fog); `helio-foliage-api` (foliage); `helio-gi-api` (gi); `helio-light-api, helio-pass-shadow-matrix` (lights); `helio-mats` (materials); `helio-pass-sky` (sky); `helio-water-api` (water).
+- **Reads other kinds through**: `helio-foliage-api` (foliage); `helio-gi-api` (gi); `helio-light-api` (lights); `helio-mats` (materials); `helio-water-api` (water).
 - **Its standalone hosts also compose**: `helio-pass-decal` (decals); `helio-pass-volumetric-fog` (fog); `helio-pass-foliage-gbuffer, helio-pass-foliage-place` (foliage); `helio-pass-gi` (gi); `helio-pass-flare, helio-pass-lens` (lens); `helio-light-api, helio-light-host` (lights); `helio-mats` (materials); `helio-mesh-api, helio-mesh-host, helio-pass-forward-lit` (meshes); `helio-pass-corona` (particles); `helio-pass-portal-cull, helio-pass-portal-instances` (portals); `helio-pass-post-volumes` (post); `helio-pass-sky` (sky); `helio-pass-sprite-batch` (sprites); `helio-pass-water-sim` (water) (demos and GPU tests
   draw a whole scene; the plugin itself does not depend on these).
 
