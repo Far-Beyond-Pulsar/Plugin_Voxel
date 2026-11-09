@@ -1,6 +1,7 @@
 //! What the voxel plugin registers for the editor (the `editor` feature):
 //! its tool modes, the sculpt stroke, the save hook, the generator
-//! follow-up and the terrain's camera framing.
+//! follow-up, the terrain's camera framing and the inspector's editors of
+//! its feature lists.
 
 use ui_level_editor::extend::{
     CameraFraming, Interaction, PropertyFollowUp, SaveHook, ToolModeRegistration,
@@ -72,3 +73,9 @@ inventory::submit! {
         frame: level_editor::frame_terrain,
     }
 }
+
+// ── Inspector editors ───────────────────────────────────────────────────────
+
+// The terrain's feature lists edit as reflected lists (one card per entry).
+ui_common::register_reflected_list_editor!(voxel_component::VoxelFeatureSpawn);
+ui_common::register_reflected_list_editor!(voxel_component::VoxelFeatureGrowth);

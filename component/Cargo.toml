@@ -9,10 +9,7 @@ name = "voxel_component"
 
 [dependencies]
 engine_class_derive = { workspace = true }
-# Enum properties get a dropdown editor, which needs the GPUI-typed prims (as helio-component).
-pulsar_reflection = { workspace = true, features = ["prims-gpui"] }
-# The `Reflectable` derive's generated enum dropdowns name `gpui`.
-gpui-ce = { workspace = true }
+pulsar_reflection = { workspace = true }
 pulsar_scenedb = { workspace = true }
 pulsar_scene_model = { workspace = true }
 pulsar_world_registry = { workspace = true }

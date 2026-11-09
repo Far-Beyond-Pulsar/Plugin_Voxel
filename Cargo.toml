@@ -12,7 +12,7 @@ autoexamples = false
 # interaction, the save hook, the generator follow-up, the terrain's camera
 # framing) and the crates they need. A game links the root without it, so it
 # takes no editor dependency.
-editor = ["dep:voxel_editor", "dep:ui_level_editor"]
+editor = ["dep:voxel_editor", "dep:ui_level_editor", "dep:ui_common"]
 
 [dependencies]
 # The plugin gate and the registrations' collection.
@@ -21,6 +21,7 @@ inventory = { workspace = true }
 # The plugin's crates.
 voxel_component = { workspace = true }
 voxel_editor = { workspace = true, optional = true }
+ui_common = { workspace = true, optional = true }
 helio-pass-voxel-planet = { workspace = true }
 # The engine seams the plugin registers into.
 engine_backend = { path = "../../../crates/core/engine_backend", default-features = false, features = ["render"] }
