@@ -5,6 +5,14 @@
 //! loaded as the editor loads it and its ground, features, air, haze,
 //! clouds, wind, meadow, exposure and camera are compared with voxel_flight's.
 
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+// The kinds a voxel world composes register through their roots.
+use fog_plugin as _;
+use foliage_plugin as _;
+use post_plugin as _;
+use sky_plugin as _;
+
 use std::path::Path;
 
 use engine_backend::scene::EditorCamera;
@@ -20,7 +28,7 @@ use voxel_component::presets::VoxelWorldPreset;
 use voxel_component::{VoxelTerrainComponent, VoxelWorldShape};
 
 #[allow(dead_code)]
-#[path = "../../examples/voxel_flight/worlds.rs"]
+#[path = "../examples/voxel_flight/worlds.rs"]
 mod flight;
 
 use flight::Preset;
@@ -30,7 +38,7 @@ use flight::Preset;
 /// scene steps do), and its camera.
 fn level(name: &str) -> (World, EditorCamera) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../../../../assets/examples/{name}/scene/default.level"
+        "../../../assets/examples/{name}/scene/default.level"
     ));
     let mut scene = engine_backend::scene::new_scene();
     let extras = engine_backend::scene::RuntimeLevel::load_into(&path, &mut scene.world)

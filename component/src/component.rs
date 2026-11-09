@@ -396,6 +396,12 @@ impl Default for VoxelTerrainComponent {
 }
 
 impl VoxelTerrainComponent {
+    /// The block-broken events queued for listeners that have not run yet
+    /// (delivered on the component's next tick).
+    pub fn pending_block_broken(&self) -> &[BlockData] {
+        &self.pending_block_broken
+    }
+
     /// A planet of `radius` metres with Helio's terrain generator and 0.1 m
     /// voxels. Add a [`VoxelTerrainLayersComponent`] to shape its continents and
     /// mountains.

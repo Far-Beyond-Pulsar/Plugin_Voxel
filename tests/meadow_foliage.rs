@@ -1,6 +1,11 @@
 //! Helio's voxel meadow is a level's foliage: every row of it, tall stands
 //! included, comes back from its component bit for bit.
 
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+// The kinds a voxel world composes register through their roots.
+use foliage_plugin as _;
+
 use foliage_component::FoliageComponent;
 
 #[test]

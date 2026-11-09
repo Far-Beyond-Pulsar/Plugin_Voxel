@@ -1,9 +1,11 @@
-//! SceneDB World registration for voxel authoring components.
+//! The voxel authoring components as SceneDB World classes (the plugin's
+//! root crate registers them, `submit_world_component!`) and the terrain's
+//! component runtime (its block events).
 //!
-//! Registration never invokes rendering or generation: the voxel backend
-//! reads the terrain and layer instances when it projects the scene.
+//! Neither invokes rendering or generation: the voxel backend reads the
+//! terrain and layer instances when it projects the scene.
 
-use engine_class_derive::{register_component_runtime, register_world_component};
+use engine_class_derive::{register_component_runtime, world_component};
 
 use crate::{TerrainEventsEventWriterExt as _, VoxelTerrainComponent, VoxelTerrainLayersComponent};
 
@@ -71,9 +73,9 @@ impl VoxelTerrainComponent {
     }
 }
 
-#[register_world_component]
+#[world_component]
 impl VoxelTerrainComponent {}
 
 // Settings of the terrain on the same object, read when it is projected.
-#[register_world_component]
+#[world_component]
 impl VoxelTerrainLayersComponent {}

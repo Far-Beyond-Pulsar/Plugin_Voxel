@@ -1,3 +1,6 @@
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+
 use pulsar_reflection::EngineClass;
 use voxel_component::{VoxelTerrainComponent, VoxelTerrainLayersComponent};
 

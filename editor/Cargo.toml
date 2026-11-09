@@ -1,33 +1,24 @@
 [package]
-name = "voxel_plugin"
+name = "voxel_editor"
 version = "0.1.0"
 edition = "2024"
-description = "Voxel worlds (pulsar.voxel): the editor plugin -- its metadata and the voxel terrain's inspector editors, over the plugin's component crate"
+description = "Voxel worlds (pulsar.voxel): the editor crate -- the voxel terrain's inspector editors and the level editor's voxel tools, over the plugin's component crate; the plugin's root crate registers the tools"
 
 [lib]
-name = "voxel_plugin"
-
-[features]
-# Statically linked hosts (the editor) use the Rust API; the inspector
-# editors register through `inventory` once the crate is linked, and the
-# component crate (with everything it registers) comes with it.
-builtin = []
+name = "voxel_editor"
 
 [dependencies]
 voxel_component = { workspace = true }
 helio-pass-voxel-planet = { workspace = true }
 helio_component = { workspace = true }
-plugin_editor_api = { workspace = true }
 # The property editors' GPUI-typed prims (as helio-component).
 pulsar_reflection = { workspace = true, features = ["prims-gpui"] }
 gpui-ce = { workspace = true }
 ui = { workspace = true }
 serde_json = { workspace = true }
-# The level editor UI: registrations through its extension points
-# (`ui_level_editor::extend`), each naming its origin.
+# The level editor UI the root registers through its extension points
+# (`ui_level_editor::extend`).
 ui_level_editor = { workspace = true }
-inventory = { workspace = true }
-pulsar_plugins = { workspace = true }
 rust-i18n = { workspace = true }
 ui_common = { workspace = true }
 engine_backend = { workspace = true }
@@ -38,11 +29,8 @@ profiling = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-# The inspector tests (tests/inspector.rs): the shared inspector and a
-# headless window.
-gpui-ce = { workspace = true, features = ["test-support"] }
-ui_common = { workspace = true }
-pulsar_reflection = { workspace = true }
+# The unit tests register `VoxelTerrainComponent`'s class themselves (`lib.rs`).
+pulsar_world_registry = { workspace = true }
 
 [lints]
 workspace = true
