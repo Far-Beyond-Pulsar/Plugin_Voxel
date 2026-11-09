@@ -1,6 +1,9 @@
 //! The voxel terrain's scripting surface (blocks, fills, ray casts), called
 //! the way scripts call them.
 
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+
 use std::any::Any;
 
 use glam::DVec3;

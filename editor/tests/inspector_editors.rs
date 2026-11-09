@@ -3,7 +3,7 @@
 
 use helio_pass_voxel_planet::terrain::{GeneratorInfo, generators};
 use voxel_component::VoxelGeneratorRef;
-use voxel_plugin::generator_editor::generator_items;
+use voxel_editor::generator_editor::generator_items;
 
 fn choice(id: &str, version: u32, name: &str) -> GeneratorInfo {
     GeneratorInfo {
@@ -18,7 +18,7 @@ fn choice(id: &str, version: u32, name: &str) -> GeneratorInfo {
 #[test]
 fn the_generator_picker_lists_registered_generators_and_searches_them() {
     use ui::dropdown::DropdownItem;
-    let titles = |items: &[voxel_plugin::generator_editor::GeneratorItem]| {
+    let titles = |items: &[voxel_editor::generator_editor::GeneratorItem]| {
         items
             .iter()
             .map(|i| i.title().to_string())
@@ -52,7 +52,7 @@ fn the_generator_picker_lists_registered_generators_and_searches_them() {
 #[test]
 fn a_kind_edit_takes_the_kinds_defaults() {
     use voxel_component::{VoxelLayerKind, VoxelLayerMask, VoxelTerrainLayer};
-    use voxel_plugin::stack_editor::set_layer;
+    use voxel_editor::stack_editor::set_layer;
     let craters = VoxelTerrainLayer::new(VoxelLayerKind::Craters);
     let mut layer = VoxelTerrainLayer {
         mask: VoxelLayerMask::Land,

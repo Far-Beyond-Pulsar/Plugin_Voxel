@@ -9,7 +9,7 @@
 //! have settled and the editor would hold that frame on screen.
 //!
 //! ```text
-//! cargo run --release -p voxel_component --example voxel_editor_harness -- \
+//! cargo run --release -p voxel_plugin --example voxel_editor_harness -- \
 //!     <level> <out dir> [width height] [steps...]
 //! ```
 //!
@@ -54,6 +54,15 @@
 //! Every frame's wall time (CPU and GPU, the queue drained) and the render
 //! thread's phases (`pointer`, `scene`, `publish`, `render`, ...) are
 //! written to `frames.csv`, and a summary per step to stdout.
+
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+// The kinds a voxel world composes register through their roots.
+use fog_plugin as _;
+use foliage_plugin as _;
+use lights_plugin as _;
+use post_plugin as _;
+use sky_plugin as _;
 
 use engine_backend::subsystems::render::{
     EditorCameraState, HelioRenderer, PendingPointerEvent, ToolRay,
