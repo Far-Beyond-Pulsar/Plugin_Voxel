@@ -151,7 +151,11 @@ fn voxel_terrain_joins_every_preset_with_a_gbuffer() {
         .clone()
         .with_tsr_quality(helio::TsrQuality::Quality)
         .with_feature(helio_pass_voxel_planet::VoxelSettings::default());
-    for preset in [Preset::Deferred, Preset::DeferredFxaa, Preset::Hlfs] {
+    for preset in [
+        Preset::Deferred,
+        Preset::DeferredFxaa,
+        Preset::Model(helio_light_host::HLFS),
+    ] {
         let graph = fixtures.build(preset);
         let chunks = graph
             .find_pass::<ChunkPass>()
