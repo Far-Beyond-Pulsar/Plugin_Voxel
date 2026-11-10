@@ -29,6 +29,7 @@ helio = { workspace = true }
 helio-core = { workspace = true }
 helio-components = { workspace = true }
 helio-feature-api = { workspace = true }
+helio-frame-api = { workspace = true }
 helio-mesh-api = { workspace = true }
 helio-presets = { workspace = true }
 helio-xr = { workspace = true }
