@@ -5,6 +5,9 @@
 //! renderer given the saved journal restores them by copy instead of
 //! generating them from the terrain and every edit.
 
+// The plugin as a game links it: its root, with every registration.
+use voxel_plugin as _;
+
 use std::sync::Arc;
 use std::time::Duration;
 

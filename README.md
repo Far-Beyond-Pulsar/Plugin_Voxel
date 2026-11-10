@@ -19,15 +19,20 @@ draw phases and api crates.
 
 | Crate | Path | What |
 |---|---|---|
+| `voxel_plugin` | `./` | Voxel Worlds (`pulsar.voxel`): the plugin's root crate, the one place it registers everything it contributes (runtime registrations always, the editor's with `editor`) |
 | `helio-voxel-data` | `api/` | Renderer-independent voxel data and SceneDB publication contract |
-| `voxel_component` | `component/` | Voxel worlds (pulsar.voxel): the voxel terrain components, their methods and runtime, the voxel file formats, ready-made worlds, and the registrations of the plugin's Helio feature |
-| `voxel_plugin` | `editor/` | Voxel worlds (pulsar.voxel): the editor plugin -- its metadata and the voxel terrain's inspector editors, over the plugin's component crate |
+| `voxel_component` | `component/` | Voxel worlds (pulsar.voxel): the voxel terrain components, their methods and runtime, the voxel file formats, ready-made worlds, and the plugin's Helio feature set; the plugin's root crate registers them |
+| `voxel_editor` | `editor/` | Voxel worlds (pulsar.voxel): the editor crate -- the voxel terrain's inspector editors and the level editor's voxel tools, over the plugin's component crate |
 | `helio-voxel-examples` | `examples/` | The voxel plugin's standalone hosts on Helio: Voxel Craft, Voxel Flight and Water World |
 | `helio-pass-voxel-planet` | `feature/` | Destructible voxel worlds, drawn: chunk-tree residency, generation, drawing and lighting as Helio passes over helio-voxel-world |
 | `helio-voxel-world` | `world/` | Destructible voxel worlds, the data: grid, terrain generators, edits, queries, planet maps and features, mirrored bit for bit by WGSL. No GPU. |
 
-- **Runtime module** (what a game built for a project links): `voxel_component`.
-- **Editor module** (what the editor links in addition): `voxel_plugin`.
+- **Root crate**: `voxel_plugin`. It is the one place the plugin submits
+  its contributions (component classes, features, scene seams, settings,
+  editor tools), each naming it as origin, so the plugin gate and the
+  plugin catalog see all of them. The other crates submit none (only type
+  attachments, such as a component's GPU mirror, stay with their types). A
+  game links the root without its `editor` feature; the editor links it with.
 - **Requires**: nothing. A project enables or disables the plugin in its
   `Pulsar.toml` (`[plugins]`); disabled, the kind is absent and the frame
   draws without it.
@@ -45,8 +50,8 @@ only inside a Pulsar-Native checkout:
 ```bash
 git clone --recursive https://github.com/Far-Beyond-Pulsar/Pulsar-Native
 cd Pulsar-Native
-cargo check -p helio-voxel-data -p voxel_component -p voxel_plugin -p helio-voxel-examples -p helio-pass-voxel-planet -p helio-voxel-world --tests
-cargo test -p helio-voxel-data -p voxel_component -p helio-pass-voxel-planet
+cargo check -p helio-voxel-data -p voxel_component -p voxel_plugin -p voxel_editor -p helio-voxel-examples -p helio-pass-voxel-planet -p helio-voxel-world --tests
+cargo test -p helio-voxel-data -p voxel_plugin -p voxel_component -p helio-pass-voxel-planet
 ```
 
 Suites that render real frames need a GPU; CI leaves them out by name

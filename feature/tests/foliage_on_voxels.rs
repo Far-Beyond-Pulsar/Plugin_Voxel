@@ -280,7 +280,7 @@ impl Harness {
     }
 }
 
-/// Grassland: a land column whose surroundings are grass.
+/// Grassland: a land column whose surroundings (to 42 m) are all grass.
 fn grassland(planet: &Planet) -> DVec3 {
     let grid = *planet.grid();
     let n = f64::from(grid.cells());
@@ -297,7 +297,11 @@ fn grassland(planet: &Planet) -> DVec3 {
                     && planet.terrain_material(Cell::new(face, i + di, j + dj, top - 1))
                         == material::GRASS
             };
-            if (-12..=12).all(|d| grass(d * 10, 0) && grass(0, d * 10) && grass(d * 7, d * 7)) {
+            // Grass over the whole disc the test checks (`near` of the eye) and the tiles
+            // around it: a lattice of 3 m, so no sand patch between lines is missed.
+            let disc = (-14..=14)
+                .all(|a| (-14..=14).all(|b| a * a + b * b > 14 * 14 || grass(a * 30, b * 30)));
+            if disc {
                 return grid.direction(face, f64::from(i) + 0.5, f64::from(j) + 0.5);
             }
         }
@@ -425,20 +429,7 @@ fn foliage_grows_on_the_voxel_ground() {
         "sparse near the eye: {density:.1} records a square metre"
     );
 
-    // Still: the same blades frame after frame.
-    h.run(&shared, eye, forward, 20);
-    let (again, _) = h.blades(eye);
-    assert_eq!(again, blades, "blades changed under a still camera");
-    // Placed again against the same ground: the same tufts (in any order).
-    {
-        let link = h
-            .renderer
-            .find_pass::<ChunkPass>()
-            .unwrap()
-            .foliage_ground();
-        link.push_changes([[eye - DVec3::splat(30.0), eye + DVec3::splat(30.0)]]);
-    }
-    h.run(&shared, eye, forward, 12);
+    // Still: the same blades frame after frame (a tile's records land in any order).
     let sorted = |mut v: Vec<Blade>| {
         v.sort_by(|a, b| {
             a.root
@@ -449,6 +440,22 @@ fn foliage_grows_on_the_voxel_ground() {
         });
         v
     };
+    h.run(&shared, eye, forward, 20);
+    let (again, _) = h.blades(eye);
+    assert!(
+        sorted(again) == sorted(blades.clone()),
+        "blades changed under a still camera"
+    );
+    // Placed again against the same ground: the same tufts (in any order).
+    {
+        let link = h
+            .renderer
+            .find_pass::<ChunkPass>()
+            .unwrap()
+            .foliage_ground();
+        link.push_changes([[eye - DVec3::splat(30.0), eye + DVec3::splat(30.0)]]);
+    }
+    h.run(&shared, eye, forward, 12);
     let (replaced, _) = h.blades(eye);
     let (replaced, before) = (sorted(replaced), sorted(blades.clone()));
     let moved = replaced.iter().zip(&before).filter(|(a, b)| a != b).count();

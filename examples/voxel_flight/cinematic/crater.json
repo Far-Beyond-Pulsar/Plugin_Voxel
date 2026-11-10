@@ -1,0 +1,16 @@
+{
+  "name": "crater",
+  "description": "A low pass that blasts craters ahead of the camera: edits show on the next frame.",
+  "fps": 24,
+  "seconds": 10,
+  "sun_elevation_deg": 18,
+  "keys": [
+    { "t": 0.0,  "altitude_m": 260, "distance_m": 0,    "heading_deg": 0, "pitch_deg": -14 },
+    { "t": 5.0,  "altitude_m": 110, "distance_m": 600,  "heading_deg": 0, "pitch_deg": -16 },
+    { "t": 10.0, "altitude_m": 150, "distance_m": 1500, "heading_deg": 0, "pitch_deg": -22 }
+  ],
+  "events": [
+    { "t": 3.0, "dig": { "radius_m": 60, "range_m": 1500 } },
+    { "t": 4.2, "dig": { "radius_m": 140, "range_m": 2500 } }
+  ]
+}

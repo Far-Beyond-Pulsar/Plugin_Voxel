@@ -1,66 +1,29 @@
-//! Voxel worlds (`pulsar.voxel`): the editor plugin.
+//! Voxel worlds (`pulsar.voxel`): the editor crate, over the plugin's
+//! component crate.
 //!
-//! The plugin's identity ([`VoxelPlugin`]) and the voxel terrain's inspector
-//! editors: the generator picker ([`generator_editor`]) and the layer stack
-//! ([`stack_editor`]), registered through `inventory` once the crate is
-//! linked. The components, their methods and runtime, the file formats and
-//! the renderer feature's registrations are the component crate's
-//! (`voxel_component`), which this crate links: the editor links this crate
-//! (through `installed_plugins`, as an installed plugin's editor module) and knows no voxel type.
+//! - The voxel terrain's inspector editors: the generator picker
+//!   ([`generator_editor`]) and the layer stack ([`stack_editor`]), each a
+//!   property editor hint of its type (registered with the type).
+//! - The level editor UI ([`level_editor`]): the sculpt and terrain tool
+//!   modes, their panels, strokes and their undo, the save hooks, the
+//!   generator follow-up and the terrain's camera framing, acting through
+//!   the component's methods.
 //!
-//! The sculpt and terrain tool modes, their panels, strokes and their undo,
-//! the save hooks and Create Voxel Terrain are this crate's
-//! ([`level_editor`]), acting through the component's methods.
+//! The level editor entries register nothing themselves: the plugin's root
+//! crate (`voxel_plugin`, with its `editor` feature) submits them through
+//! the level editor's extension points.
 
 // The level editor UI's text (`locales/`).
 rust_i18n::i18n!("locales", fallback = "en");
 
-/// The plugin's level editor UI, registered through the level editor's
-/// extension points (`ui_level_editor::extend`).
 pub mod level_editor;
 
-use plugin_editor_api::*;
+// The unit tests attach terrains to worlds, which takes a registered class.
+// A test build of this crate does not link the root crate (the root links
+// this crate under `editor`), so it registers the class itself; every other
+// build gets it from the root only.
+#[cfg(test)]
+pulsar_world_registry::submit_world_component!(voxel_component::VoxelTerrainComponent);
 
 pub mod generator_editor;
 pub mod stack_editor;
-
-/// The plugin's identity.
-#[derive(Default)]
-pub struct VoxelPlugin;
-
-impl VoxelPlugin {
-    /// The plugin id.
-    pub const ID: &'static str = "pulsar.voxel";
-}
-
-impl EditorPlugin for VoxelPlugin {
-    fn metadata(&self) -> PluginMetadata {
-        // The plugin's identity is its descriptor's (pulsar-plugin.toml).
-        let descriptor = voxel_component::plugin_descriptor();
-        PluginMetadata {
-            id: PluginId::new(descriptor.id),
-            name: descriptor.name,
-            version: "0.1.0".into(),
-            author: "Pulsar Team".into(),
-            description: descriptor.description,
-        }
-    }
-
-    fn file_types(&self) -> Vec<FileTypeDefinition> {
-        Vec::new()
-    }
-
-    fn editors(&self) -> Vec<EditorMetadata> {
-        Vec::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn has_the_plugin_id() {
-        assert_eq!(VoxelPlugin.metadata().id.as_str(), "pulsar.voxel");
-    }
-}

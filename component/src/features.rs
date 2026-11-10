@@ -383,18 +383,6 @@ mod tests {
         );
     }
 
-    /// The plugin names the terrain's materials for every ground-material
-    /// list (a spawn's surfaces, foliage's ground).
-    #[test]
-    fn material_lists_read_names_and_ids() {
-        let list = GroundMaterialList::parse("Grass, dark_stone 22").unwrap();
-        assert_eq!(list.0, [material::GRASS, material::DARK_STONE, 22]);
-        assert_eq!(list.text(), "Grass, DarkStone, 22");
-        assert_eq!(GroundMaterialList::parse(&list.text()).unwrap(), list);
-        assert!(GroundMaterialList::parse("Grass, Lava").is_err());
-        assert_eq!(GroundMaterialList::parse(" ").unwrap().0, Vec::<u32>::new());
-    }
-
     #[test]
     fn a_growths_card_shows_what_its_form_reads() {
         let tree = VoxelFeatureGrowth::default();

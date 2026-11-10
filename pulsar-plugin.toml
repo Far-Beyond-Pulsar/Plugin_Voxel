@@ -1,6 +1,6 @@
 # The `pulsar.voxel` plugin's descriptor. A project enables or disables it in
 # its Pulsar.toml (`[plugins]`); disabled, its kind is absent (see
-# crates/core/pulsar_plugins). The runtime module carries this file
+# crates/core/pulsar_plugins). Its root crate carries this file
 # (`pulsar_plugins::installed!`).
 id = "pulsar.voxel"
 name = "Voxel Worlds"
@@ -11,8 +11,7 @@ enabled_by_default = true
 # simply has no such instance.
 requires = []
 
-[modules]
-# What a game built for the project links.
-runtime = ["voxel_component"]
-# What the editor links in addition.
-editor = ["voxel_plugin"]
+# The plugin's root crate (the package in this directory): the one place it
+# registers everything it contributes. A game links it without its `editor`
+# feature; the editor links it with.
+root = "voxel_plugin"

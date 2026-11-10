@@ -1,0 +1,16 @@
+{
+  "name": "planet_descent",
+  "description": "From orbit, down through the cloud deck to the lakes and forest below the spawn. Set \"track\": \"mountain\" to arrive at the nearest summit instead.",
+  "fps": 24,
+  "seconds": 15,
+  "sun_elevation_deg": 28,
+  "keys": [
+    { "t": 0.0,  "altitude_m": 14000000, "distance_m": 0,      "heading_deg": 0, "pitch_deg": -90 },
+    { "t": 3.0,  "altitude_m": 2200000,  "distance_m": 40000,  "heading_deg": 0, "pitch_deg": -72 },
+    { "t": 6.5,  "altitude_m": 120000,   "distance_m": 110000, "heading_deg": 0, "pitch_deg": -45 },
+    { "t": 9.5,  "altitude_m": 6000,     "distance_m": 160000, "heading_deg": 0, "pitch_deg": -26, "sun_elevation_deg": 24 },
+    { "t": 12.5, "altitude_m": 500,      "distance_m": 164000, "heading_deg": 0, "pitch_deg": -12, "sun_elevation_deg": 16 },
+    { "t": 15.0, "altitude_m": 38,       "distance_m": 166200, "heading_deg": 0, "pitch_deg": -6, "sun_elevation_deg": 11 }
+  ],
+  "events": []
+}

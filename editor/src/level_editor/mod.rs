@@ -1,5 +1,5 @@
-//! Voxel worlds in the level editor, registered through its extension
-//! points (`ui_level_editor::extend`):
+//! Voxel worlds in the level editor, which the plugin's root crate registers
+//! through the level editor's extension points (`ui_level_editor::extend`):
 //! - the **Voxel Sculpt** tool mode ([`sculpt`]): strokes through the
 //!   terrain component's `sculpt` method on the render thread, each stroke
 //!   one undo step ([`journal`]) once its last samples landed (an
@@ -20,81 +20,72 @@ pub mod sculpt;
 pub mod state;
 pub mod terrain;
 
-use ui_level_editor::ToolModeId;
-use ui_level_editor::extend::{
-    CameraFraming, Interaction, PropertyFollowUp, SaveHook, ToolModeRegistration,
-};
+use glam::DVec3;
+use pulsar_scenedb::{Entity, World};
+use ui_level_editor::{LevelEditorState, ToolMode, ToolModeId};
 
 /// The Voxel Sculpt mode's id.
 pub const SCULPT_MODE: ToolModeId = ToolModeId("voxel_sculpt");
 /// The Terrain mode's id.
 pub const TERRAIN_MODE: ToolModeId = ToolModeId("terrain");
 
-inventory::submit! {
-    ToolModeRegistration {
-        origin: pulsar_plugins::origin!(),
-        order: 20,
-        make: || Box::new(sculpt::VoxelSculptMode),
+/// A new Voxel Sculpt mode (its tool mode registration's factory).
+pub fn sculpt_mode() -> Box<dyn ToolMode> {
+    Box::new(sculpt::VoxelSculptMode)
+}
+
+/// A new Terrain mode (its tool mode registration's factory).
+pub fn terrain_mode() -> Box<dyn ToolMode> {
+    Box::new(terrain::TerrainMode)
+}
+
+/// Whether a sculpt stroke is still waiting for its last samples (the
+/// editor finishes it before undo).
+pub fn stroke_in_progress(state: &LevelEditorState) -> bool {
+    state::in_progress(state).is_some()
+}
+
+/// Finishes the stroke in progress as one undo step (`force`: without
+/// waiting for its last samples).
+pub fn finish_stroke(state: &mut LevelEditorState, force: bool) {
+    state::VoxelStroke::finish(state, force);
+}
+
+/// What a level save does first: fold old edits into the journals' bases
+/// and keep the renderer's chunks of the edits ([`save`]).
+pub fn before_save(scene: &engine_backend::scene::SharedScene) {
+    save::compact_voxel_journals(scene);
+    save::keep_voxel_chunks(scene);
+}
+
+/// The terrain's class, whose `generator` property [`generator_changed`]
+/// follows.
+pub const TERRAIN_CLASS: &str = "VoxelTerrainComponent";
+
+/// Choosing a terrain's generator attaches its settings
+/// (`voxel_component::world::ensure_generator_settings`).
+pub fn generator_changed(world: &mut World, owner: Entity, instance: Entity) {
+    if let Err(error) = voxel_component::world::ensure_generator_settings(world, owner, instance) {
+        tracing::warn!("{error}");
     }
 }
 
-inventory::submit! {
-    ToolModeRegistration {
-        origin: pulsar_plugins::origin!(),
-        order: 25,
-        make: || Box::new(terrain::TerrainMode),
-    }
-}
-
-inventory::submit! {
-    Interaction {
-        origin: pulsar_plugins::origin!(),
-        in_progress: |state| state::in_progress(state).is_some(),
-        finish: |state, force| {
-            state::VoxelStroke::finish(state, force);
-        },
-    }
-}
-
-inventory::submit! {
-    SaveHook {
-        origin: pulsar_plugins::origin!(),
-        before_save: |scene| {
-            save::compact_voxel_journals(scene);
-            save::keep_voxel_chunks(scene);
-        },
-    }
-}
-
-inventory::submit! {
-    PropertyFollowUp {
-        origin: pulsar_plugins::origin!(),
-        class_name: "VoxelTerrainComponent",
-        property: "generator",
-        follow: |world, owner, instance| {
-            if let Err(error) =
-                voxel_component::world::ensure_generator_settings(world, owner, instance)
-            {
-                tracing::warn!("{error}");
-            }
-        },
-    }
-}
-
-inventory::submit! {
-    CameraFraming {
-        origin: pulsar_plugins::origin!(),
-        frame: |world, object, eye, forward| {
-            let terrain = engine_backend::scene::attachments::enabled_components_of::<
-                voxel_component::VoxelTerrainComponent,
-            >(world, object)
-            .first()
-            .map(|(instance, _)| *instance)?;
-            Some(
-                voxel_component::world::terrain_world(world, terrain)
-                    .map(|planet| voxel_component::world::frame_view(&planet, eye, forward, 30.0))
-                    .map_err(|error| error.to_string()),
-            )
-        },
-    }
+/// Frames an object's first enabled voxel terrain over its ground (`None`
+/// when the object holds none).
+pub fn frame_terrain(
+    world: &World,
+    object: Entity,
+    eye: DVec3,
+    forward: DVec3,
+) -> Option<Result<(DVec3, DVec3), String>> {
+    let terrain = engine_backend::scene::attachments::enabled_components_of::<
+        voxel_component::VoxelTerrainComponent,
+    >(world, object)
+    .first()
+    .map(|(instance, _)| *instance)?;
+    Some(
+        voxel_component::world::terrain_world(world, terrain)
+            .map(|planet| voxel_component::world::frame_view(&planet, eye, forward, 30.0))
+            .map_err(|error| error.to_string()),
+    )
 }
