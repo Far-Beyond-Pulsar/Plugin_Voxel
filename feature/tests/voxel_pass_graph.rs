@@ -18,6 +18,19 @@ use helio_pass_voxel_planet::{Planet, PlanetRecipe};
 use helio_presets::Preset;
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 
+/// One test at a time may hold a wgpu device (Pulsar-Native#1647). Creating and
+/// using several devices on one adapter at once crashes some Windows drivers
+/// with STATUS_ACCESS_VIOLATION, and libtest runs tests in parallel; this makes
+/// `cargo test` safe without `--test-threads=1`. Each test takes it first.
+/// (nextest runs one test per process; `.config/nextest.toml` also serializes
+/// these suites in a `gpu-device` test group.)
+static GPU_DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    // A test that panicked while holding the lock does not poison the rest.
+    GPU_DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The engine's features over Helio's: the voxel terrain's and the media
 /// kinds' (foliage, water, fog, post-process volumes), as the engine adds them.
 fn voxel_features() -> helio_feature_api::FeatureSet {
@@ -98,6 +111,7 @@ impl helio_core::RenderPass for FinalResourceConsumer {
 
 #[test]
 fn chunk_pass_builds_settles_and_resizes_in_the_deferred_graph() {
+    let _gpu = gpu_serial();
     pollster::block_on(async {
         let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
         let Ok(adapter) = instance.request_adapter(&Default::default()).await else {
@@ -598,6 +612,7 @@ impl Editor {
 /// next to the x axis and the view turned the axis' red.
 #[test]
 fn editor_overlays_stay_in_world_space_in_camera_relative_frames() {
+    let _gpu = gpu_serial();
     let Some(mut editor) = editor(320, 180) else {
         return;
     };
@@ -694,6 +709,7 @@ fn capture(editor: &Editor, name: &str, pixels: &[[u8; 4]]) {
 /// scene's directional light; the frame's origin follows the eye.
 #[test]
 fn atmosphere_follows_the_world_eye_and_sun_through_resize() {
+    let _gpu = gpu_serial();
     let Some(mut editor) = editor(256, 144) else {
         return;
     };
@@ -798,6 +814,7 @@ fn atmosphere_follows_the_world_eye_and_sun_through_resize() {
 /// light outside the shell, no dark sectors in it.
 #[test]
 fn orbital_atmosphere_has_no_wedges_outside_the_shell() {
+    let _gpu = gpu_serial();
     const SIZE: u32 = 513;
     let Some(mut editor) = editor(SIZE, SIZE) else {
         return;
@@ -881,6 +898,7 @@ fn orbital_atmosphere_has_no_wedges_outside_the_shell() {
 /// the terminator changes it smoothly.
 #[test]
 fn terminator_is_smooth_and_the_night_side_is_dark() {
+    let _gpu = gpu_serial();
     const SIZE: u32 = 513;
     let Some(mut editor) = editor(SIZE, SIZE) else {
         return;
@@ -956,6 +974,7 @@ fn terminator_is_smooth_and_the_night_side_is_dark() {
 /// and darker ground below it, and nothing once the atmosphere row is gone.
 #[test]
 fn atmosphere_over_flat_ground_without_a_planet() {
+    let _gpu = gpu_serial();
     let Some(mut editor) = editor(256, 144) else {
         return;
     };
@@ -1031,6 +1050,7 @@ fn atmosphere_over_flat_ground_without_a_planet() {
 /// Discarding colour history must show that edit without rebuilding chunks.
 #[test]
 fn appearance_edit_is_visible_in_one_frame_without_rebuilding_residency() {
+    let _gpu = gpu_serial();
     let Some(mut editor) = editor(128, 72) else {
         return;
     };
@@ -1172,6 +1192,7 @@ fn appearance_edit_is_visible_in_one_frame_without_rebuilding_residency() {
 /// spreading through temporal history, or a missing sky).
 #[test]
 fn terrain_under_an_atmosphere_is_lit_at_every_height() {
+    let _gpu = gpu_serial();
     let Some(mut editor) = editor(320, 180) else {
         return;
     };
@@ -1264,6 +1285,7 @@ fn terrain_under_an_atmosphere_is_lit_at_every_height() {
 /// copy instead of generating them; chunks of another history are refused.
 #[test]
 fn saved_edited_chunks_come_back_through_the_frame() {
+    let _gpu = gpu_serial();
     use helio_pass_voxel_planet::chunks::KeptChunks;
     use helio_pass_voxel_planet::engine::{
         VolumeAnswer, VolumeAnswers, VolumeFrame, VolumeRequests,
