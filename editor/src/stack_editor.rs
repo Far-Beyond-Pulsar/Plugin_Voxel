@@ -28,7 +28,7 @@ use ui::button::{Button, ButtonVariants as _};
 use ui::dropdown::{Dropdown, DropdownEvent, DropdownState};
 use ui::{ActiveTheme as _, IconName, Sizable as _, v_flex};
 
-use helio_component::components::reflected_list::{
+use ui_common::reflected_list::{
     FieldRows, ListEdit, ListWake, apply_list_edit, collapsible_item_card, remap_expanded,
 };
 use voxel_component::{VoxelLayerKind, VoxelMaterialRule, VoxelTerrainLayer, VoxelTerrainStack};

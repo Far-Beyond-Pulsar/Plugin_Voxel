@@ -152,8 +152,6 @@ impl helio_component::components::reflected_list::ReflectedListItem for VoxelFea
     }
 }
 
-helio_component::register_reflected_list_editor!(VoxelFeatureGrowth);
-
 fn serialize_growth_json(
     value: &VoxelFeatureGrowth,
 ) -> pulsar_reflection::ReflectResult<serde_json::Value> {
@@ -310,8 +308,6 @@ impl helio_component::components::reflected_list::ReflectedListItem for VoxelFea
         format!("{}. {name} ({} m)", index + 1, self.spacing_m)
     }
 }
-
-helio_component::register_reflected_list_editor!(VoxelFeatureSpawn);
 
 fn serialize_spawn_json(
     value: &VoxelFeatureSpawn,

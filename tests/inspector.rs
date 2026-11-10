@@ -291,3 +291,19 @@ fn the_layers_stack_with_hundreds_of_layers(cx: &mut TestAppContext) {
         total / 200.0
     );
 }
+
+/// The features list and its nested lists have the inspector's editors (the
+/// root's `editor` registrations and ui_common's ground-material editor).
+#[test]
+fn the_feature_lists_have_the_inspectors_editors() {
+    for type_id in [
+        std::any::TypeId::of::<Vec<voxel_component::VoxelFeatureSpawn>>(),
+        std::any::TypeId::of::<Vec<voxel_component::VoxelFeatureGrowth>>(),
+        std::any::TypeId::of::<helio_component::GroundMaterialList>(),
+    ] {
+        assert!(
+            ui_common::PROPERTY_EDITOR_REGISTRY.has(type_id),
+            "{type_id:?} has an editor"
+        );
+    }
+}
