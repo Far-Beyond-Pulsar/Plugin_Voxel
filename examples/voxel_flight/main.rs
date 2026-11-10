@@ -16,6 +16,9 @@
 //!   `HELIO_VOXEL_CHUNKS_BLAST=r` blasted by one ball `r` m across.
 //!   `HELIO_VOXEL_GEN_BENCH=rounds` then generates its tiles again that many
 //!   times (`GENBENCH`: the GPU's generation time by kernel).
+//! * `HELIO_VOXEL_FLIGHT_CINEMATIC=<name|script.json>` renders a scripted
+//!   camera flight offline, a settled PNG a frame (`cinematic.rs`: keyframes
+//!   and dig events in JSON; builtins `planet_descent`, `crater`).
 //! * `HELIO_VOXEL_CHUNKS_FLY=descent|cruise` streams along a path.
 //! * `HELIO_VOXEL_FLIGHT_STRESS=ascent|descent|cruise|orbit|jump|dig|yoyo|dive|glide|sway` flies through the
 //!   renderer in real time, every frame recorded (`stress_<mode>.csv`),
@@ -45,6 +48,7 @@
 //! of the GPU): waiting for every frame lets the driver lower its clocks,
 //! which inflates every GPU timing.
 
+mod cinematic;
 mod worlds;
 
 use glam::{DVec3, Vec3};
@@ -92,6 +96,8 @@ struct Flight {
     requests: VolumeRequests,
     /// Volumes drawn beside the planet (`volumes_tour`), placed each frame.
     extra: Vec<VoxelVolume>,
+    /// Captures still being written (`capture_async`).
+    writers: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// The planet's up at `eye`.
@@ -243,8 +249,25 @@ impl Flight {
         // The generator's look with the materials the preset's features add.
         let appearance = preset.appearance(planet.field().appearance());
         let terrain = helio_pass_voxel_planet::VoxelSettings { residency: config };
-        let mut config = RendererConfig::new(size[0], size[1], wgpu::TextureFormat::Rgba8UnormSrgb)
-            .with_tsr_quality(quality);
+        // `HELIO_VOXEL_FLIGHT_NO_AA`: no temporal upscaler and no
+        // anti-aliasing at all, every frame drawn on its own (an offline
+        // render drawn larger than it is shown, then downscaled).
+        let no_aa = std::env::var_os("HELIO_VOXEL_FLIGHT_NO_AA").is_some();
+        let mut config = RendererConfig::new(size[0], size[1], wgpu::TextureFormat::Rgba8UnormSrgb);
+        if !no_aa {
+            config = config.with_tsr_quality(quality);
+        }
+        let preset_graph = if no_aa {
+            helio_presets::Preset::Model(helio_frame_api::lighting::ModelPipeline {
+                id: "deferred_no_aa",
+                label: "Deferred, no anti-aliasing",
+                description: "The deferred model with no anti-aliasing: a frame drawn larger than it is shown",
+                model: helio_frame_api::lighting::model::DEFERRED,
+                aa: helio_frame_api::lighting::Antialiasing::TemporalOrNone,
+            })
+        } else {
+            helio_presets::Preset::Deferred
+        };
         config
             .features
             .edit::<helio_pass_foliage_place::FoliageSettings>()
@@ -271,7 +294,7 @@ impl Flight {
             // water, fog, post-process volumes) and the lighting kinds (GI,
             // the sky) are features Helio's presets do not list: their plugins', which a host adds as the engine does.
             .with_graph(helio_mesh_host::presets::with(
-                helio_presets::Preset::Deferred,
+                preset_graph,
                 &helio_feature_api::FeatureSet::new()
                     .with(helio_pass_voxel_planet::VoxelFeature)
                     .with(helio_pass_corona::CoronaFeature)
@@ -369,6 +392,7 @@ impl Flight {
             render_cycles: 0,
             requests: VolumeRequests::default(),
             extra: Vec::new(),
+            writers: Vec::new(),
         }
     }
 
@@ -429,6 +453,74 @@ impl Flight {
         )
     }
 
+    /// The last frame as `<out>/<name>.png`, read back and compressed on a
+    /// worker thread while the next frames draw (at most a few at once;
+    /// [`Self::finish_captures`] waits for the rest).
+    fn capture_async(&mut self, name: &str) {
+        let row = (self.size[0] * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row) * u64::from(self.size[1]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            self.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(self.size[1]),
+                },
+            },
+            self.target.size(),
+        );
+        self.queue.submit([encoder.finish()]);
+        while self.writers.len() >= 4 {
+            self.writers.remove(0).join().unwrap();
+        }
+        let device = self.device.clone();
+        let (w, h) = (self.size[0] as usize, self.size[1]);
+        let path = self.output.join(format!("{name}.png"));
+        self.writers.push(std::thread::spawn(move || {
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let data = buffer.slice(..).get_mapped_range().unwrap();
+            // RGB: the target's alpha is not coverage.
+            let mut pixels = Vec::with_capacity(w * h as usize * 3);
+            for r in data.chunks(row as usize) {
+                for px in r[..w * 4].chunks_exact(4) {
+                    pixels.extend_from_slice(&px[..3]);
+                }
+            }
+            // Whole or not at all: a render stopped here resumes cleanly.
+            let part = path.with_extension("part");
+            image::save_buffer_with_format(
+                &part,
+                &pixels,
+                w as u32,
+                h,
+                image::ColorType::Rgb8,
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+            std::fs::rename(&part, &path).unwrap();
+        }));
+    }
+
+    /// Waits for every [`Self::capture_async`] still writing.
+    fn finish_captures(&mut self) {
+        for writer in self.writers.drain(..) {
+            writer.join().unwrap();
+        }
+    }
+
     /// The last frame as `<out>/<name>.png`.
     fn capture(&self, name: &str) {
         let row = (self.size[0] * 4).div_ceil(256) * 256;
@@ -463,6 +555,12 @@ impl Flight {
             .chunks(row as usize)
             .flat_map(|r| r[..self.size[0] as usize * 4].to_vec())
             .collect();
+        // The target's alpha is not coverage (it is 0 here): saved as it is,
+        // image viewers show these PNGs as empty.
+        let mut pixels = pixels;
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
         image::save_buffer(
             self.output.join(format!("{name}.png")),
             &pixels,
@@ -3348,6 +3446,12 @@ fn main() {
         volume_view(&planet, &view, ground, heading);
         return;
     }
+    // A scripted render is not in a hurry: its streaming and detail follow.
+    if std::env::var_os("HELIO_VOXEL_FLIGHT_CINEMATIC").is_some()
+        && std::env::var_os("HELIO_VOXEL_FLIGHT_CINEMATIC_RECORD").is_none()
+    {
+        cinematic::offline_defaults();
+    }
     let mut flight = Flight::new(&output, size, quality, planet, preset);
     if let Ok(mode) = std::env::var("HELIO_VOXEL_FLIGHT_VOLUMES") {
         if mode == "hover" {
@@ -3355,6 +3459,12 @@ fn main() {
         } else {
             volumes_tour(&mut flight, ground, heading, seed);
         }
+        return;
+    }
+    // `HELIO_VOXEL_FLIGHT_CINEMATIC=<name|script.json>`: a scripted flight
+    // rendered offline, one settled PNG a frame (`cinematic.rs`).
+    if let Ok(script) = std::env::var("HELIO_VOXEL_FLIGHT_CINEMATIC") {
+        cinematic::run(&mut flight, &script, ground, heading);
         return;
     }
     if let Ok(mode) = std::env::var("HELIO_VOXEL_CHUNKS_FLY") {

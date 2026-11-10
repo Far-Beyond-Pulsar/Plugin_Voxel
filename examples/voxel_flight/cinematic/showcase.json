@@ -1,0 +1,44 @@
+{
+  "name": "showcase",
+  "description": "Orbit to the forest below the spawn and drop into a meadow ringed by trees; a slow turn in it, a rise over the canopy to a second meadow, and a slow rise out of it.",
+  "fps": 24,
+  "track": "anchor:meadow",
+  "track_length_m": 166300,
+  "min_clearance_m": 0.7,
+  "anchors": [
+    { "name": "meadow",  "kind": "clearing", "near": { "distance_m": 166300, "side_m": 0 }, "radius_m": 10 },
+    { "name": "oakA",    "kind": "feature",  "material": "Wood", "near": { "anchor": "meadow" } },
+    { "name": "meadow2", "kind": "clearing", "near": { "anchor": "meadow" }, "radius_m": 8, "skip_within_m": 140 },
+    { "name": "oakB",    "kind": "feature",  "material": "Wood", "near": { "anchor": "meadow2" } }
+  ],
+  "segments": [
+    {
+      "mode": "track",
+      "keys": [
+        { "t": 0.0,  "altitude_m": 14000000, "distance_m": 0,      "heading_deg": 0, "pitch_deg": -85 },
+        { "t": 3.0,  "altitude_m": 2200000,  "distance_m": 40000,  "heading_deg": 0, "pitch_deg": -72 },
+        { "t": 6.5,  "altitude_m": 120000,   "distance_m": 110000, "heading_deg": 0, "pitch_deg": -45 },
+        { "t": 9.5,  "altitude_m": 6000,     "distance_m": 160000, "heading_deg": 0, "pitch_deg": -26 },
+        { "t": 12.5, "altitude_m": 500,      "distance_m": 164000, "heading_deg": 0, "pitch_deg": -12 },
+        { "t": 15.0, "altitude_m": 38,       "distance_m": 166200, "heading_deg": 0, "pitch_deg": -6 }
+      ]
+    },
+    {
+      "mode": "free",
+      "keys": [
+        { "t": 17.0, "at": "meadow", "forward_m": -4, "height_m": 20, "look": { "forward_m": 30, "height_m": 4 } },
+        { "t": 19.5, "at": "meadow", "height_m": 7.0, "look": { "anchor": "oakA", "height_m": 3.0 } },
+        { "t": 21.5, "at": "meadow", "right_m": -5, "height_m": 2.2, "look": { "anchor": "oakA", "height_m": 3.2 } },
+        { "t": 24.0, "at": "meadow", "forward_m": 5,  "height_m": 2.0, "look": { "anchor": "oakA", "height_m": 3.2 } },
+        { "t": 26.5, "at": "meadow", "right_m": 5,  "height_m": 2.0, "look": { "anchor": "oakA", "height_m": 3.2 } },
+        { "t": 29.0, "at": "meadow", "forward_m": -5, "height_m": 2.4, "look": { "anchor": "oakA", "height_m": 3.2 } },
+        { "t": 31.0, "at": "meadow", "height_m": 3.5, "look": { "forward_m": 12, "height_m": 7 } },
+        { "t": 34.5, "at": "meadow2", "forward_m": -12, "height_m": 18, "look": { "forward_m": 0, "height_m": 2 } },
+        { "t": 37.0, "at": "meadow2", "right_m": -3, "height_m": 2.4, "look": { "anchor": "oakB", "height_m": 3.2 } },
+        { "t": 40.0, "at": "meadow2", "right_m": 2, "forward_m": 2, "height_m": 3.0, "look": { "anchor": "oakB", "height_m": 3.5 } },
+        { "t": 43.0, "at": "meadow2", "height_m": 14, "look": { "forward_m": 40, "height_m": 12 } }
+      ]
+    }
+  ],
+  "events": []
+}
