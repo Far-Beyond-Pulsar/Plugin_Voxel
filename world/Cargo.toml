@@ -17,3 +17,6 @@ rayon = "1.12"
 [dev-dependencies]
 # examples/planet_map.rs writes the maps as PNGs.
 image = { workspace = true }
+
+[lints]
+workspace = true

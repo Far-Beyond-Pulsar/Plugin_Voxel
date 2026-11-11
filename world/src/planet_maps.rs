@@ -1200,10 +1200,16 @@ fn decode(bytes: &[u8], key: u64) -> Option<PlanetMaps> {
     })
 }
 
+// Helio-layer crate (below Pulsar, so no `engine_fs`): the bake cache lives in
+// the machine's cache directory (see `disk_dir`), outside any project.
+#[allow(clippy::disallowed_methods)]
 fn load(path: &std::path::Path, key: u64) -> Option<PlanetMaps> {
     decode(&std::fs::read(path).ok()?, key)
 }
 
+// Helio-layer crate (below Pulsar, so no `engine_fs`): the bake cache lives in
+// the machine's cache directory (see `disk_dir`), outside any project.
+#[allow(clippy::disallowed_methods)]
 fn store(path: &std::path::Path, key: u64, maps: &PlanetMaps) -> std::io::Result<()> {
     let dir = path.parent().expect("a cache file's directory");
     std::fs::create_dir_all(dir)?;
