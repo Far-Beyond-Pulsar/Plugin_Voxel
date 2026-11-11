@@ -31,6 +31,8 @@ impl Feature for VoxelFeature {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_light_api::SCENE_LIGHTS);
+        registrar.consumes(helio_mats::MATERIALS);
         // With terrain to draw, it traces GI's probes every frame and its sun
         // samples rotate over blocks of pixels for TSR to integrate.
         registrar.prepare(std::sync::Arc::new(|env| {

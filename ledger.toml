@@ -35,7 +35,7 @@ notes = "Voxel work continues on its own branch (Pulsar-Native#994, Helio#314); 
 [[pass]]
 crate = "helio-pass-voxel-planet"
 in_default_graph = false
-reads = []
+reads = ["materials", "scene_lights"]
 owner = "voxel_component (RenderFeatureRegistration)"
 disposition = "the voxel plugin's feature crate (plugins/vendor/voxel/feature), not in Helio's default features: the plugin registers VoxelFeature with the engine's renderer, which adds it to every preset; its ChunkPass reads the frame's camera, the VOXEL_FRAME payload the terrain runtime publishes, and the scene's material rows (terrain textured like meshes) and lights (their shadows on the terrain); no SceneDB rows of its own"
 target_contract = "Phase 4; 09-component-structure-and-graph-boundary.md"

@@ -15,9 +15,8 @@ autoexamples = false
 editor = ["dep:voxel_editor", "dep:ui_level_editor", "dep:ui_common"]
 
 [dependencies]
-# The plugin gate and the registrations' collection.
+# The plugin gate and the builder its registrations go through.
 pulsar_plugins = { workspace = true }
-inventory = { workspace = true }
 # The plugin's crates.
 voxel_component = { workspace = true }
 voxel_editor = { workspace = true, optional = true }

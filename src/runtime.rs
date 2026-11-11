@@ -1,6 +1,7 @@
 //! What the voxel plugin registers for a game (and the editor): every
 //! runtime contribution, grouped by the engine seam it plugs into.
 
+use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::RenderFeatureRegistration;
 use helio_component::GroundMaterialNames;
 use helio_pass_voxel_planet::engine::VOXEL_FRAME;
@@ -10,67 +11,62 @@ use pulsar_world_registry::{ScenePayloadRegistration, SceneSubsystemRegistration
 use voxel_component::runtime::VoxelWorlds;
 use voxel_component::{VoxelTerrainComponent, VoxelTerrainLayersComponent};
 
-// ── Component classes ───────────────────────────────────────────────────────
+/// Everything the voxel plugin registers for a game.
+pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
+    // ── Component classes ───────────────────────────────────────────────────
 
-pulsar_world_registry::submit_world_component!(VoxelTerrainComponent, VoxelTerrainLayersComponent,);
+    p.components()
+        .class::<VoxelTerrainComponent>(ClassSpec::default())
+        .class::<VoxelTerrainLayersComponent>(ClassSpec::default());
 
-// ── Rendering ───────────────────────────────────────────────────────────────
+    // ── Rendering ───────────────────────────────────────────────────────────
 
-// The voxel feature (the chunk terrain at the G-buffer, its sun, GI tracer,
-// foliage ground and water terrain), configured from the project's voxel
-// settings.
-inventory::submit! {
-    RenderFeatureRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The voxel feature (the chunk terrain at the G-buffer, its sun, GI
+    // tracer, foliage ground and water terrain), configured from the
+    // project's voxel settings.
+    p.add(RenderFeatureRegistration {
+        origin: p.origin(),
         features: voxel_component::render_features,
         configure: voxel_component::configure_renderer,
-    }
-}
+    });
 
-// ── Settings ────────────────────────────────────────────────────────────────
+    // ── Settings ────────────────────────────────────────────────────────────
 
-// The project's voxel residency settings.
-inventory::submit! {
-    SettingsGroupRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The project's voxel residency settings.
+    p.add(SettingsGroupRegistration {
+        origin: p.origin(),
         group: &helio_pass_voxel_planet::settings::VOXEL_RESIDENCY,
-    }
-}
+    });
 
-// ── Materials ───────────────────────────────────────────────────────────────
+    // ── Materials ───────────────────────────────────────────────────────────
 
-// The terrain's material names in every ground-material list (a feature
-// spawn's surfaces, foliage's ground).
-inventory::submit! {
-    GroundMaterialNames {
-        origin: pulsar_plugins::origin!(),
+    // The terrain's material names in every ground-material list (a feature
+    // spawn's surfaces, foliage's ground).
+    p.add(GroundMaterialNames {
+        origin: p.origin(),
         name: voxel_component::material_name,
         id: material::from_name,
-    }
-}
+    });
 
-// ── Scene ───────────────────────────────────────────────────────────────────
+    // ── Scene ───────────────────────────────────────────────────────────────
 
-// The subsystem that keeps journals on their ground and skies on their air,
-// and steps every terrain's world.
-inventory::submit! {
-    SceneSubsystemRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The subsystem that keeps journals on their ground and skies on their
+    // air, and steps every terrain's world.
+    p.add(SceneSubsystemRegistration {
+        origin: p.origin(),
         name: VoxelWorlds::NAME,
         install: |scene| scene.register_subsystem(VoxelWorlds::default()),
-    }
-}
+    });
 
-// The scene's voxel worlds, handed to the voxel pass every frame.
-inventory::submit! {
-    ScenePayloadRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The scene's voxel worlds, handed to the voxel pass every frame.
+    p.add(ScenePayloadRegistration {
+        origin: p.origin(),
         key: VOXEL_FRAME.key(),
         publish: voxel_component::runtime::publish_payload,
         settling: voxel_component::runtime::settling,
         // Its sun samples rotate over blocks of pixels for TSR to integrate.
         temporal: true,
-    }
+    });
 }
 
 #[cfg(test)]

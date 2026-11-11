@@ -6,10 +6,18 @@ id = "pulsar.voxel"
 name = "Voxel Worlds"
 description = "Destructible voxel terrain: its components, runtime, file formats, ready-made worlds and the renderer feature that draws it"
 enabled_by_default = true
-# None: the kinds a voxel world composes (sky, haze, wind, ground cover, sun,
-# look) are reached by class name and component method; without one, a world
-# simply has no such instance.
-requires = []
+# Every one optional: the kinds a voxel world composes (sky, haze, wind, ground
+# cover, sun, look) are reached by class name and component method; without
+# one, a world simply has no such instance.
+requires = [
+  { id = "pulsar.foliage.api", optional = true },
+  { id = "pulsar.gi.api", optional = true },
+  { id = "pulsar.lights.rows", optional = true },
+  { id = "pulsar.lights.api", optional = true },
+  { id = "pulsar.materials.table", optional = true },
+  { id = "pulsar.materials.api", optional = true },
+  { id = "pulsar.water.api", optional = true },
+]
 
 # The plugin's root crate (the package in this directory): the one place it
 # registers everything it contributes. A game links it without its `editor`
