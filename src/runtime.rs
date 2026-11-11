@@ -83,14 +83,12 @@ mod tests {
             "features: {:?}",
             features.ids()
         );
-        assert!(
-            pulsar_settings::project::rendering::groups()
-                .iter()
-                .any(|group| std::ptr::eq(
-                    *group,
-                    &helio_pass_voxel_planet::settings::VOXEL_RESIDENCY
-                ))
-        );
+        assert!(pulsar_settings::project::rendering::groups()
+            .iter()
+            .any(|group| std::ptr::eq(
+                *group,
+                &helio_pass_voxel_planet::settings::VOXEL_RESIDENCY
+            )));
     }
 
     /// The plugin names the terrain's materials for every ground-material
@@ -113,10 +111,9 @@ mod tests {
             .into_iter()
             .filter(|summary| summary.origin == pulsar_plugins::origin!())
             .collect();
-        assert!(
-            ours.iter()
-                .any(|summary| summary.category == "component.class")
-        );
+        assert!(ours
+            .iter()
+            .any(|summary| summary.category == "component.class"));
         for summary in &ours {
             assert_eq!(
                 pulsar_plugins::plugin_of(summary.origin).map(|plugin| plugin.id.as_str()),
