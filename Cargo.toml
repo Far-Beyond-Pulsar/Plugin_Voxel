@@ -61,6 +61,10 @@ helio-pass-volumetric-fog = { workspace = true }
 helio-pass-sky = { workspace = true }
 helio-pass-foliage-place = { workspace = true }
 helio = { workspace = true }
+helio-core = { workspace = true }
+helio-graph-asset = { workspace = true }
+helio-feature-api = { workspace = true }
+helio-presets = { workspace = true }
 helio-voxel-data = { workspace = true }
 pulsar_scenedb = { workspace = true }
 pulsar_scene_model = { workspace = true }
