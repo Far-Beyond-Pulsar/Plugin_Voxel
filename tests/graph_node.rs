@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use engine_backend::subsystems::render::helio_renderer::{pipelines, render_features};
 use helio::{DebugDrawState, PassBuildContext, RendererConfig};
-use helio_graph_asset::{validate, NodeInstance, PinKind};
+use helio_graph_asset::{NodeInstance, PinKind, validate};
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 
 const VOXEL_NODE: &str = "helio.pass.voxel_chunks";
@@ -62,7 +62,7 @@ fn configured() -> RendererConfig {
 
 /// The deferred preset's graph over the registry.
 fn asset_of(registry: &helio_graph_asset::NodeRegistry) -> helio_graph_asset::GraphAsset {
-    helio_presets::graphs::deferred_graph_asset_for(registry, &configured())
+    helio_presets::graphs::deferred_graph_asset(registry)
 }
 
 /// Compiles `asset` and counts the chunk passes in it (`None`: no GPU).
@@ -107,11 +107,16 @@ fn the_plugin_registers_the_node_and_the_graph_builds_it() {
     let _serial = serial();
     pulsar_plugins::deactivate();
     let registry = helio_presets::graphs::registry_with(&render_features::plugin_features());
-    let node = registry.get(VOXEL_NODE).expect("the voxel node is registered");
+    let node = registry
+        .get(VOXEL_NODE)
+        .expect("the voxel node is registered");
     assert_eq!(registry.feature_of(VOXEL_NODE), Some("helio.voxel"));
     assert!(node.generated, "pins come from what the pass declares");
     assert!(node.params.iter().any(|p| p.key == "enabled"));
-    assert!(node.placement.is_some(), "the preset places it at the G-buffer");
+    assert!(
+        node.placement.is_some(),
+        "the preset places it at the G-buffer"
+    );
 
     let mut asset = asset_of(&registry);
     assert!(
@@ -136,7 +141,9 @@ fn the_probe_gives_the_node_the_pins_its_pass_declares() {
     let _serial = serial();
     pulsar_plugins::deactivate();
     let registry = pipelines::graph_node_registry();
-    let node = registry.get(VOXEL_NODE).expect("the voxel node is registered");
+    let node = registry
+        .get(VOXEL_NODE)
+        .expect("the voxel node is registered");
     let pins = node.pins(&Default::default());
     if pipelines::graph_pin_probe().is_none() {
         eprintln!("GPU_VALIDATION_SKIPPED_NO_ADAPTER: voxel node pins");
@@ -174,7 +181,10 @@ fn a_disabled_plugin_has_no_node_and_a_graph_naming_it_says_so() {
     let registry = pipelines::graph_node_registry();
     pulsar_plugins::deactivate();
 
-    assert!(registry.get(VOXEL_NODE).is_none(), "its node is unregistered");
+    assert!(
+        registry.get(VOXEL_NODE).is_none(),
+        "its node is unregistered"
+    );
     assert_eq!(
         registry.absence(VOXEL_NODE),
         Some("plugin pulsar.voxel disabled")
