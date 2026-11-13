@@ -919,11 +919,13 @@ impl SunPlanner {
         let (outbox, plans) = std::sync::mpsc::channel();
         let pages = SunPages::new(voxel);
         let finest = pages.finest;
-        std::thread::Builder::new()
-            .name("sun pages planner".into())
-            .spawn(move || {
+        // Ends when the world drops its job sender.
+        helio_tasks::spawn_service(
+            helio_tasks::ServiceSpec::new("Voxel sun pages planner", "sun pages planner")
+                .owner("voxel"),
+            move |ctx| {
                 let mut pages = pages;
-                while let Ok(mut job) = inbox.recv() {
+                while let Ok(mut job) = ctx.wait(|| inbox.recv()) {
                     let clock = std::time::Instant::now();
                     for (asking, words) in &job.asked {
                         pages.asked(asking, words);
@@ -946,8 +948,9 @@ impl SunPlanner {
                         break;
                     }
                 }
-            })
-            .expect("the sun pages planner thread starts");
+            },
+        )
+        .expect("the sun pages planner thread starts");
         Self {
             finest,
             jobs,

@@ -21,6 +21,8 @@ rayon = "1.12"
 helio-settings = { workspace = true }
 wgpu = { version = "30.0.1" }
 helio-core = { workspace = true }
+# Its planners' threads and pipeline compiles run on the host's task system.
+helio-tasks = { workspace = true }
 helio-feature-api = { workspace = true }
 helio-frame-api = { workspace = true }
 # Specular anti-aliasing for the scene materials' normal maps.

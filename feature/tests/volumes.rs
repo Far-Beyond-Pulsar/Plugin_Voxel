@@ -144,22 +144,21 @@ impl Scene {
 
     fn with_capacity(gpu: &Gpu, volumes: &Volumes, capacity: Capacity) -> Self {
         let mut world = ChunkWorld::with_capacity(&gpu.device, &gpu.queue, capacity);
-        // Each volume added, timed (its form's pipelines; the second the
-        // passes lighting across volumes).
+        // The volumes added, then their pipelines compiled off the frame
+        // (each form's, the passes lighting across volumes), timed.
         let ids = volumes
             .volumes
             .iter()
-            .map(|v| {
-                let clock = std::time::Instant::now();
-                let id = world.add_volume(v.id, &v.planet, v.transform);
-                eprintln!(
-                    "volume {} added in {:.1} s",
-                    v.id,
-                    clock.elapsed().as_secs_f64()
-                );
-                id
-            })
+            .map(|v| world.add_volume(v.id, &v.planet, v.transform))
             .collect();
+        let clock = std::time::Instant::now();
+        world
+            .wait_for_pipelines()
+            .expect("the volumes' pipelines compile");
+        eprintln!(
+            "pipelines compiled in {:.1} s",
+            clock.elapsed().as_secs_f64()
+        );
         Self {
             world,
             ids,

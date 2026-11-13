@@ -550,7 +550,7 @@ fn world_moved_from(
 pub const EARTH_SUN_ANGULAR_RADIUS: f32 = 0.004675;
 
 /// Where helio-pass-sky's atmosphere frame keeps the cosine of the sun
-/// disk's angular radius (`AtmosphereFrame::sun.w`).
+/// disk's angular radius (`SkyFrame::sun.w`).
 const ATMOSPHERE_SUN_DISK: u64 = 28;
 
 /// `DrawParams::rays` for `view_proj` (eye-relative) at `size` pixels: the
@@ -2112,11 +2112,20 @@ pub struct ChunkWorld {
     keep_pipeline_layout: wgpu::PipelineLayout,
     /// Generation pipelines by their source's fingerprint: volumes of one
     /// terrain program and form share them.
-    gen_cache: FxHashMap<u64, std::sync::Weak<volumes::GenPipelines>>,
+    gen_cache:
+        FxHashMap<u64, std::sync::Weak<helio_core::compile::Compiling<volumes::GenPipelines>>>,
     layouts: volumes::DrawLayouts,
-    /// Drawing's pipelines for spheres and planes, built when a volume of
-    /// that form comes.
-    pipelines: [Option<volumes::DrawPipelines>; 2],
+    /// Drawing's pipelines for spheres and planes, compiled off the frame
+    /// from when a volume of that form comes.
+    pipelines: [Option<helio_core::compile::Compiling<volumes::DrawPipelines>>; 2],
+    /// Each form's passes lighting other volumes' points, compiled once the
+    /// world holds more than one volume ([`Self::pipelines_ready`]).
+    cross: [Option<helio_core::compile::Compiling<volumes::CrossPipelines>>; 2],
+    /// The world's own pipelines (chunk table, records, leaf pool).
+    base: helio_core::compile::Compiling<BasePipelines>,
+    /// Whether every pipeline the volumes held need is ready: the world
+    /// generates and draws only then ([`Self::update`]).
+    drawable: bool,
     /// The UV reference image of debug mode 1 (trace and publish).
     uv_grid_view: wgpu::TextureView,
     uv_grid_sampler: wgpu::Sampler,
@@ -2242,7 +2251,6 @@ pub struct ChunkWorld {
     /// Chunk table changes scattered (`chunk_table.wgsl`), uploaded into
     /// their own buffer (a count, then the changes).
     table_layout: wgpu::BindGroupLayout,
-    table_pipeline: wgpu::ComputePipeline,
     table_changes: wgpu::Buffer,
     /// The frame's small writes as one upload (`FrameUploads`: a copy each
     /// where it is written, one queue write a call that records).
@@ -2254,7 +2262,6 @@ pub struct ChunkWorld {
     records: Vec<[[i32; 4]; RECORD_VEC4S]>,
     record_at: FxHashMap<u32, usize>,
     records_layout: wgpu::BindGroupLayout,
-    records_pipeline: wgpu::ComputePipeline,
     records_buffer: wgpu::Buffer,
     pack_data: wgpu::Buffer,
     pack_alloc: wgpu::Buffer,
@@ -2284,7 +2291,6 @@ pub struct ChunkWorld {
     leaf_growths: u32,
     /// The leaf pool's free count raised when it grows (`chunk_pool.wgsl`).
     pool_layout: wgpu::BindGroupLayout,
-    pool_pipeline: wgpu::ComputePipeline,
     /// Per-voxel materials (`chunk_generate.wgsl`): a batch's edited cell
     /// materials, each leaf page's detail page, the pages, the stack of
     /// those given back, and the allocator (the stack's count, the
@@ -3069,6 +3075,64 @@ fn draw_source(plane: bool, counting: bool) -> String {
         .replace("SCENE_MATERIALS", scene::STUB)
 }
 
+/// A world's own pipelines: the chunk table's scatter (`chunk_table.wgsl`),
+/// the records' (`chunk_records.wgsl`) and the leaf pool's growth
+/// (`chunk_pool.wgsl`), compiled off the frame like the volumes' (layouts:
+/// table, records, pool).
+struct BasePipelines {
+    table: wgpu::ComputePipeline,
+    records: wgpu::ComputePipeline,
+    pool: wgpu::ComputePipeline,
+}
+
+impl BasePipelines {
+    fn new(device: &wgpu::Device, layouts: &[wgpu::BindGroupLayout; 3]) -> Self {
+        let compute = |label: &str, source: &str, layout: &wgpu::BindGroupLayout, entry: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            helio_core::shader::create_compute_pipeline(
+                device,
+                wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(
+                        &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: None,
+                            bind_group_layouts: &[Some(layout)],
+                            immediate_size: 0,
+                        }),
+                    ),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                },
+            )
+        };
+        Self {
+            table: compute(
+                "chunk table",
+                include_str!("../../shaders/chunk_table.wgsl"),
+                &layouts[0],
+                "table_update",
+            ),
+            records: compute(
+                "chunk records",
+                include_str!("../../shaders/chunk_records.wgsl"),
+                &layouts[1],
+                "records_update",
+            ),
+            pool: compute(
+                "chunk pool",
+                include_str!("../../shaders/chunk_pool.wgsl"),
+                &layouts[2],
+                "pool_grow",
+            ),
+        }
+    }
+}
+
 impl ChunkWorld {
     /// A world of the default [`Capacity`], without volumes yet
     /// ([`Self::add_volume`]).
@@ -3085,6 +3149,11 @@ impl ChunkWorld {
     ) -> Self {
         let mut world = Self::with_capacity(device, queue, capacity);
         world.add_volume(0, planet, crate::volume::VolumeTransform::IDENTITY);
+        // A world made outside any frame (tests, offline tools) is handed
+        // over ready to draw.
+        if let Err(reason) = world.wait_for_pipelines() {
+            panic!("the voxel world's pipelines did not compile: {reason}");
+        }
         world
     }
 
@@ -3157,36 +3226,9 @@ impl ChunkWorld {
             bind_group_layouts: &[Some(&gen_layout), Some(&keep_layout)],
             immediate_size: 0,
         });
-        let table_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("chunk table"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/chunk_table.wgsl").into()),
-        });
         let table_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("chunk table"),
             entries: &[storage(0, true, c), storage(1, false, c)],
-        });
-        let table_pipeline = helio_core::shader::create_compute_pipeline(
-            device,
-            wgpu::ComputePipelineDescriptor {
-                label: Some("chunk table"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[Some(&table_layout)],
-                        immediate_size: 0,
-                    }),
-                ),
-                module: &table_module,
-                entry_point: Some("table_update"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
-        let records_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("chunk records"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../shaders/chunk_records.wgsl").into(),
-            ),
         });
         let records_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("chunk records"),
@@ -3196,23 +3238,6 @@ impl ChunkWorld {
                 storage(2, false, c),
             ],
         });
-        let records_pipeline = helio_core::shader::create_compute_pipeline(
-            device,
-            wgpu::ComputePipelineDescriptor {
-                label: Some("chunk records"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[Some(&records_layout)],
-                        immediate_size: 0,
-                    }),
-                ),
-                module: &records_module,
-                entry_point: Some("records_update"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
         let layouts = volumes::DrawLayouts::new(device);
         let (uv_grid_view, uv_grid_sampler) = create_uv_grid(device, queue);
         // Zeroed: the reversed depth's far, no mesh anywhere.
@@ -3348,31 +3373,20 @@ impl ChunkWorld {
             .collect();
         let drawn_set = drawn::DrawnSet::new(slots, table_slots);
         let chunk_table = buffer("chunk table", (table_slots * 32) as u64, s);
-        let pool_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("chunk pool"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/chunk_pool.wgsl").into()),
-        });
         let pool_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("chunk pool"),
             entries: &[storage(0, false, c), storage(1, true, c)],
         });
-        let pool_pipeline = helio_core::shader::create_compute_pipeline(
-            device,
-            wgpu::ComputePipelineDescriptor {
-                label: Some("chunk pool"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[Some(&pool_layout)],
-                        immediate_size: 0,
-                    }),
-                ),
-                module: &pool_module,
-                entry_point: Some("pool_grow"),
-                compilation_options: Default::default(),
-                cache: None,
-            },
-        );
+        let base = {
+            let layouts = [
+                table_layout.clone(),
+                records_layout.clone(),
+                pool_layout.clone(),
+            ];
+            helio_core::compile::Compiling::start(device, "voxel world pipelines", move |device| {
+                BasePipelines::new(device, &layouts)
+            })
+        };
         // The pools' buffers are copied into larger ones when they grow.
         let g = s | wgpu::BufferUsages::COPY_SRC;
         queue.write_buffer(&chunk_table, 0, bytemuck::cast_slice(drawn_set.table()));
@@ -3388,6 +3402,9 @@ impl ChunkWorld {
             gen_cache: FxHashMap::default(),
             layouts,
             pipelines: [None, None],
+            cross: [None, None],
+            base,
+            drawable: false,
             uv_grid_view,
             uv_grid_sampler,
             no_scene_depth,
@@ -3541,13 +3558,11 @@ impl ChunkWorld {
                 .collect(),
             slot_keys: vec![[-1, 0, 0, 0]; slots],
             table_layout,
-            table_pipeline,
             table_changes: buffer("chunk table changes", 16 + 1024 * 48, s),
             uploads: helio_core::upload::FrameUploads::new(device, queue, "chunk uploads"),
             records: Vec::new(),
             record_at: FxHashMap::default(),
             records_layout,
-            records_pipeline,
             records_buffer: buffer("chunk records", (16 + 256 * RECORD_BYTES) as u64, s),
             pack_data: buffer(
                 "chunk packs",
@@ -3587,7 +3602,6 @@ impl ChunkWorld {
             leaf_max: max_chunks as u64 * LEAVES_PER_SLOT,
             leaf_growths: 0,
             pool_layout,
-            pool_pipeline,
             cell_materials: buffer(
                 "chunk cell materials",
                 DETAIL_JOBS as u64 * TILE_COLUMNS * CELL_WORDS * 4,
@@ -3821,7 +3835,7 @@ impl ChunkWorld {
         );
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.pool_pipeline);
+            pass.set_pipeline(&self.base().pool);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
@@ -4686,6 +4700,12 @@ impl ChunkWorld {
         frame: u64,
         config: &ResidencyConfig,
     ) -> UpdateStats {
+        // Nothing generates or draws until the volumes' pipelines are
+        // compiled (they compile off the frame from when a volume comes).
+        self.drawable = self.pipelines_ready();
+        if !self.drawable {
+            return UpdateStats::default();
+        }
         self.claim_timing(frame);
         self.frame_now = frame;
         let mut stats = UpdateStats::default();
@@ -5511,6 +5531,9 @@ impl ChunkWorld {
                 })
         };
         let gen = vol.gen.clone();
+        let gen = gen
+            .ready()
+            .expect("generation runs with its pipelines ready");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chunk tile nodes"),
@@ -5887,7 +5910,7 @@ impl ChunkWorld {
                 label: Some("chunk table"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.table_pipeline);
+            pass.set_pipeline(&self.base().table);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups((changes.len() as u32 / 3).div_ceil(64), 1, 1);
         }
@@ -5991,7 +6014,7 @@ impl ChunkWorld {
             label: Some("chunk records"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.records_pipeline);
+        pass.set_pipeline(&self.base().records);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(((count * (RECORD_VEC4S - 1)) as u32).div_ceil(64), 1, 1);
         drop(pass);
@@ -6009,6 +6032,9 @@ impl ChunkWorld {
         picks: &[(u64, [f32; 2])],
         answers: &std::sync::Arc<crate::engine::VolumeAnswers>,
     ) -> usize {
+        if !self.drawable {
+            return 0;
+        }
         let Some(targets) = &self.targets else {
             return 0;
         };
@@ -6274,7 +6300,8 @@ impl ChunkWorld {
     /// host's wait). Shots and tests that wait for this see converged
     /// shadows.
     pub fn settled(&self) -> bool {
-        self.residency_settled()
+        self.drawable
+            && self.residency_settled()
             && self.sun_occlusion.as_ref().is_none_or(|o| {
                 let s = o.pages.stats;
                 (s.missing == 0 && s.stale == 0 && s.coarse == 0)
@@ -6734,22 +6761,120 @@ impl ChunkWorld {
         out.into_iter().map(|(_, i)| i).collect()
     }
 
+    /// The world's own pipelines (ready while drawable).
+    fn base(&self) -> &BasePipelines {
+        self.base
+            .ready()
+            .expect("the world records with its pipelines ready")
+    }
+
+    /// The drawing pipelines of form `plane` (ready while drawable).
+    fn form_pipelines(&self, plane: bool) -> &volumes::DrawPipelines {
+        self.pipelines[usize::from(plane)]
+            .as_ref()
+            .and_then(helio_core::compile::Compiling::ready)
+            .expect("a held volume's form has its pipelines ready")
+    }
+
     /// The drawing pipelines of volume `index`'s form.
     fn pipelines_of(&self, index: u16) -> &volumes::DrawPipelines {
         let plane = self.volumes[usize::from(index)]
             .as_ref()
             .is_some_and(|v| v.grid.is_plane());
-        self.pipelines[usize::from(plane)].as_ref().unwrap()
+        self.form_pipelines(plane)
     }
 
     /// The passes of volume `index`'s form lighting other volumes' points
-    /// (built when the second volume came: `cross_volumes` lists none
-    /// before).
+    /// (ready once the world holds more than one volume: `cross_volumes`
+    /// lists none before).
     fn cross_pipelines(&self, index: u16) -> &volumes::CrossPipelines {
-        self.pipelines_of(index)
-            .cross
+        let plane = self.volumes[usize::from(index)]
             .as_ref()
+            .is_some_and(|v| v.grid.is_plane());
+        self.cross[usize::from(plane)]
+            .as_ref()
+            .and_then(helio_core::compile::Compiling::ready)
             .expect("a world of more than one volume has its cross pipelines")
+    }
+
+    /// The forms of the volumes held, and whether the world holds more than
+    /// one volume (so lights across them).
+    fn forms_held(&self) -> ([bool; 2], bool) {
+        let mut forms = [false; 2];
+        let mut count = 0;
+        for v in self.volumes.iter().flatten() {
+            forms[usize::from(v.grid.is_plane())] = true;
+            count += 1;
+        }
+        (forms, count > 1)
+    }
+
+    /// Whether every pipeline the volumes held need is compiled: the
+    /// world's own, each volume's generation, each form's drawing and, with
+    /// more than one volume, the passes lighting across them (whose compile
+    /// starts here once their form's draw source is built). Until then the
+    /// world neither generates nor draws and is not settled; a pipeline that
+    /// failed to compile keeps it so (`helio_core::compile` logs why). Never
+    /// waits.
+    pub fn pipelines_ready(&mut self) -> bool {
+        let (forms, across) = self.forms_held();
+        if across {
+            for form in 0..2 {
+                if !forms[form] || self.cross[form].is_some() {
+                    continue;
+                }
+                let Some(draw) = self.pipelines[form]
+                    .as_ref()
+                    .and_then(helio_core::compile::Compiling::ready)
+                else {
+                    continue;
+                };
+                let (layouts, module) = (self.layouts.clone(), draw.module.clone());
+                self.cross[form] = Some(helio_core::compile::Compiling::start(
+                    &self.device,
+                    "voxel cross-volume pipelines",
+                    move |device| volumes::CrossPipelines::new(device, &layouts, &module),
+                ));
+            }
+        }
+        fn built<T: Send + Sync + 'static>(c: &Option<helio_core::compile::Compiling<T>>) -> bool {
+            c.as_ref().is_some_and(|c| c.ready().is_some())
+        }
+        self.base.ready().is_some()
+            && self
+                .volumes
+                .iter()
+                .flatten()
+                .all(|v| v.gen.ready().is_some())
+            && (0..2).all(|form| {
+                !forms[form]
+                    || (built(&self.pipelines[form]) && (!across || built(&self.cross[form])))
+            })
+    }
+
+    /// Blocks until every pipeline the volumes held need is compiled
+    /// ([`Self::pipelines_ready`]), or one fails: for tests and offline tools
+    /// with no frame to keep drawing.
+    pub fn wait_for_pipelines(&mut self) -> Result<(), String> {
+        loop {
+            self.base.wait()?;
+            for v in self.volumes.iter().flatten() {
+                v.gen.wait()?;
+            }
+            for c in self.pipelines.iter().flatten() {
+                c.wait()?;
+            }
+            // Starts the passes lighting across volumes, once.
+            if self.pipelines_ready() {
+                return Ok(());
+            }
+            for c in self.cross.iter().flatten() {
+                c.wait()?;
+            }
+            if self.pipelines_ready() {
+                return Ok(());
+            }
+        }
     }
 
     /// The volumes with chunks in the drawn cut.
@@ -6950,6 +7075,9 @@ impl ChunkWorld {
         sun: Vec3,
     ) {
         use helio_light_api::SUN_OCCLUSION_TABLE_WORDS;
+        if !self.drawable {
+            return;
+        }
         let toward = sun.as_dvec3().normalize();
         let Some(voxel) = self
             .primary
@@ -7485,9 +7613,7 @@ impl ChunkWorld {
         timing: Option<(&wgpu::QuerySet, u32)>,
         open: Option<&[[u32; 4]]>,
     ) -> wgpu::BindGroup {
-        let pipelines = self.pipelines[usize::from(vol.grid.is_plane())]
-            .as_ref()
-            .expect("a volume's form has its pipelines");
+        let pipelines = self.form_pipelines(vol.grid.is_plane());
         let (pass_index, passes) = (params.volume[1], params.volume[2]);
         match params_from {
             Some((from, at)) => encoder.copy_buffer_to_buffer(
@@ -7775,6 +7901,9 @@ impl ChunkWorld {
         gi: Option<&GiRays<'_>>,
         eye_index: usize,
     ) {
+        if !self.drawable {
+            return;
+        }
         self.record_eye(
             encoder,
             frame,
@@ -8382,6 +8511,9 @@ impl ChunkWorld {
         eye: DVec3,
         camera: Vec3,
     ) {
+        if !self.drawable {
+            return;
+        }
         // Foliage is tiled on the primary volume: its walks in its frame.
         let Some(primary) = self.primary else { return };
         let Some((_, group, _)) = self
@@ -8462,12 +8594,7 @@ impl ChunkWorld {
         });
         pass.set_bind_group(0, &group, &[]);
         pass.set_bind_group(1, &probe_group, &[]);
-        pass.set_pipeline(
-            &self.pipelines[usize::from(plane)]
-                .as_ref()
-                .unwrap()
-                .ground_probe,
-        );
+        pass.set_pipeline(&self.form_pipelines(plane).ground_probe);
         pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         // The other volumes near the eye, where they stand on that ground or
         // hold it (`ground_probe_cross`).
@@ -8839,6 +8966,9 @@ impl ChunkWorld {
         depth: &wgpu::TextureView,
         inputs: Option<scene::SceneMaterialInputs<'_>>,
     ) {
+        if !self.drawable {
+            return;
+        }
         let Some(targets) = &self.targets else { return };
         let Some(groups) = &self.last_groups else {
             return;
@@ -8973,7 +9103,7 @@ impl ChunkWorld {
             let plane = self.volumes[usize::from(*index)]
                 .as_ref()
                 .is_some_and(|v| v.grid.is_plane());
-            let pipelines = self.pipelines[usize::from(plane)].as_ref().unwrap();
+            let pipelines = self.form_pipelines(plane);
             match (&pipelines.publish_scene, &scene_group) {
                 (Some(textured), Some(_)) => pass.set_pipeline(textured),
                 _ => pass.set_pipeline(&pipelines.publish),

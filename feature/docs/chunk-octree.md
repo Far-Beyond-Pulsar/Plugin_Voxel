@@ -34,6 +34,13 @@ One `ChunkWorld` holds them all (`ChunkWorld::add_volume`,
   larger than the footprints it has: a block's is a few slots), features,
   brushes and baked bricks. One volume generates a frame: those with edits
   first, then those with requests, in turn.
+- **Pipelines compile off the frame.** A volume's generation pipelines, its
+  form's drawing pipelines and, once a second volume comes, the passes
+  lighting across volumes are compile jobs (`helio_core::compile`) started
+  when the volume is added; the world neither generates nor draws until they
+  are ready (`ChunkWorld::pipelines_ready`) and is not settled meanwhile. A
+  world made outside a frame (tests, tools) waits for them
+  (`ChunkWorld::wait_for_pipelines`).
 - **One tracer, a pass a volume.** A view traces its volumes nearest first
   (by their bounds; the primary one always), each by the same kernels with
   its own `DrawParams`: the eye in its frame, the camera's projections

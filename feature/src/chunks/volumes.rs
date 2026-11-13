@@ -40,7 +40,7 @@ pub(super) struct GenPipelines {
 }
 
 impl GenPipelines {
-    fn new(
+    pub(super) fn new(
         device: &wgpu::Device,
         source: &str,
         gen_layout: &wgpu::PipelineLayout,
@@ -126,7 +126,7 @@ pub(super) struct Volume {
     pub height_layers: (i32, i32),
     /// What its packs depend on (`kept_chunks`).
     pub fingerprint: u64,
-    pub gen: std::sync::Arc<GenPipelines>,
+    pub gen: std::sync::Arc<helio_core::compile::Compiling<GenPipelines>>,
     pub world: wgpu::Buffer,
     pub terrain: wgpu::Buffer,
     /// Its terrain program's tables (`terrain_tables`: its planet's maps)
@@ -240,6 +240,7 @@ impl Volume {
 }
 
 /// Drawing's bind group layouts, the same for every world form.
+#[derive(Clone)]
 pub(super) struct DrawLayouts {
     pub draw: wgpu::BindGroupLayout,
     pub trace: wgpu::BindGroupLayout,
@@ -633,11 +634,9 @@ pub(super) struct DrawPipelines {
     /// volume's, from where they are).
     pub gi_trace: wgpu::ComputePipeline,
     pub ground_probe: wgpu::ComputePipeline,
-    /// The passes of a volume lighting the others' points (`cross`), built
-    /// once more than one volume is held (`ensure_cross`): their walks are
-    /// long kernels to compile, which a world of one volume never runs.
-    pub cross: Option<CrossPipelines>,
-    module: wgpu::ShaderModule,
+    /// The draw source's module, for the passes lighting across volumes
+    /// ([`CrossPipelines`]).
+    pub module: wgpu::ShaderModule,
     pub feedback: wgpu::ComputePipeline,
     pub publish: wgpu::RenderPipeline,
     /// Opens rects of an orthographic view's exits (`trace_view`'s `open`).
@@ -654,7 +653,7 @@ impl DrawPipelines {
         device: &wgpu::Device,
         layouts: &DrawLayouts,
         source: &str,
-        scene: Option<(&wgpu::BindGroupLayout, u32, &wgpu::BindGroupLayout)>,
+        scene: Option<&(wgpu::BindGroupLayout, u32, wgpu::BindGroupLayout)>,
     ) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chunk draw"),
@@ -822,6 +821,7 @@ impl DrawPipelines {
         // The publish again, textured by the host's scene materials, where
         // the device has texture binding arrays.
         let publish_scene = scene.map(|(textures, capacity, shore_params)| {
+            let capacity = *capacity;
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("chunk draw (scene materials)"),
                 source: wgpu::ShaderSource::Wgsl(scene::scene_source(source, capacity).into()),
@@ -952,16 +952,17 @@ impl DrawPipelines {
             publish,
             exits_open,
             publish_scene,
-            cross: None,
             module,
         }
     }
+}
 
-    /// The passes that light other volumes' points, built once.
-    pub fn ensure_cross(&mut self, device: &wgpu::Device, layouts: &DrawLayouts) {
-        if self.cross.is_some() {
-            return;
-        }
+impl CrossPipelines {
+    /// The passes of a form whose draw source is `module` lighting other
+    /// volumes' points: built once a world holds more than one volume
+    /// (`ChunkWorld::pipelines_ready`), as their walks are long kernels to
+    /// compile, which a world of one volume never runs.
+    pub fn new(device: &wgpu::Device, layouts: &DrawLayouts, module: &wgpu::ShaderModule) -> Self {
         let compute = |label: &str, second: &wgpu::BindGroupLayout, entry: &str| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
@@ -973,14 +974,14 @@ impl DrawPipelines {
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),
                     layout: Some(&layout),
-                    module: &self.module,
+                    module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
                     cache: None,
                 },
             )
         };
-        self.cross = Some(CrossPipelines {
+        Self {
             shadow: compute(
                 "chunk shadows across volumes",
                 &layouts.shadow_fallback,
@@ -996,7 +997,7 @@ impl DrawPipelines {
                 &layouts.ground,
                 "ground_probe_cross",
             ),
-        });
+        }
     }
 }
 
@@ -1052,15 +1053,23 @@ impl ChunkWorld {
         let plane = grid.is_plane();
         // Drawing's pipelines for its form.
         let form = usize::from(plane);
+        // Compiled off the frame from now (PSO precaching): the world draws
+        // and generates once they are ready (`ChunkWorld::pipelines_ready`).
         if self.pipelines[form].is_none() {
             let source = draw_source(plane, self.counting);
-            self.pipelines[form] = Some(DrawPipelines::new(
+            let layouts = self.layouts.clone();
+            let scene = self
+                .scene
+                .as_ref()
+                .map(|s| (s.layout.clone(), s.capacity, s.shore_params_layout.clone()));
+            self.pipelines[form] = Some(helio_core::compile::Compiling::start(
                 &device,
-                &self.layouts,
-                &source,
-                self.scene
-                    .as_ref()
-                    .map(|s| (&s.layout, s.capacity, &s.shore_params_layout)),
+                if plane {
+                    "voxel draw pipelines (planes)"
+                } else {
+                    "voxel draw pipelines (spheres)"
+                },
+                move |device| DrawPipelines::new(device, &layouts, &source, scene.as_ref()),
             ));
         }
         let gen_source = generation_source(plane, &program, self.wide64);
@@ -1072,11 +1081,15 @@ impl ChunkWorld {
         {
             Some(gen) => gen,
             None => {
-                let gen = std::sync::Arc::new(GenPipelines::new(
+                let (source, gen_layout, keep_layout) = (
+                    gen_source.clone(),
+                    self.gen_pipeline_layout.clone(),
+                    self.keep_pipeline_layout.clone(),
+                );
+                let gen = std::sync::Arc::new(helio_core::compile::Compiling::start(
                     &device,
-                    &gen_source,
-                    &self.gen_pipeline_layout,
-                    &self.keep_pipeline_layout,
+                    "voxel generation pipelines",
+                    move |device| GenPipelines::new(device, &source, &gen_layout, &keep_layout),
                 ));
                 self.gen_cache
                     .insert(source_key, std::sync::Arc::downgrade(&gen));
@@ -1277,12 +1290,6 @@ impl ChunkWorld {
         });
         if self.primary.is_none() {
             self.primary = Some(index16);
-        }
-        // More than one volume: each form's passes lighting the others.
-        if self.volumes.iter().flatten().count() > 1 {
-            for pipelines in self.pipelines.iter_mut().flatten() {
-                pipelines.ensure_cross(&self.device, &self.layouts);
-            }
         }
         VolumeId(index16)
     }
