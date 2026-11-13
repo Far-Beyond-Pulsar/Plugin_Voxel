@@ -29,6 +29,8 @@ tracing = { workspace = true }
 helio = { workspace = true }
 helio-feature-api = { workspace = true }
 helio-settings = { workspace = true }
+# The world builder's thread runs on the host's task system.
+helio-tasks = { workspace = true }
 # The plugin's api (data formats) and feature crates.
 helio-voxel-data = { workspace = true }
 helio-pass-voxel-planet = { workspace = true }

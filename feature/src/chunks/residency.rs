@@ -2244,11 +2244,13 @@ impl Worker {
     pub fn spawn() -> Self {
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (outbox, results) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("chunk residency".into())
-            .spawn(move || {
+        // Ends when the world drops its job sender.
+        helio_tasks::spawn_service(
+            helio_tasks::ServiceSpec::new("Voxel residency planner", "chunk residency")
+                .owner("voxel"),
+            move |ctx| {
                 let mut planning: FxHashMap<u16, Planning> = FxHashMap::default();
-                while let Ok(job) = inbox.recv() {
+                while let Ok(job) = ctx.wait(|| inbox.recv()) {
                     for change in job.changes {
                         match change {
                             Change::Add {
@@ -2326,8 +2328,9 @@ impl Worker {
                         break;
                     }
                 }
-            })
-            .expect("chunk residency thread");
+            },
+        )
+        .expect("chunk residency thread");
         Self {
             jobs,
             results: std::sync::Mutex::new(results),

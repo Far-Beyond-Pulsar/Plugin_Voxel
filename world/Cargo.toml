@@ -13,6 +13,8 @@ serde_json = "1"
 rustc-hash = "2.1"
 # Brush baking and coarse rebuilds across cores (`edit_store`).
 rayon = "1.12"
+# Query workers run on the host's task system.
+helio-tasks = { workspace = true }
 
 [dev-dependencies]
 # examples/planet_map.rs writes the maps as PNGs.

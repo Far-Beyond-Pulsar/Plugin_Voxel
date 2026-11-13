@@ -15,6 +15,7 @@ use helio_core::{
     DebugViewDescriptor, DebugViewLegend, DebugViewLegendStop, PassContext, PrepareContext,
     RenderPass,
 };
+use helio_frame_api::lighting::sky::SKY_FRAME;
 use std::sync::Arc;
 
 /// A frame's volume as the world holds it: the host's id, the world's, the
@@ -305,10 +306,8 @@ const READS: &[&str] = &[
     helio_gi_api::GI_RAYS,
     helio_gi_api::GI_SUN,
     helio_gi_api::GI_CLIPMAP,
-    ATMOSPHERE_FRAME,
+    SKY_FRAME,
 ];
-/// helio-pass-sky's frame of the atmosphere (its sun's disk).
-const ATMOSPHERE_FRAME: &str = "atmosphere_frame";
 const WRITES: &[&str] = &[
     helio_frame_api::gbuffer::GROUP,
     helio_frame_api::gbuffer::LIGHTMAP_UV,
@@ -748,7 +747,7 @@ impl ChunkPass {
         // The atmosphere's sun disk sizes the shadows' penumbrae.
         world.set_atmosphere_frame(
             ctx.registry
-                .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(ATMOSPHERE_FRAME))
+                .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(SKY_FRAME))
                 .map(|b| (*b).clone()),
         );
         // The sun's occlusion by the terrain, for what else the sun lights

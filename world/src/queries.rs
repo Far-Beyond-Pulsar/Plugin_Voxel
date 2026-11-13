@@ -491,7 +491,7 @@ struct Shared {
 /// See the module doc.
 pub struct WorldQueries {
     shared: Arc<Shared>,
-    workers: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<helio_tasks::Service>,
     /// Resident bricks kept at most (about 1 KiB each, 17 with materials).
     budget: usize,
 }
@@ -530,10 +530,17 @@ impl WorldQueries {
         let workers = (0..threads.max(1))
             .map(|n| {
                 let shared = shared.clone();
-                std::thread::Builder::new()
-                    .name(format!("voxel-queries-{n}"))
-                    .spawn(move || work(&shared))
-                    .expect("spawn a voxel query worker")
+                helio_tasks::spawn_service(
+                    helio_tasks::ServiceSpec::new(
+                        format!("Voxel world queries {n}"),
+                        format!("voxel-queries-{n}"),
+                    )
+                    .owner("voxel")
+                    .role(helio_tasks::Role::Compute)
+                    .pool("voxel-queries"),
+                    move |ctx| work(&shared, ctx),
+                )
+                .expect("spawn a voxel query worker")
             })
             .collect();
         Self {
@@ -1284,7 +1291,7 @@ fn rebuild(
     }
 }
 
-fn work(shared: &Shared) {
+fn work(shared: &Shared, ctx: &helio_tasks::TaskContext) {
     loop {
         let job = {
             let mut state = shared.state.lock().expect("queries");
@@ -1295,7 +1302,7 @@ fn work(shared: &Shared) {
                 if let Some(job) = take(&mut state, shared) {
                     break job;
                 }
-                state = shared.work.wait(state).expect("queries");
+                state = ctx.wait(|| shared.work.wait(state).expect("queries"));
             }
         };
         match job {

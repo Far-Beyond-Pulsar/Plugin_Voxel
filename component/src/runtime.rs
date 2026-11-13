@@ -129,12 +129,18 @@ impl TerrainWorld {
     fn new() -> Self {
         let (requests, inbox) = mpsc::channel::<Request>();
         let (outbox, results) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("voxel-world".into())
-            .spawn(move || {
-                // Ends with the runtime (its sender dropped).
-                while let Ok(request) = inbox.recv() {
+        // Ends with the runtime (its sender dropped). A build has no bound
+        // (a new recipe bakes its maps), so it names its phase instead of
+        // beating.
+        helio_tasks::spawn_service(
+            helio_tasks::ServiceSpec::new("Voxel world builder", "voxel-world")
+                .owner("voxel")
+                .no_heartbeat(),
+            move |ctx| {
+                while let Ok(request) = ctx.wait(|| inbox.recv()) {
+                    ctx.set_phase("Building the world");
                     let built = build(&request.target, request.base.as_deref());
+                    ctx.set_phase("Waiting for a request");
                     let landed = Landed {
                         target: request.target,
                         built,
@@ -143,8 +149,9 @@ impl TerrainWorld {
                         return;
                     }
                 }
-            })
-            .expect("spawn the voxel world builder");
+            },
+        )
+        .expect("spawn the voxel world builder");
         Self {
             state: Mutex::default(),
             requests,
