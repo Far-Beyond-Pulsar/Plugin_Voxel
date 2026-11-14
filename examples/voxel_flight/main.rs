@@ -238,14 +238,12 @@ impl Flight {
         }
         scene.world.flush_gpu_mirror(&queue);
         // The renderer's pass generates as a host's does: the engine's
-        // milliseconds a frame unless the environment sets them.
+        // milliseconds a frame unless the environment sets them (a frame's
+        // length too; unset, the pass follows the renderer's frame budget).
         let mut config = chunk_config(size[1], 256);
         config.generate_ms = config
             .generate_ms
             .or(helio_pass_voxel_planet::chunks::ResidencyConfig::default().generate_ms);
-        config.frame_ms = config
-            .frame_ms
-            .or(helio_pass_voxel_planet::chunks::ResidencyConfig::default().frame_ms);
         // The generator's look with the materials the preset's features add.
         let appearance = preset.appearance(planet.field().appearance());
         let terrain = helio_pass_voxel_planet::VoxelSettings { residency: config };
