@@ -2271,7 +2271,7 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
     out.orm = vec4<f32>(look.ao * textureLoad(hit_sky, p, 0).r * occlusion, clamp(roughness, 0.04, 1.0), 0.0, f0);
     out.emissive = vec4<f32>(emissive, f0);
     // Terrain tag consumed by deferred lighting (skips screen-space AO).
-    out.lightmap_uv = GBUFFER_TAG_TRACED;
+    out.surface = GBUFFER_TAG_TRACED;
     // Materials that let light through are two-sided foliage: the sun from
     // behind comes through tinted by their colour (its share through the
     // leaf and those past it is the sun's visibility: `shadow_fallback`).

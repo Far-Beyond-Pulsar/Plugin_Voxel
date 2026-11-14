@@ -292,7 +292,7 @@ impl ChunkPass {
 
 const READS: &[&str] = &[
     helio_frame_api::gbuffer::GROUP,
-    helio_frame_api::gbuffer::LIGHTMAP_UV,
+    helio_frame_api::gbuffer::SURFACE,
     helio_frame_api::gbuffer::SSS,
     helio_frame_api::gbuffer::EXTRA,
     helio_frame_api::gbuffer::VELOCITY,
@@ -310,7 +310,7 @@ const READS: &[&str] = &[
 ];
 const WRITES: &[&str] = &[
     helio_frame_api::gbuffer::GROUP,
-    helio_frame_api::gbuffer::LIGHTMAP_UV,
+    helio_frame_api::gbuffer::SURFACE,
     helio_frame_api::gbuffer::SSS,
     helio_frame_api::gbuffer::EXTRA,
     helio_frame_api::gbuffer::VELOCITY,
@@ -623,7 +623,7 @@ impl ChunkPass {
             g.views[1],
             g.views[2],
             g.views[3],
-            view!(helio_frame_api::gbuffer::LIGHTMAP_UV),
+            view!(helio_frame_api::gbuffer::SURFACE),
             view!(helio_frame_api::gbuffer::SSS),
             view!(helio_frame_api::gbuffer::EXTRA),
             view!(helio_frame_api::gbuffer::VELOCITY),
