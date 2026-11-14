@@ -1985,7 +1985,9 @@ pub struct ResidencyConfig {
     /// Milliseconds a frame may take: `ChunkPass` lets generation grow into
     /// what the last measured frame left of them on the GPU and the CPU, by
     /// half a millisecond a frame at most, up to three times `generate_ms`
-    /// (nodes wait only while the frame is full).
+    /// (nodes wait only while the frame is full). `None`: the host's pace
+    /// (`PassContext::frame_budget_ms`, its display's refresh); with neither,
+    /// no growth.
     pub frame_ms: Option<f64>,
 }
 
@@ -1996,7 +1998,7 @@ impl Default for ResidencyConfig {
     /// frame; a 45 degree view 1080 pixels tall), 400 km out, half a second
     /// of prefetch, buried nodes generated where they hold the eye, chunks
     /// unvisited for 600 frames released; up to 256 footprints and 3 ms of
-    /// generation a frame.
+    /// generation a 60th of a second, in frames the host's pace long.
     fn default() -> Self {
         let release_frames = 600;
         Self {
@@ -2018,7 +2020,7 @@ impl Default for ResidencyConfig {
             },
             footprints_per_frame: 256,
             generate_ms: Some(3.0),
-            frame_ms: Some(16.0),
+            frame_ms: None,
         }
     }
 }
@@ -4953,6 +4955,7 @@ impl ChunkWorld {
         // 2. The latest plans (made on the worker from an eye a frame or two
         // old) and their evictions; then the next plans, with what slots
         // need freeing.
+        let plans_scope = helio_core::CpuScope::new("VoxelChunks: plans and evictions");
         let (mut added, mut removed) = (Vec::new(), Vec::new());
         let mut evicted = Vec::new();
         if let Some(plans) = self.worker.poll() {
@@ -5048,6 +5051,8 @@ impl ChunkWorld {
                 .max(2 * CHUNK_BATCH as u64 * LEAVES_PER_SLOT / LEAF_PAGE)
                 .min(pages / 2)
         };
+        drop(plans_scope);
+        let grow_scope = helio_core::CpuScope::new("VoxelChunks: grow pools");
         let grow_clock = std::time::Instant::now();
         if self.free_slots.len() + evictions.len() < reserve(self.slot_capacity)
             && self.slot_capacity < self.max_chunks
@@ -5065,6 +5070,8 @@ impl ChunkWorld {
             }
         }
         stats.grow_ms = grow_clock.elapsed().as_secs_f64() * 1e3;
+        drop(grow_scope);
+        let jobs_scope = helio_core::CpuScope::new("VoxelChunks: plan jobs");
         let reserve = reserve(self.slot_capacity);
         let mut need = reserve.saturating_sub(self.free_slots.len() + evictions.len());
         let pages = self.leaf_capacity / LEAF_PAGE;
@@ -5124,6 +5131,7 @@ impl ChunkWorld {
         if !jobs.is_empty() {
             self.worker.submit(frame, &mut self.reports_unsent, jobs);
         }
+        drop(jobs_scope);
         lap(&mut stats, 1);
         for vol in self.volumes.iter().flatten() {
             let plan = &vol.plan;
@@ -5142,6 +5150,7 @@ impl ChunkWorld {
         // built short of pages are built again; full at its most, they
         // keep their leaves' pairs.
         if let Some(full_at) = self.detail_overflow_seen.take() {
+            helio_core::cpu_scope!("VoxelChunks: grow details");
             if full_at == self.detail_capacity && self.detail_capacity < self.detail_max {
                 self.grow_details(encoder);
             }
@@ -5304,6 +5313,7 @@ impl ChunkWorld {
         vol.urgent_distance.retain(|k, _| urgent.contains(k));
         // The plan's requests, a footprint's nodes together.
         let mut restores = Restores::default();
+        let requests_scope = helio_core::CpuScope::new("VoxelChunks: generate: plan requests");
         let requests = std::mem::take(&mut vol.plan.requests);
         // The terrain regions of the footprints the next frames may reach,
         // asked for together (made off the frame); a footprint whose regions
@@ -5369,6 +5379,7 @@ impl ChunkWorld {
             at = end;
         }
         vol.plan.requests = requests;
+        drop(requests_scope);
         let GenBatch {
             computed,
             cached,
@@ -5397,6 +5408,7 @@ impl ChunkWorld {
 
         // GPU: blocks of evicted chunks back to their free lists, then the
         // tiles' columns, the chunks' columns and trees.
+        let buffers_scope = helio_core::CpuScope::new("VoxelChunks: generate: job buffers");
         let refs_buffer = self.gpu_cache.buffer_init(
             &self.device,
             &wgpu::util::BufferInitDescriptor {
@@ -5429,7 +5441,11 @@ impl ChunkWorld {
                 usage: wgpu::BufferUsages::STORAGE,
             },
         );
-        vol.brick_cache.upload(&self.device, &self.queue, encoder);
+        drop(buffers_scope);
+        {
+            helio_core::cpu_scope!("VoxelChunks: generate: brick cache upload");
+            vol.brick_cache.upload(&self.device, &self.queue, encoder);
+        }
         let pack_group = (!packs.is_empty()).then(|| {
             let jobs: Vec<[u32; 4]> = packs.iter().map(|&(_, slot, ..)| [slot, 0, 0, 0]).collect();
             encoder.clear_buffer(&self.pack_alloc, 0, Some((1 + 2 * MAX_PACKS as u64) * 4));
@@ -5437,7 +5453,10 @@ impl ChunkWorld {
         });
         let restore_group = (!restores.jobs.is_empty())
             .then(|| self.keep_group(&[[0; 4]], &restores.jobs, &restores.data));
-        vol.regions.flush(&self.queue);
+        {
+            helio_core::cpu_scope!("VoxelChunks: generate: regions flush");
+            vol.regions.flush(&self.queue);
+        }
         let group = self.gen_group(
             &vol,
             &refs_buffer,
@@ -5466,6 +5485,7 @@ impl ChunkWorld {
         // The frame's candidate block jobs and its computed footprints'
         // block tables.
         let block_jobs = if vol.has_features && computed_count > 0 {
+            helio_core::cpu_scope!("VoxelChunks: generate: feature blocks");
             let computed = tile_jobs[..computed_count].iter().map(|t| Footprint {
                 volume: vol.index,
                 face: t.face as u8,
@@ -5722,6 +5742,7 @@ impl ChunkWorld {
         frame: u64,
         unseen: bool,
     ) -> UpdateStats {
+        helio_core::cpu_scope!("VoxelChunks: finish update");
         let mut clock = std::time::Instant::now();
         let mut lap = |stats: &mut UpdateStats, i: usize| {
             stats.cpu_ms[i] = clock.elapsed().as_secs_f64() * 1e3;
@@ -6515,20 +6536,38 @@ impl ChunkWorld {
         if !(0.0..n).contains(&c[0]) || !(0.0..n).contains(&c[1]) {
             return u32::MAX;
         }
-        self.nodes
-            .iter()
-            .filter(|(k, c)| {
-                k.volume == vol.index
-                    && k.face == cell.face
-                    && (cell.i >> k.level).div_euclid(CHUNK) == k.cx
-                    && (cell.j >> k.level).div_euclid(CHUNK) == k.cy
-                    && self.drawn_set.contains(c.slot)
-                    && c.z.is_some_and(|(_, hi)| {
-                        (i64::from(k.cz * CHUNK + hi) << k.level) > i64::from(cell.k)
-                    })
-            })
-            .min_by_key(|(k, _)| k.level)
-            .map_or(u32::MAX, |(_, c)| c.slot)
+        // The eye's column at each level, finest first, through the column
+        // index (`footprint_nodes`): a few lookups a level, never a walk of
+        // every resident node (that walk was most of the draw's CPU time on
+        // a planet). At the finest level with one, the drawn chunk whose top
+        // is above the eye, the lowest (the one holding the eye when drawn).
+        for level in 0..vol.grid.levels() {
+            let column = Footprint {
+                volume: vol.index,
+                face: cell.face,
+                level,
+                cx: (cell.i >> level).div_euclid(CHUNK),
+                cy: (cell.j >> level).div_euclid(CHUNK),
+            };
+            let Some(czs) = self.footprint_nodes.get(&column) else {
+                continue;
+            };
+            let holding = czs
+                .iter()
+                .filter_map(|&cz| {
+                    let resident = self.nodes.get(&column.node(cz))?;
+                    let above = resident.z.is_some_and(|(_, hi)| {
+                        (i64::from(cz * CHUNK + hi) << level) > i64::from(cell.k)
+                    });
+                    (above && self.drawn_set.contains(resident.slot))
+                        .then_some((cz, resident.slot))
+                })
+                .min_by_key(|&(cz, _)| cz);
+            if let Some((_, slot)) = holding {
+                return slot;
+            }
+        }
+        u32::MAX
     }
 
     /// The draw parameters of view `v` (in the world frame), in volume
@@ -7919,6 +7958,7 @@ impl ChunkWorld {
             gi,
             eye_index,
         );
+        helio_core::cpu_scope!("VoxelChunks: draw: upload flush");
         self.uploads.flush();
     }
 
@@ -7942,6 +7982,9 @@ impl ChunkWorld {
         let Some(primary) = self.primary else {
             return;
         };
+        // The stages' CPU cost (recording, not GPU time), so a profile names
+        // the part of the draw that costs.
+        let setup_scope = helio_core::CpuScope::new("VoxelChunks: draw: setup");
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
             self.targets = Some(Targets::new(&self.device, size));
             // What was bound over the old targets goes with them.
@@ -8036,12 +8079,18 @@ impl ChunkWorld {
         let primary_vol = self.volumes[usize::from(primary)].as_ref().unwrap();
         let camera_group =
             self.draw_group(&self.params, primary_vol, self.camera_view(primary_vol));
+        drop(setup_scope);
+        let trace_scope = helio_core::CpuScope::new("VoxelChunks: draw: trace");
         let mut groups: Vec<(u16, wgpu::BindGroup, [u32; 4])> = Vec::with_capacity(order.len());
         for (pass, &index) in order.iter().enumerate() {
             let vol = self.volumes[usize::from(index)].as_ref().unwrap();
             let last = prev_of(index);
             let flags = u32::from(moved) | (u32::from(last != vol.transform) << 1);
-            let params = self.draw_params(&input, Some((vol, last)), pass as u32, traced, flags);
+            let params = {
+                helio_core::cpu_scope!("VoxelChunks: draw: trace: params");
+                self.draw_params(&input, Some((vol, last)), pass as u32, traced, flags)
+            };
+            helio_core::cpu_scope!("VoxelChunks: draw: trace: record");
             let group = self.trace_view(
                 encoder,
                 self.camera_view(vol),
@@ -8057,9 +8106,14 @@ impl ChunkWorld {
             );
             groups.push((index, group, params.rect));
         }
-        let cross = self.cross_volumes(&input, &order, &drawn_in, gi.is_some(), &prev);
+        drop(trace_scope);
+        let cross = {
+            helio_core::cpu_scope!("VoxelChunks: draw: cross volumes");
+            self.cross_volumes(&input, &order, &drawn_in, gi.is_some(), &prev)
+        };
         let targets = self.targets.as_ref().unwrap();
         {
+            let lighting_scope = helio_core::CpuScope::new("VoxelChunks: draw: shadows and GI");
             // 4. Sun shadows: samples, then every hit, and meshes before
             // their hits; each volume's hits by its own pass.
             let occlusion = self.sun_occlusion.as_ref().unwrap();
@@ -8302,6 +8356,8 @@ impl ChunkWorld {
                 }
             }
             drop(pass);
+            drop(lighting_scope);
+            helio_core::cpu_scope!("VoxelChunks: draw: denoise");
             self.denoise(
                 encoder,
                 &camera_group,
@@ -8312,6 +8368,7 @@ impl ChunkWorld {
                 timing,
             );
         }
+        helio_core::cpu_scope!("VoxelChunks: draw: reports");
         // The sun's occlusion pages this frame's pixels asked for, back
         // without waiting (when a slot is free).
         if let Some(o) = &mut self.sun_occlusion {

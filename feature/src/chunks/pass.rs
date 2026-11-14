@@ -699,6 +699,7 @@ impl ChunkPass {
             self.gi_eye,
         ) {
             (Some(frame_gi), Some(rays), Some(hits), Some(sun), Some(clipmap), Some(world_eye)) => {
+                helio_core::cpu_scope!("VoxelChunks: follow GI");
                 world.follow_gi(clipmap, world_eye, trace_eye);
                 Some((frame_gi, rays, hits, sun))
             }
@@ -706,12 +707,21 @@ impl ChunkPass {
         };
         let mut cmds = ctx.graphics_cmds();
         let encoder = &mut cmds;
-        // Generation keeps its pace per second at any frame rate: a frame
-        // slower than a 60th of a second generates for longer, up to twice.
+        // The frame's length: the setting when it gives one, else the host's
+        // pace (its display's refresh, `frame_budget_ms`).
         let mut config = self.config;
+        config.frame_ms = config
+            .frame_ms
+            .or_else(|| ctx.frame_budget_ms().map(f64::from));
+        // Generation keeps its pace per second at any frame rate:
+        // `generate_ms` is a 60th of a second's share, scaled to the frame
+        // (a 165 Hz frame generates 0.36 of it, so a fast display does not
+        // spend half its frame generating). With no pace known, the measured
+        // interval sizes it, a slow frame generating for longer, up to twice.
+        let frame_seconds = config.frame_ms.map(|ms| ms / 1000.0).or(interval);
         config.generate_ms = config
             .generate_ms
-            .map(|ms| ms * interval.map_or(1.0, |dt| (dt * 60.0).clamp(1.0, 2.0)));
+            .map(|ms| ms * frame_seconds.map_or(1.0, |s| (s * 60.0).clamp(0.25, 2.0)));
         // It grows into what the last measured frame left of `frame_ms` on
         // the GPU and the CPU (its own generation counted in), by half a
         // millisecond a frame at most (measurements lag), up to three times
@@ -757,7 +767,7 @@ impl ChunkPass {
             helio_core::cpu_scope!("VoxelChunks: sun occlusion");
             world.draw_sun_occlusion(encoder, ctx.frame_num, trace_eye, frame.sun);
         }
-        helio_core::cpu_scope!("VoxelChunks: draw");
+        let draw_scope = helio_core::CpuScope::new("VoxelChunks: draw");
         world.draw_for_eye(
             encoder,
             ctx.frame_num,
@@ -789,6 +799,8 @@ impl ChunkPass {
                 .as_ref(),
             eye_index,
         );
+        drop(draw_scope);
+        let ground_scope = helio_core::CpuScope::new("VoxelChunks: foliage ground");
         // Foliage's ground: where the drawn terrain changed, and this frame's
         // questions (`chunks::ground`) answered against the cut just drawn
         // (the primary volume's, and the others' near the eye).
@@ -813,8 +825,13 @@ impl ChunkPass {
                 self.foliage_ground.answer(question.batch);
             }
         }
+        drop(ground_scope);
         let scene_inputs = self.scene.as_ref().and_then(|(_, source)| source(ctx));
-        world.publish_scene(encoder, gbuffer, ctx.depth, scene_inputs);
+        {
+            helio_core::cpu_scope!("VoxelChunks: publish scene");
+            world.publish_scene(encoder, gbuffer, ctx.depth, scene_inputs);
+        }
+        helio_core::cpu_scope!("VoxelChunks: picks");
         // Picks along rays from this camera's eye: each volume's, at the
         // view points they cross. Others' are another camera's.
         for (h, v) in self.held.iter_mut().zip(&frame.volumes) {

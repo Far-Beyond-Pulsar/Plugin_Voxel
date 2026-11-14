@@ -109,8 +109,8 @@ pub static VOXEL_RESIDENCY: Group = Group {
             "Frame Budget (ms)",
             "Generation",
             (0.0, 1000.0, 0.5),
-            16.0,
-            "Milliseconds a frame may take: generation grows into what the frame leaves; 0: no growth",
+            0.0,
+            "Milliseconds a frame may take: generation grows into what the frame leaves; 0: the display's frame time",
         ),
     ],
 };

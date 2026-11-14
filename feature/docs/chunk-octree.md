@@ -293,8 +293,13 @@ would be visited; one refining visits its children as they enter).
 ## Generation
 
 `ChunkWorld::update` generates a frame's batch within a GPU budget
-(`ResidencyConfig::generate_ms`, 3 ms; `ChunkPass` lets it grow into what
-the last frame left of `frame_ms`, up to three times) against the measured
+(`ResidencyConfig::generate_ms`, 3 ms a 60th of a second: `ChunkPass` scales
+it to the frame's length, so a 165 Hz frame gets 0.36 of it and generation
+keeps its pace per second; it then grows into what the last frame left of
+`frame_ms`, up to three times). A frame's length is `frame_ms` when set, else
+the host's pace (`PassContext::frame_budget_ms`: the output's refresh, which
+Pulsar's render scheduler sets), so generation never stretches a fast
+display's frames toward an assumed 60 Hz. Against the measured
 cost of a footprint's columns and of a chunk (`GenCost`), at most
 `footprints_per_frame` footprints. Nodes edits changed go first (coarsest,
 then drawn ones nearest first), then the plan's requests, a footprint's
