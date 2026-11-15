@@ -12,15 +12,15 @@ struct SceneMap {
 
 @group(2) @binding(0) var<storage, read> scene_map: SceneMap;
 @group(2) @binding(1) var<storage, read> scene_materials: array<GpuMaterial>;
-@group(2) @binding(2) var scene_textures: binding_array<texture_2d<f32>, MATERIAL_TEXTURES>;
-@group(2) @binding(3) var scene_samplers: binding_array<sampler, MATERIAL_TEXTURES>;
+@group(2) @binding(2) var scene_sampler: sampler;
+@group(2) @binding(3) var scene_textures: binding_array<texture_2d<f32>, MATERIAL_TEXTURES>;
 // Shared with WaterSim. Layer 0 holds terrain height/coast distance/coast
 // gradient; layer 1 holds travel time/front direction/shoaling. state.zw is
 // the map center relative to this frame's eye, matching chunk hit positions.
 struct WaterShoreParams { center_extent: vec4<f32>, state: vec4<f32> }
 @group(2) @binding(4) var water_shore_fields: texture_2d_array<f32>;
 // Kept in group 3: WGPU forbids uniform buffers in a group that contains
-// descriptor binding arrays (the scene texture/sampler table in group 2).
+// descriptor binding arrays (the scene texture table in group 2).
 @group(3) @binding(0) var<uniform> water_shore_params: WaterShoreParams;
 
 fn swash_hash12(p: vec2<f32>) -> f32 {
@@ -178,7 +178,7 @@ fn scene_surface(m: u32, axis: u32, sign: u32, level: u32, cell: vec3<i32>, in_c
         // its longer side (not the half pixel the direction is sampled at):
         // the mip whose texels are that long.
         let footprint = max(scene_texels_per_pixel(slot, tile_px) + log2(clamp(slant, 1.0, 16.0)), 0.0);
-        let spread = textureSampleLevel(scene_textures[slot], scene_samplers[slot], uv, footprint).a;
+        let spread = textureSampleLevel(scene_textures[slot], scene_sampler, uv, footprint).a;
         roughness = normal_map_roughness(roughness, spread, 1.0);
     }
     return SceneSurface(colour, roughness, material.emissive.rgb * material.emissive.w * texel, normal, occlusion, swash, true);
@@ -195,5 +195,5 @@ fn scene_texels_per_pixel(slot: u32, tile_px: f32) -> f32 {
 // `scene_surface`) on a texture `tile_px` pixels wide.
 fn scene_sample(slot: u32, uv: vec2<f32>, tile_px: f32) -> vec4<f32> {
     let lod = max(scene_texels_per_pixel(slot, tile_px) - 1.0, 0.0);
-    return textureSampleLevel(scene_textures[slot], scene_samplers[slot], uv, lod);
+    return textureSampleLevel(scene_textures[slot], scene_sampler, uv, lod);
 }

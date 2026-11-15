@@ -9084,7 +9084,6 @@ impl ChunkWorld {
         let scene = self.scene.as_ref().zip(inputs).filter(|(s, i)| {
             s.map_written.is_some()
                 && i.texture_views.len() == s.capacity as usize
-                && i.samplers.len() == s.capacity as usize
         });
         let scene_group = scene.as_ref().map(|(s, i)| {
             let mut cached = s.group.lock().unwrap();
@@ -9103,30 +9102,31 @@ impl ChunkWorld {
                     &wgpu::BindGroupDescriptor {
                         label: Some("chunk scene materials"),
                         layout: &s.layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: s.map.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: i.materials.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureViewArray(i.texture_views),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::SamplerArray(i.samplers),
-                            },
-                            wgpu::BindGroupEntry {
+                        entries: &{
+                            let mut entries = vec![
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: s.map.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: i.materials.as_entire_binding(),
+                                },
+                            ];
+                            scene::table_binding(s.capacity).append_bind_group_entries(
+                                &mut entries,
+                                2,
+                                i.texture_views,
+                                i.sampler,
+                            );
+                            entries.push(wgpu::BindGroupEntry {
                                 binding: 4,
                                 resource: wgpu::BindingResource::TextureView(
                                     i.water_shore_fields.unwrap_or(&s.swash_fallback_view),
                                 ),
-                            },
-                        ],
+                            });
+                            entries
+                        },
                     },
                 );
                 let shore_params = self.gpu_cache.bind_group(

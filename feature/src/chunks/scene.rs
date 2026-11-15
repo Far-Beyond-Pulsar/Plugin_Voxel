@@ -54,7 +54,8 @@ pub struct SceneMaterialInputs<'a> {
     pub materials: &'a wgpu::Buffer,
     /// The descriptor-indexed texture table, `texture_capacity` long.
     pub texture_views: &'a [&'a wgpu::TextureView],
-    pub samplers: &'a [&'a wgpu::Sampler],
+    /// The one sampler the table is read through.
+    pub sampler: &'a wgpu::Sampler,
     /// Shared Ultra-Water terrain fields; optional when no authored shore map
     /// is active. The texture is a two-layer `shore`/`travel` RGBA32F array.
     pub water_shore_fields: Option<&'a wgpu::TextureView>,
@@ -100,56 +101,40 @@ pub(crate) fn scene_source(draw: &str, capacity: u32) -> String {
     )
 }
 
+/// The texture table's binding for a table of `capacity` entries: always
+/// binding arrays (the scene materials need descriptor indexing, see
+/// [`texture_capacity`]). Bound at 2 (the sampler) and 3 (the textures).
+pub(crate) fn table_binding(capacity: u32) -> helio_mats::MaterialBindingConfig {
+    helio_mats::MaterialBindingConfig {
+        mode: helio_mats::MaterialBindingMode::BindingArray,
+        max_textures: capacity as usize,
+    }
+}
+
 pub(crate) fn layout_entries(capacity: u32) -> Vec<wgpu::BindGroupLayoutEntry> {
-    let count = std::num::NonZeroU32::new(capacity);
-    vec![
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
         },
-        wgpu::BindGroupLayoutEntry {
-            binding: 1,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
+        count: None,
+    };
+    let mut entries = vec![storage(0), storage(1)];
+    table_binding(capacity).append_layout_entries(&mut entries, 2, wgpu::ShaderStages::FRAGMENT);
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 4,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
         },
-        wgpu::BindGroupLayoutEntry {
-            binding: 2,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 3,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count,
-        },
-        wgpu::BindGroupLayoutEntry {
-            binding: 4,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2Array,
-                multisampled: false,
-            },
-            count: None,
-        },
-    ]
+        count: None,
+    });
+    entries
 }
 
 /// Water's frame parameters use a separate group because WGPU forbids a
@@ -185,7 +170,7 @@ pub fn helio_scene_materials() -> SceneMaterialSource {
         Some(SceneMaterialInputs {
             materials: &materials.buffer,
             texture_views: textures.texture_views,
-            samplers: textures.samplers,
+            sampler: textures.sampler,
             water_shore_fields,
             water_shore_params,
             version: (textures.version, materials.epoch as u64),
