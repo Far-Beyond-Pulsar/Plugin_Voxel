@@ -52,6 +52,16 @@ impl Feature for VoxelFeature {
                     let Some(settings) = build.env.setting::<VoxelSettings>().cloned() else {
                         return Ok(());
                     };
+                    // A secondary view (a reflection, a portal's, `helio_core::view`)
+                    // draws no terrain yet: the world is this pass's, and its
+                    // draw state (targets, denoiser history, per-eye motion,
+                    // parameters) is one camera's. Drawing the frame's world
+                    // for another view needs that state per view, the world
+                    // shared; until then a second pass here would build a
+                    // second world.
+                    if !helio_frame_api::view::view_of(build.env).is_primary() {
+                        return Ok(());
+                    }
                     let pass = ChunkPass::new(settings.residency);
                     build
                         .env

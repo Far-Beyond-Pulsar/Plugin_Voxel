@@ -300,7 +300,6 @@ impl Flight {
                     .with(helio_pass_decal::DecalFeature)
                     .with(helio_pass_lens::LensFeature)
                     .with(helio_pass_flare::LensFlareFeature)
-                    .with(helio_pass_portal_cull::PortalCullFeature)
                     .with(helio_pass_portal_instances::PortalFeature)
                     .with(helio_pass_foliage_gbuffer::FoliageFeature)
                     .with(helio_pass_water_sim::WaterFeature)
