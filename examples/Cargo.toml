@@ -40,7 +40,6 @@ helio-pass-sprite-batch = { workspace = true }
 helio-pass-decal = { workspace = true }
 helio-pass-lens = { workspace = true }
 helio-pass-flare = { workspace = true }
-helio-pass-portal-cull = { workspace = true }
 helio-pass-portal-instances = { workspace = true }
 helio-pass-foliage-place = { workspace = true, features = ["host-rows"] }
 helio-pass-foliage-gbuffer = { workspace = true }
