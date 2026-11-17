@@ -202,7 +202,10 @@ fn load(spec: &str) -> Script {
         let mut frees: Vec<FreeKey> = Vec::new();
         for k in keys {
             let t = number(k, "t").expect("a key's `t`");
-            assert!(t > last_t, "cinematic script: key times must increase ({t})");
+            assert!(
+                t > last_t,
+                "cinematic script: key times must increase ({t})"
+            );
             last_t = t;
             if let Some(sun) = number(k, "sun_elevation_deg") {
                 sun_keys.push((t, sun));
@@ -439,9 +442,8 @@ fn find_anchor(flight: &Flight, spec: &AnchorSpec, from: DVec3) -> DVec3 {
             .find_map(|(a, b)| {
                 let (i, j) = (base.i + a * step, base.j + b * step);
                 let top = planet.column_top(base.face, i, j, 0);
-                let feature = |i: i32, j: i32, k: i32| {
-                    planet.features_at(0, base.face, i, j, k).flatten()
-                };
+                let feature =
+                    |i: i32, j: i32, k: i32| planet.features_at(0, base.face, i, j, k).flatten();
                 if spec.clearing {
                     // Nothing grows within `radius` of the cell.
                     let open = (-reach..=reach).all(|x| {
@@ -696,7 +698,11 @@ fn build(flight: &Flight, script: &Script, ground_point: DVec3, heading: f64) ->
             .map(|k| {
                 let at = point + up * (f64::from(k) * 0.5 + 0.05);
                 let (cell, _) = planet.grid().locate(at);
-                if planet.solid(cell) { '#' } else { '.' }
+                if planet.solid(cell) {
+                    '#'
+                } else {
+                    '.'
+                }
             })
             .collect();
         eprintln!("CINEMATIC anchor {} column (0-24 m): {profile}", spec.name);
@@ -708,7 +714,13 @@ fn build(flight: &Flight, script: &Script, ground_point: DVec3, heading: f64) ->
     // horizon, at the first anchor.
     if let Some((_, at)) = anchors.first() {
         let (up, forward, right) = frame(*at, track.ahead);
-        for (az, el) in [(0.0f64, 40.0f64), (60.0, 40.0), (90.0, 40.0), (-60.0, 40.0), (135.0, 40.0)] {
+        for (az, el) in [
+            (0.0f64, 40.0f64),
+            (60.0, 40.0),
+            (90.0, 40.0),
+            (-60.0, 40.0),
+            (135.0, 40.0),
+        ] {
             let (a, e) = (az.to_radians(), el.to_radians());
             let sun = (forward * a.cos() + right * a.sin()) * e.cos() + up * e.sin();
             eprintln!(
@@ -844,7 +856,10 @@ fn settle(flight: &mut Flight, eye: DVec3, forward: Vec3, max: u32, converge: u3
             .renderer
             .find_pass::<ChunkPass>()
             .and_then(ChunkPass::sun_page_stats);
-        eprintln!("CINEMATIC sun pages after {} draws: {pages:?}", frames + converge);
+        eprintln!(
+            "CINEMATIC sun pages after {} draws: {pages:?}",
+            frames + converge
+        );
     }
     frames + converge
 }
@@ -932,7 +947,10 @@ pub fn run(flight: &mut Flight, spec: &str, ground_point: DVec3, heading: f64) {
                 );
             }
         }
-        eprintln!("CINEMATIC check: {inside} samples inside solid of {}", total * 2);
+        eprintln!(
+            "CINEMATIC check: {inside} samples inside solid of {}",
+            total * 2
+        );
         return;
     }
 
@@ -946,9 +964,16 @@ pub fn run(flight: &mut Flight, spec: &str, ground_point: DVec3, heading: f64) {
     // Without a temporal upscaler a frame needs no history: only the
     // streaming is waited for.
     let no_aa = std::env::var_os("HELIO_VOXEL_FLIGHT_NO_AA").is_some();
-    let subframes = env_u32("HELIO_VOXEL_FLIGHT_CINEMATIC_SUBFRAMES", if no_aa { 1 } else { 3 }).max(1);
+    let subframes = env_u32(
+        "HELIO_VOXEL_FLIGHT_CINEMATIC_SUBFRAMES",
+        if no_aa { 1 } else { 3 },
+    )
+    .max(1);
     let settle_max = env_u32("HELIO_VOXEL_FLIGHT_CINEMATIC_SETTLE", 600);
-    let converge = env_u32("HELIO_VOXEL_FLIGHT_CINEMATIC_CONVERGE", if no_aa { 0 } else { 24 });
+    let converge = env_u32(
+        "HELIO_VOXEL_FLIGHT_CINEMATIC_CONVERGE",
+        if no_aa { 0 } else { 24 },
+    );
     eprintln!(
         "CINEMATIC {}: {total} frames at {} fps ({:.1} s), rendering {first}..={last} at {}x{}",
         script.name, script.fps, script.seconds, flight.size[0], flight.size[1]
@@ -1014,8 +1039,8 @@ pub fn run(flight: &mut Flight, spec: &str, ground_point: DVec3, heading: f64) {
     } else {
         (0..=last).collect()
     };
-    let skip_existing = std::env::var("HELIO_VOXEL_FLIGHT_CINEMATIC_SKIP_EXISTING")
-        .map_or(true, |v| v != "0");
+    let skip_existing =
+        std::env::var("HELIO_VOXEL_FLIGHT_CINEMATIC_SKIP_EXISTING").map_or(true, |v| v != "0");
     let mut previous: Option<u32> = None;
     for &frame in &order {
         let t = f64::from(frame) * dt;

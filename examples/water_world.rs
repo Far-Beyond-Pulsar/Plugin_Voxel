@@ -38,7 +38,6 @@ use helio_pass_voxel_planet::engine::{PlanetFrame, TerrainAppearance, VOXEL_FRAM
 use helio_pass_voxel_planet::{Brush, BrushOp, BrushShape, Planet, PlanetRecipe, VolumeTransform};
 use helio_pass_water_sim::host_rows::WaterVolumeComponent;
 use helio_pass_water_sim::{GpuWaterVolume, OceanSpectrum, WaterSimPass, WaterSpraySettings};
-use helio_presets::Preset;
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

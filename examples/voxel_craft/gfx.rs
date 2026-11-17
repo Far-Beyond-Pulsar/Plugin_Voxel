@@ -20,7 +20,6 @@ use helio_pass_voxel_planet::chunks::pass::ChunkPass;
 use helio_pass_voxel_planet::chunks::ResidencyConfig;
 use helio_pass_voxel_planet::engine::{PlanetFrame, TerrainAppearance, VOXEL_FRAME};
 use helio_pass_voxel_planet::Planet;
-use helio_presets::Preset;
 use pulsar_scenedb::{Entity, SceneDb};
 use std::sync::Arc;
 use winit::window::Window;
@@ -871,7 +870,6 @@ pub struct View<'a> {
     #[cfg(not(target_arch = "wasm32"))]
     pub vr: Option<&'a crate::xr::rig::RigView>,
     pub target: Option<DVec3>,
-    pub dt: f32,
     pub planet: &'a Arc<Planet>,
     pub player: &'a crate::player::Player,
     /// The camera: position and look direction (planet-centred).
