@@ -63,10 +63,11 @@ crate draws it and re-exports its modules, so a host names one crate.
 | `src/chunks/residency.rs` | The planner (on a worker thread): which nodes are drawn, generated next and released for a moving eye, from distance and what rays met. |
 | `src/chunks/drawn.rs` | The drawn cut: drawn nodes, their ancestors' content boxes and level fades, uploaded as the changes of each frame. |
 | `src/chunks/pass.rs` | `ChunkPass`, the render-graph pass hosts add: reads a `PlanetFrame`, writes Helio's gbuffer and `directional_visibility`. |
+| `src/chunks/rays.rs` | The terrain as a tracer of Helio's ray streams (`helio_frame_api::rays::stream`): the cut each draw leaves for them, the passes a consumer's node gets, their kernels ([Ray streams](docs/chunk-octree.md#ray-streams)). |
 | `src/chunks/scene.rs`, `shaders/scene_materials.wgsl` | Voxel materials drawn with the host's scene materials (Helio material rows and textures for each material's top, side and bottom faces), on devices with texture binding arrays. |
 | `src/engine.rs` | What hosts share with the pass (`PlanetFrame`, picks, appearance) and the terrain half of the shaders (`terrain_source`), checked by `verify_field`. |
 | `shaders/chunk_generate.wgsl` | Footprint columns (two-rate nodes, material slopes, cave primitives, volume extents, feature placements), chunk columns (field, cliff shapes and caves, features, edits, materials), 64-tree build, eviction, packing and restoring kept chunks. |
-| `shaders/chunk_draw.wgsl` | The cut walk, chunk tracing, fades, sun and local light shadows, sky visibility, appearance, gbuffer publish and ray reports. |
+| `shaders/chunk_draw.wgsl` | The cut walk, chunk tracing, fades, sun and local light shadows, sky visibility, appearance, gbuffer publish, ray reports, and ray streams' traces and surfaces. |
 | `shaders/chunk_table.wgsl` | Scatters a frame's chunk-table changes. |
 | `tests/chunks.rs` | GPU correctness against the CPU planet (see [Tests](#tests)). |
 | `tests/wide_products.rs`, `../world/tests/bake_cost.rs` | Hardware and limb wide products agree; what baking a brush costs as the history grows (a report). |
@@ -252,6 +253,10 @@ frame of `ChunkPass`:
 6. **Publish.** Material colour (patches, pigment, edge darkening), corner
    AO and the shading normal go to Helio's gbuffer; Helio's deferred
    lighting, atmosphere and TSR do the rest.
+7. **Ray streams.** Any consumer's rays (Helio's ray streams) walk the cut
+   the last draw left from wherever they start, in every volume: nearest
+   hits and their surfaces, or occlusion
+   ([Ray streams](docs/chunk-octree.md#ray-streams)).
 
 ## Invariants and decisions
 
@@ -347,6 +352,14 @@ unit tests, `tests/chunks.rs`, `tests/wide_products.rs`) and
   feature cells are solid on the CPU.
 - Terrain shadows fall on meshes in front of it.
 - Coverage from orbit; picks report the drawn hit.
+- Ray streams (`terrain_traces_stream_rays`, `terrain_traces_occlusion_streams`,
+  `a_plane_traces_stream_rays`, volumes' `stream_rays_cross_every_volume`):
+  rays from GI's probes, from surfaces, from hundreds of metres off and
+  from 25 km over an Earth against CPU casts (distance, inside, face,
+  material, emission, transmission), lengths, rows kept and replaced, rows
+  past the count; occlusion toward the sun and nearby points;
+  `stream_rays_cost_against_gi_trace` (ignored) times them against
+  `gi_trace` on a frame of GI's rays.
 - Residency: the planner (a cut once over every point, bands switching
   as one, nodes refined by their own distance, parents drawn until every
   Mixed child exists, eviction by pressure and release by age, rays

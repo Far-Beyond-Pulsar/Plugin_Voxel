@@ -94,6 +94,9 @@ pub(super) struct VolumeViews {
     /// volume's points (`ChunkWorld::draw`: shadows across volumes over its
     /// shadow's rectangle, GI rays, foliage probes).
     pub cross: wgpu::Buffer,
+    /// The camera's view as ray streams walk the volume (`chunks::rays`):
+    /// written with each camera draw, read until the next.
+    pub rays: wgpu::Buffer,
 }
 
 /// One placed world of a [`ChunkWorld`].
@@ -102,6 +105,9 @@ pub(super) struct Volume {
     pub tag: u64,
     pub index: u16,
     pub transform: VolumeTransform,
+    /// Whether it has moved since it was added (rays of movable casters see
+    /// it, `chunks::rays`; else those of static ones).
+    pub movable: bool,
     /// The transform each eye's last draw placed it with (its hits' motion
     /// from there), and where the eye was in its frame at the last update,
     /// with the transform then and when (its motion relative to the eye).
@@ -260,6 +266,9 @@ pub(super) struct DrawLayouts {
     pub gi: wgpu::BindGroupLayout,
     pub ground: wgpu::BindGroupLayout,
     pub feedback: wgpu::BindGroupLayout,
+    /// A ray stream's traces and its surfaces (`chunks::rays`).
+    pub rays: wgpu::BindGroupLayout,
+    pub ray_surfaces: wgpu::BindGroupLayout,
 }
 
 impl DrawLayouts {
@@ -535,6 +544,30 @@ impl DrawLayouts {
             ground: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("chunk ground probes"),
                 entries: &[uniform(58, c), read(59), write(60), read(61)],
+            }),
+            // A ray stream: its header, rays and hits, the frame (its
+            // origin, the tracer's number) and the eye of the cut drawn
+            // last; for the surfaces, the surfaces too.
+            rays: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("voxel rays"),
+                entries: &[
+                    read(67),
+                    read(68),
+                    write(69),
+                    uniform(71, c),
+                    uniform(72, c),
+                ],
+            }),
+            ray_surfaces: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("voxel ray surfaces"),
+                entries: &[
+                    read(67),
+                    read(68),
+                    write(69),
+                    write(70),
+                    uniform(71, c),
+                    uniform(72, c),
+                ],
             }),
             // Ray reports: the hits of a pixel of each 2x2, as the nodes
             // they want.
@@ -1188,6 +1221,7 @@ impl ChunkWorld {
             tag,
             index: index16,
             transform,
+            movable: false,
             drawn_transform: [None; 2],
             last_local_eye: None,
             grid,
@@ -1233,6 +1267,7 @@ impl ChunkWorld {
                 camera: params("chunk draw params"),
                 sun: params("chunk sun params"),
                 cross: params("chunk cross params"),
+                rays: params("chunk ray params"),
             },
             tile_data: buffer(
                 "chunk footprint columns",
@@ -1335,6 +1370,7 @@ impl ChunkWorld {
     /// since the last draw is that between them).
     pub fn set_transform(&mut self, id: VolumeId, transform: VolumeTransform) {
         if let Some(vol) = self.volume_mut(id) {
+            vol.movable |= vol.transform != transform;
             vol.transform = transform;
         }
     }

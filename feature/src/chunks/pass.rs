@@ -91,6 +91,9 @@ pub struct ChunkPass {
     /// foliage placement pass ([`Self::foliage_ground`]), its tiling and its answers.
     planet_ground: std::sync::Arc<super::ground::PlanetGround>,
     foliage_ground: std::sync::Arc<helio_foliage_api::GroundLink>,
+    /// Where the cut each draw leaves for ray streams goes, for the
+    /// terrain's tracer passes of the graph (`chunks::rays`).
+    rays: Arc<super::rays::RayLink>,
 }
 
 impl ChunkPass {
@@ -123,7 +126,14 @@ impl ChunkPass {
             xr_mode: false,
             planet_ground,
             foliage_ground,
+            rays: Arc::default(),
         }
+    }
+
+    /// The graph's ray link (`chunks::rays::SharedRayLink`): each draw's cut
+    /// is published there for the terrain's tracer passes.
+    pub fn set_ray_link(&mut self, link: Arc<super::rays::RayLink>) {
+        self.rays = link;
     }
 
     /// The terrain as the ground foliage grows on: give it to a foliage placement pass
@@ -498,6 +508,7 @@ impl ChunkPass {
             self.shown = None;
             self.world = None;
             self.held.clear();
+            self.rays.publish(None);
             return Ok(());
         };
         let world = self.world.get_or_insert_with(|| {
@@ -705,6 +716,11 @@ impl ChunkPass {
             }
             _ => None,
         };
+        // The graph traces ray streams through the terrain: its draws keep
+        // a cut for them and their kernels compile.
+        if self.rays.wanted() {
+            world.want_rays();
+        }
         let mut cmds = ctx.graphics_cmds();
         let encoder = &mut cmds;
         // The frame's length: the setting when it gives one, else the host's
@@ -799,6 +815,7 @@ impl ChunkPass {
                 .as_ref(),
             eye_index,
         );
+        self.rays.publish(world.ray_cut());
         drop(draw_scope);
         let ground_scope = helio_core::CpuScope::new("VoxelChunks: foliage ground");
         // Foliage's ground: where the drawn terrain changed, and this frame's

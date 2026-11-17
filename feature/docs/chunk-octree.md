@@ -66,8 +66,9 @@ One `ChunkWorld` holds them all (`ChunkWorld::add_volume`,
   reprojecting each hit by its volume's motion (`motions`).
 - **Lighting across volumes.** Any ray can walk any volume from where it
   enters it (`enter_volume`: a sphere's ceiling ball, a plane's band
-  between its edges; placed by the volume's anchor chunk, else a sphere's
-  exact levels). Each volume that can matter adds a pass in its own
+  between its edges; placed by the volume's anchor chunk, else by the
+  drawn chunk a sphere's exact levels find there, then again in the frame
+  of the chunk it starts in: see [Ray streams](#ray-streams)). Each volume that can matter adds a pass in its own
   pipelines (`ChunkWorld::cross_volumes`): its sun shadow on the others'
   hits and the meshes, ANDed in, over the rectangle the shadow can fall in
   (`shadow_cross`; pixels the sun's occlusion pages lit are left: every
@@ -692,6 +693,88 @@ With a host's scene materials (`scene.rs`, `shaders/scene_materials.wgsl`,
 devices with texture binding arrays), each voxel material's top, side and
 bottom faces use Helio material rows and textures instead of the flat
 appearance colours.
+
+## Ray streams
+
+The terrain is a tracer of the frame's ray streams
+(`helio_frame_api::rays::stream`; `src/chunks/rays.rs`, chunk_draw.wgsl 8):
+any consumer's rays (GI's probes, shadow rays from any kind's hits,
+reflections, a radiance cache, a reference path tracer) against every
+volume, from anywhere, without hardware ray tracing. `VoxelFeature`
+registers it (`helio_pass_voxel_planet::tracer()`); a host without features
+offers that to its graph (`stream::offer`).
+
+- **The cut it walks.** Each camera draw writes, in command order with the
+  draw, every drawn volume's ray parameters (its camera parameters, no seed
+  chunk at the eye, `RAY_VOLUME_MOVABLE` once it has moved) and the eye
+  they are relative to (`ray_eye`), and publishes the cut (`RayCut`: each
+  volume's bind group, the kernels, the layouts) into the graph's
+  `RayLink` (`SharedRayLink`, made by whichever of the chunk node and a
+  tracer pass builds first). A tracer pass is a pass of the consumer's
+  node: recorded before this frame's draw it walks the last frame's cut,
+  after it this frame's; either way one whole cut, as the draw that wrote
+  the parameters left the chunk storage and table (the update after it
+  changes them in command order; a pool's growth makes new buffers and
+  leaves the old ones to the passes that bound them). A moving volume's
+  rays before the draw see it where the last frame drew it.
+- **Where a ray starts.** A ray carries its frame-space origin only. It
+  comes into each volume's frame by the frame's origin less the draw's eye
+  (f64 high and low parts, `ray_frame`, `ray_eye`), then `enter_volume`:
+  its start, or where it reaches the ceiling ball (a plane's band). The
+  start is placed by the anchor within `ANCHOR_REACH` of its cells, else
+  (spheres) by `placing_chunk`: the point's cell at the first exact level
+  (planet-centred f32, off by up to |p| / 2^24: 0.4 m on an Earth, 0.1 m
+  on the Moon), the drawn node there (`place_at`), its chunk, its air's
+  frame, or a drawn chunk beside it in its column (`frame_near`, up to six
+  levels finer). Placed by one chunk and starting in another, the point is
+  placed again in that one's frame. A chunk's frame is exact to a
+  hundredth of a cell over its box and its neighbours', so the start is
+  the exact cell wherever the estimate lands within a chunk of it (it
+  always does: 0.4 m against chunks of 6.4 m and up). The origin itself is
+  f32 frame space: its rounding is |origin| / 2^24, 24 um at GI's coarsest
+  probes (400 m), 0.4 m at 6000 km, where the cut draws cells of kilometres.
+  A tracer traces from the origin itself, with no offset of its own (the
+  contract): a ray that starts in rock is a hit from inside at once
+  (`SCENE_HIT_INSIDE`, t 1e-6, its face back along the ray), and so is one
+  that starts on a solid cell's face, within `ON_FACE` (1/1024) of a cell
+  of it, whichever way it goes (`on_solid_face`: far past the frames'
+  rounding, so the answer never depends on it; as GI's probes on a mesh's
+  surface count as inside). Consumers start rays off the surfaces they
+  leave.
+- **Nearest** (`ray_nearest`): the walk (`walk`, the camera's and GI's)
+  up to `scene_hit_reach`, the hit written where nearer. Payload: `a` bits
+  0..17 the walk's hit pair (`ROCK_PAIR` a Solid or Buried node's), 17..19
+  the face's axis, 19 its side; `b` the chunk's slot (NONE: none); `c` the
+  cell (6 bits an axis) and the volume's index (bits 18..30).
+- **Surfaces** (`ray_surface`), a pass of their own once every tracer
+  traced (the walk's kernel stays small, and only hits that stayed the
+  terrain's are shaded): the face's normal toward where the ray came from
+  (a ray from inside: back along it), the normal it is lit with by
+  `hit_face`'s rule without the screen (`face_rule`, `face_lit`: natural
+  steps by the stored slope, smooth worlds by `smooth_normal`, cells under
+  the ray's footprint, its cone's spread times the distance, by the slope:
+  the level the cut drew decides), the cell's material (`shown_material`,
+  per-voxel where it has its own) as the G-buffer's publish shades it
+  (`material_albedo`'s patches and clumps at the footprint, no voxel
+  pigment; metalness 0, as the publish writes; the row's roughness), its
+  transmission (`material_transmission`) and emission (the publish's).
+- **Occlusion** (`ray_occlusion`): blocked rows are left; a walk that
+  meets the terrain before `t_max` blocks the ray (voxels are opaque, leaf
+  cells too, as the sun's walks see them).
+- **Every volume**: a dispatch a volume with drawn chunks, the stream's
+  indirect groups each; a ray that misses a volume's ceiling ball costs it
+  the test. Masks: a volume that has moved is `MASK_MOVABLE`, else
+  `MASK_STATIC`.
+- **Cost** (`stream_rays_cost_against_gi_trace`, RTX 3060, a frame of
+  GI's 174 080 probe rays about the GI test's ground, pipelined frames,
+  2026-11-17): nearest 1.39 ms, surfaces 0.09 ms, the entry alone 0.14 ms,
+  occlusion toward the sun 0.25 ms; `gi_trace` on the same rays (from
+  CPU-placed cells, its hits shaded in the kernel) 1.12 ms. The nearest
+  kernel is 0.13 ms over `gi_trace` plus the entry: the general entry's
+  code shares the walk's kernel (and its register budget).
+- **Kernels** compile off the frame per form once a stream is traced
+  (`ChunkWorld::want_rays`: the link asks for them), like the cross-volume
+  passes; drawing never waits for them.
 
 ## Costs
 

@@ -1160,3 +1160,110 @@ fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
         state
     }
 }
+
+/// Ray streams cross every volume (`chunks::rays`: a dispatch a volume, the
+/// nearer hit kept): rays from the probes' places about a block hovering
+/// over the ground, in the frame's space off the eye, hit the nearest
+/// volume as CPU casts over every volume do, at its distance and face, the
+/// block's and the ground's alike, each hit naming its volume.
+#[test]
+fn stream_rays_cross_every_volume() {
+    use helio_frame_api::rays::stream::{unpack_unit, RayClass, SceneRay};
+    let Some(gpu) = gpu() else { return };
+    let (earth, at, ground, up, side) = wall_and_block();
+    let volumes = Volumes::new(vec![
+        VoxelVolume::new(1, earth, VolumeTransform::IDENTITY),
+        VoxelVolume::new(5, Arc::new(block()), at),
+    ]);
+    let fwd = up.cross(side);
+    let eye = ground - fwd * 9.0 + up * 2.0 - side * 3.0;
+    let camera = Camera {
+        eye,
+        forward: (at.position - eye).normalize().as_vec3(),
+        up: up.as_vec3(),
+        size: [320, 180],
+    };
+    let mut scene = Scene::new(gpu, &volumes);
+    scene.world.want_rays();
+    scene
+        .world
+        .wait_for_pipelines()
+        .expect("the ray kernels compile");
+    scene.settle(gpu, &camera);
+    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let origins: Vec<DVec3> = (0..helio_gi_api::LEVEL_PROBES)
+        .map(|p| clipmap.position(p))
+        .filter(|&o| o.distance(at.position) < 8.0 && !volumes.solid(o, Matter::All))
+        .take(400)
+        .collect();
+    let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
+    let mut unit = || loop {
+        let v =
+            DVec3::new(next() as f64, next() as f64, next() as f64) / u64::MAX as f64 * 2.0 - 1.0;
+        if v.length_squared() > 1e-4 && v.length_squared() <= 1.0 {
+            return v.normalize();
+        }
+    };
+    let rays: Vec<(DVec3, DVec3)> = origins
+        .iter()
+        .flat_map(|&o| std::iter::repeat_n(o, 64))
+        .map(|o| (o, unit()))
+        .collect();
+    let frame = eye + DVec3::new(-3.0, 1.25, 0.5);
+    let stream: Vec<SceneRay> = rays
+        .iter()
+        .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.0))
+        .collect();
+    let (hits, surfaces) = common::trace_stream(
+        gpu,
+        &scene.world,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let view_proj = camera.view_proj();
+    let near = 0.7 * 0.1 / camera.pixel_angle();
+    let (mut compared, mut wrong, mut by_volume) = (0, 0, [0usize; 2]);
+    for (k, &(o, d)) in rays.iter().enumerate() {
+        let Some(cpu) = volumes.raycast(o, d, 30.0, Matter::All) else {
+            continue;
+        };
+        let hit_at = o + d * cpu.hit.distance;
+        let clip = view_proj * (hit_at - eye).as_vec3().extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        if clip.w <= 0.0
+            || ndc.x.abs() > 0.95
+            || ndc.y.abs() > 0.95
+            || (hit_at - eye).length() > near
+        {
+            continue;
+        }
+        compared += 1;
+        by_volume[cpu.index] += 1;
+        let h = &hits[k];
+        let face = DVec3::from_array(unpack_unit(surfaces[k].face).map(f64::from));
+        let exact = h.t > 0.0
+            && h.tracer().0 == common::VOXEL_TRACER
+            && !h.inside()
+            && (h.c >> 18) == u32::from(scene.ids[cpu.index].0)
+            && (f64::from(h.t) - cpu.hit.distance).abs() <= 2e-3 + cpu.hit.distance * 1e-5
+            && face.dot(cpu.normal) > 0.99;
+        if !exact {
+            wrong += 1;
+            if wrong < 8 {
+                eprintln!(
+                    "ray {k}: traced {h:?} face {face}, cpu volume {} at {} n {}",
+                    cpu.id, cpu.hit.distance, cpu.normal
+                );
+            }
+        }
+    }
+    eprintln!(
+        "stream rays: compared {compared} (ground {}, block {}), wrong {wrong}",
+        by_volume[0], by_volume[1]
+    );
+    assert!(by_volume[0] > 500 && by_volume[1] > 500, "{by_volume:?}");
+    assert!(wrong * 100 <= compared, "{wrong} of {compared}");
+}

@@ -2152,7 +2152,7 @@ fn voxel_in_cell(c: ChunkDraw, cell: vec3<i32>, position: vec3<f32>) -> vec3<f32
 // A voxel material's surface from the host's scene materials (`chunks::scene`:
 // textures through Helio's material table); `valid` is false where the host
 // maps none, or draws without them.
-struct SceneSurface {
+struct VoxelSceneSurface {
     albedo: vec3<f32>,
     roughness: f32,
     emissive: vec3<f32>,
@@ -2166,8 +2166,8 @@ struct SceneSurface {
 SCENE_MATERIALS
 
 // Shading normal `n` bent by texture normal `t` (in the face's texture
-// frame: `scene_surface`) on a face along `axis` of a cell of frame `c`:
-// the texture's u and up directions there (cell axes, as `scene_surface`
+// frame: `voxel_scene_surface`) on a face along `axis` of a cell of frame `c`:
+// the texture's u and up directions there (cell axes, as `voxel_scene_surface`
 // lays textures on faces), made perpendicular to `n`.
 fn textured_normal(n: vec3<f32>, t: vec3<f32>, c: ChunkDraw, axis: u32) -> vec3<f32> {
     if t.z >= 0.9999 { return n; }
@@ -2233,7 +2233,7 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
     // A pixel's footprint along the face over its width (the view's slant).
     let slant = 1.0 / max(abs(dot(normal, normalize(position))), 1.0 / 16.0);
     let world_xz_from_eye = to_world(position).xz;
-    let scene = scene_surface(material, axis, sign, level, chunk_keys[v.x].yzw * 64 + cell, voxel_in_cell(c, cell, position), pixel_m, slant, world_xz_from_eye);
+    let scene = voxel_scene_surface(material, axis, sign, level, chunk_keys[v.x].yzw * 64 + cell, voxel_in_cell(c, cell, position), pixel_m, slant, world_xz_from_eye);
     var occlusion = 1.0;
     if scene.valid {
         albedo = scene.albedo;
@@ -2486,56 +2486,88 @@ fn screen_ground(q: vec2<u32>, size: vec2<u32>, t: f32) -> vec3<f32> {
 fn hit_face(v: vec2<u32>, ground_hint: vec3<f32>, q: vec2<u32>, size: vec2<u32>, t: f32) -> Face {
     let pixel_m = pixel_width(q, size, t);
     let cell = vec3<i32>(vec3<u32>(v.y, v.y >> 6u, v.y >> 12u) & vec3<u32>(63u));
-    let c = cell_frame(v.x, cell);
-    let key = chunk_keys[v.x];
-    let axis = (v.y >> 18u) & 3u;
-    let sign = (v.y >> 20u) & 1u;
+    let rule = face_rule(v.x, cell, (v.y >> 18u) & 3u, (v.y >> 20u) & 1u, pixel_ray(q, size) * t, pixel_m, ground_hint);
+    if rule.done { return rule.f; }
+    var ground = rule.ground;
+    // Cells of a pixel or less: the slope the hits around make (a few loads).
+    if dot(ground, ground) == 0.0 && length(rule.c.m0.xyz) <= 1.5 * pixel_m { ground = screen_ground(q, size, t); }
+    return face_lit(rule, v.x, cell, ground);
+}
+
+// What lights hit face `axis` (`sign` 1 its positive side) of cell `cell`
+// of chunk `slot`, seen at eye-relative `position` by a footprint `pixel_m`
+// wide (`hit_face`'s rule; the ray streams' surfaces', 8, without the
+// screen): the face (`done`: lit by its own normal), the frame shading
+// reads there, the slope's weight and the ground normal known so far
+// (`ground_hint`; a smooth world's at the hit; the leaf's stored slope).
+struct FaceRule {
+    f: Face,
+    c: ChunkDraw,
+    w: f32,
+    coarse: f32,
+    step: bool,
+    ground: vec3<f32>,
+    done: bool,
+}
+
+fn face_rule(slot: u32, cell: vec3<i32>, axis: u32, sign: u32, position: vec3<f32>, pixel_m: f32, ground_hint: vec3<f32>) -> FaceRule {
+    let c = cell_frame(slot, cell);
+    let key = chunk_keys[slot];
     let axis_world = select(select(c.m2.xyz, c.m1.xyz, axis == 1u), c.m0.xyz, axis == 0u);
     let normal = normalize(axis_world) * select(-1.0, 1.0, sign == 1u);
     let cell_m = length(axis_world);
-    var f = Face(normal, cell_m, normal, 0.0, vec3<f32>(0.0), 0.0);
+    var out = FaceRule(Face(normal, cell_m, normal, 0.0, vec3<f32>(0.0), 0.0), c, 0.0, 0.0, false, vec3<f32>(0.0), true);
     let small = 1.0 - smoothstep(1.0, 3.0, params.planet.y / max(pixel_m, 1e-6));
-    let coarse = max(under_refined(key, length(c.m0.xyz) / max(pixel_m, 1e-6)), small);
+    out.coarse = max(under_refined(key, length(c.m0.xyz) / max(pixel_m, 1e-6)), small);
     // Natural steps only: the leaf stores the heightfield's slope where it
     // holds natural tops. A feature's cells (a boulder, a tree's leaves) or an
     // edit's stand for no slope: softened, rock fields lost their form and
     // shadows, and leaves' sun rays skipped the leaves around them (canopy
     // speckle).
-    let stored = leaf_ground(v.x, cell, c);
-    let step = dot(stored, stored) > 0.0 && !solid_near(v.x, key, cell + vec3<i32>(0, 0, 1));
+    let stored = leaf_ground(slot, cell, c);
+    out.step = dot(stored, stored) > 0.0 && !solid_near(slot, key, cell + vec3<i32>(0, 0, 1));
     // A world made smooth lights every hit by the smooth surface its voxels
     // approximate (`smooth_normal`), natural steps by their exact slope.
     let smoothing = voxel_materials.shape.x;
-    if !step && coarse == 0.0 && smoothing <= 0.0 { return f; }
-    let w = max(max(select(0.0, voxel_materials.detail.w, step), coarse), smoothing);
-    // The heightfield's exact slope stored with the leaf; else, cells of a
-    // pixel or less: the slope the hits around make (a few loads); larger
-    // ones measure their column tops (`slope_normal`).
+    if !out.step && out.coarse == 0.0 && smoothing <= 0.0 { return out; }
+    out.done = false;
+    out.w = max(max(select(0.0, voxel_materials.detail.w, out.step), out.coarse), smoothing);
+    // The heightfield's exact slope stored with the leaf; else the caller's
+    // (the screen's, then the column tops: `face_lit`).
     var ground = ground_hint;
-    if smoothing > 0.0 && !step {
+    if smoothing > 0.0 && !out.step {
         // At this hit, not a neighbour's: it varies across the face.
-        let position = pixel_ray(q, size) * t;
         let local = vec3<f32>(c.i0.w, c.i1.w, c.i2.w) + vec3<f32>(dot(c.i0.xyz, position), dot(c.i1.xyz, position), dot(c.i2.xyz, position));
-        ground = smooth_normal(v.x, key, cell, local, c);
+        ground = smooth_normal(slot, key, cell, local, c);
     }
     if dot(ground, ground) == 0.0 { ground = stored; }
-    if dot(ground, ground) == 0.0 && length(c.m0.xyz) <= 1.5 * pixel_m { ground = screen_ground(q, size, t); }
-    if dot(ground, ground) == 0.0 { ground = slope_normal(v.x, key, cell, c); }
+    out.ground = ground;
+    return out;
+}
+
+// `rule`'s face lit by the slope's normal `ground` (none yet: its column
+// tops', `slope_normal`), by the rule's weight.
+fn face_lit(rule: FaceRule, slot: u32, cell: vec3<i32>, ground_known: vec3<f32>) -> Face {
+    var f = rule.f;
+    var ground = ground_known;
+    if dot(ground, ground) == 0.0 { ground = slope_normal(slot, chunk_keys[slot], cell, rule.c); }
     // A unit normal (written so NaN fails it), else the face's own.
-    if w <= 0.0 || !(abs(dot(ground, ground) - 1.0) < 0.01) { return f; }
-    let shading = mix(normal, ground, w);
+    if rule.w <= 0.0 || !(abs(dot(ground, ground) - 1.0) < 0.01) { return f; }
+    let normal = f.normal;
+    let shading = mix(normal, ground, rule.w);
     let l = dot(shading, shading);
     if !(l > 1e-6) { return f; }
     f.ground = ground;
     f.shading = shading * inverseSqrt(l);
     // A sun ray passes the steps the smooth surface stands for by as far as
     // it leans from the face (none on a flat wall: no leak at its foot).
-    var skip_w = max(select(0.0, voxel_materials.detail.w, step), coarse);
-    if smoothing > 0.0 && !step {
+    let smoothing = voxel_materials.shape.x;
+    var skip_w = max(select(0.0, voxel_materials.detail.w, rule.step), rule.coarse);
+    if smoothing > 0.0 && !rule.step {
         skip_w = max(skip_w, smoothing * clamp(2.0 * length(cross(ground, normal)), 0.0, 1.0));
     }
     f.skip = 2.0 * skip_w;
-    f.light_skip = 2.0 * coarse;
+    f.light_skip = 2.0 * rule.coarse;
     return f;
 }
 
@@ -2922,14 +2954,16 @@ fn frame_chunk(v: vec2<u32>) -> u32 {
 // `placed` (one near it, of this volume) to its cells' precision; without
 // one finer than the exact levels, the exact level's node over it
 // (planet-centred: to half a metre on an Earth). `kind`: 0 a walk, 1 in
-// rock or a Buried node, 2 off the cut (past a corner, or a plane's edge).
+// rock or a Buried node (its hit pair in `rock`, `rock_pair`), 2 off the cut
+// (past a corner, or a plane's edge).
 struct PointStart {
     walk: Walk,
     kind: u32,
+    rock: u32,
 }
 
 fn point_start(org: vec3<f32>, placed: u32, r: i32) -> PointStart {
-    var out = PointStart(Walk(0u, vec4<i32>(0), vec3<i32>(0), vec3<i32>(0), false), 2u);
+    var out = PointStart(Walk(0u, vec4<i32>(0), vec3<i32>(0), vec3<i32>(0), false), 2u, 0u);
     if placed != NONE && ours(placed) && !exact_level(key_level(chunk_keys[placed].x)) {
         let key = chunk_keys[placed];
         let frame = chunk_frame(placed);
@@ -2956,6 +2990,7 @@ fn point_start(org: vec3<f32>, placed: u32, r: i32) -> PointStart {
             out.walk = Walk(at.slot, chunk_keys[at.slot], vec3<i32>(0), vec3<i32>(64), true);
         } else if at.level == ROCK || at.level == BURIED {
             out.kind = 1u;
+            out.rock = rock_pair(at);
         } else if at.level == LOST {
             out.kind = 2u;
         } else if exact_level(at.level) {
@@ -3005,27 +3040,82 @@ fn point_walk(q: vec2<u32>, org: vec3<f32>, v: vec2<u32>, dir: vec3<f32>, range:
 }
 
 // ---- Walks into the volume from anywhere ----
-// Points of other volumes (their hits and meshes in shadow passes, GI
-// probes, foliage queries) see this pass's volume by walking it from where
-// their ray enters it: a sphere's ceiling ball, a plane's edges between its
-// band's bottom and its ceiling (`params.ceiling`). The walk starts there as a point's
-// does (`point_start`): placed by the anchor's frame (`params.cut.w`: a
-// drawn chunk of the volume, near the eye on a sphere; NONE without one),
-// a plane's anywhere (its frames are one affine map), a sphere's within
-// ANCHOR_REACH of its cells (its frames stray from the sphere farther out);
-// else by a sphere's exact levels.
+// Any ray sees this pass's volume by walking it from where it enters it:
+// points of other volumes (their hits and meshes in shadow passes, GI
+// probes, foliage queries) and the ray streams' rays (8), from anywhere. A
+// ray enters a sphere's ceiling ball, a plane's band between its bottom
+// and its ceiling within its edges (`params.ceiling`); one that starts in
+// it enters where it starts. The walk starts there as a point's does
+// (`point_start`), placed in the frame of a drawn chunk near the point to
+// that chunk's cells' precision: the anchor's (`params.cut.w`: a drawn
+// chunk of the volume over the eye's column), a plane's anywhere (its
+// frames are one affine map), a sphere's within ANCHOR_REACH of its cells
+// (its frames stray from the sphere farther out); else the chunk a sphere's
+// exact levels find there (`placing_chunk`). Placed by a chunk other than
+// the one it then starts in, the point is placed again in that one's own
+// frame.
 struct Entry {
     walk: Walk,
     t: f32,
-    // 0: a walk from t; 1: in rock or a Buried node at t; 2: the ray
-    // misses the volume (or nothing is drawn where it enters).
+    // 0: a walk from t; 1: in rock or a Buried node at t (its hit pair in
+    // `rock`); 2: the ray misses the volume (or nothing is drawn where it
+    // enters).
     kind: u32,
+    rock: u32,
 }
 
 const ANCHOR_REACH: f32 = 512.0;
 
+// The drawn chunk whose frame places eye-relative point `p` of a sphere to
+// its cells' precision, for a ray of dither `r`, else NONE. The point's
+// exact cell at the first exact level (planet-centred f32: off by up to
+// |p| / 2^24, half a metre on an Earth) finds the drawn node over it
+// (`place_at`): its chunk; air with a frame; else a drawn chunk beside the
+// point's node in its column (`frame_near`), at the node's level (off the
+// cut: the exact level) or finer
+// (rock under the ground, air over it: air grows to the coarsest empty
+// slab over ground drawn far finer). Air of an exact level needs none: it
+// is walked in the grid's own cells.
+fn placing_chunk(p: vec3<f32>, r: i32) -> u32 {
+    if PLANE_WORLD { return params.cut.w; }
+    let level = min(i32(params.planet.z), i32(params.cut.x));
+    if !exact_level(level) { return NONE; }
+    // The face the point is over, as `point_start`'s.
+    let c = params.up.xyz * params.up.w + p;
+    let a = abs(c);
+    var normal = vec3<i32>(0, 0, select(-1, 1, c.z > 0.0));
+    if a.x >= a.y && a.x >= a.z {
+        normal = vec3<i32>(select(-1, 1, c.x > 0.0), 0, 0);
+    } else if a.y >= a.z {
+        normal = vec3<i32>(0, select(-1, 1, c.y > 0.0), 0);
+    }
+    let face = face_with_normal(normal);
+    // At t = 0 the direction plays no part.
+    let q = exact_cell(exact_ray(p, vec3<f32>(0.0, 0.0, 1.0)), face, level, 0.0);
+    let cell = vec3<i32>(floor(q));
+    let frac = clamp(fract(q), vec3<f32>(0.0), vec3<f32>(0.999));
+    let at = place_at(face, level, cell, frac, r, false);
+    if at.slot != NONE { return at.slot; }
+    // Off the cut there (air finer than its frames reach, `place_at`'s
+    // lost places): every level of the column from the exact one down.
+    var node_level = level;
+    if at.level == LOST {
+    } else if at.level == ROCK || at.level == BURIED {
+        node_level = key_level(at.hi.x);
+    } else {
+        if at.frame != NONE { return at.frame; }
+        if exact_level(at.level) { return NONE; }
+        node_level = at.level;
+    }
+    for (var l = node_level; l >= 0; l--) {
+        let f = frame_near(vec4<i32>(key_x(face, l), cell_at(cell, frac, l - level) >> vec3<u32>(6u)));
+        if f != NONE { return f; }
+    }
+    return NONE;
+}
+
 fn enter_volume(org: vec3<f32>, dir: vec3<f32>, t_end: f32, r: i32) -> Entry {
-    var out = Entry(Walk(0u, vec4<i32>(0), vec3<i32>(0), vec3<i32>(0), false), 0.0, 2u);
+    var out = Entry(Walk(0u, vec4<i32>(0), vec3<i32>(0), vec3<i32>(0), false), 0.0, 2u, 0u);
     let anchor = params.cut.w;
     var t0 = 0.0;
     var t1 = t_end;
@@ -3080,15 +3170,26 @@ fn enter_volume(org: vec3<f32>, dir: vec3<f32>, t_end: f32, r: i32) -> Entry {
     if t1 <= t0 { return out; }
     let p = org + dir * t0;
     var placed = anchor;
-    if !PLANE_WORLD && anchor != NONE {
-        let f = chunk_frame(anchor);
-        let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, p), dot(f.i1.xyz, p), dot(f.i2.xyz, p));
-        if any(abs(o - 32.0) > vec3<f32>(ANCHOR_REACH)) { placed = NONE; }
+    if !PLANE_WORLD {
+        var near = anchor != NONE;
+        if near {
+            let f = chunk_frame(anchor);
+            let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, p), dot(f.i1.xyz, p), dot(f.i2.xyz, p));
+            near = all(abs(o - 32.0) <= vec3<f32>(ANCHOR_REACH));
+        }
+        if !near { placed = placing_chunk(p, r); }
     }
-    let start = point_start(p, placed, r);
+    var start = point_start(p, placed, r);
+    // Started in another chunk than the one that placed it: placed again in
+    // its own frame (exact to its cells), as the point may lie in the chunk
+    // beside it.
+    if start.kind == 0u && start.walk.real && start.walk.slot != placed {
+        start = point_start(p, start.walk.slot, r);
+    }
     out.walk = start.walk;
     out.t = t0;
     out.kind = start.kind;
+    out.rock = start.rock;
     return out;
 }
 
@@ -4785,4 +4886,230 @@ fn ground_probe_cross(@builtin(global_invocation_id) id: vec3<u32>) {
         if end.slot != NONE && end.t > 0.0 { hit = ground_answer(end, org, up, band_top); }
     }
     ground_hits[id.x] = hit;
+}
+
+// ---- 8. Ray streams ----
+// The terrain as a tracer of the frame's ray streams
+// (`helio_frame_api::rays::stream`, `//!use frame_ray_stream`): any
+// consumer's rays, from anywhere, any length, against each volume (a
+// dispatch a volume, `chunks::rays`). A ray, in the frame's space, comes
+// into the volume's frame relative to the eye of the draw whose cut it walks
+// (the frame's origin less that eye: `ray_frame`, `ray_eye`), enters the
+// volume where it starts or where it reaches it (`enter_volume`) and walks
+// the cut (`walk`), as GI's probe rays and the shadows across volumes do.
+// The cut is the last one drawn: written in command order with its draw
+// (`ray_eye` and the volumes' parameters), so a pass before this frame's
+// draw walks the last frame's cut whole, one after it this frame's.
+@group(1) @binding(67) var<storage, read> ray_header: RayStreamHeader;
+@group(1) @binding(68) var<storage, read> stream_rays: array<SceneRay>;
+@group(1) @binding(69) var<storage, read_write> stream_hits: array<SceneHit>;
+@group(1) @binding(70) var<storage, read_write> stream_surfaces: array<SceneSurface>;
+
+// The frame's origin (world: a high and a low f32 part) and this tracer's
+// number in the hits it writes (`tracer.x`).
+struct RayFrame {
+    origin_hi: vec4<f32>,
+    origin_lo: vec4<f32>,
+    tracer: vec4<u32>,
+}
+@group(1) @binding(71) var<uniform> ray_frame: RayFrame;
+
+// The eye of the draw whose cut the rays walk (world, high and low parts):
+// what every volume's parameters are relative to.
+struct RayEye {
+    hi: vec4<f32>,
+    lo: vec4<f32>,
+}
+@group(1) @binding(72) var<uniform> ray_eye: RayEye;
+
+// `params.volume.w` of a volume's ray parameters: it has moved since it was
+// added (rays of `RAY_MASK_MOVABLE` see it; else `RAY_MASK_STATIC`).
+const RAY_VOLUME_MOVABLE: u32 = 16u;
+
+// Whether ray `ray` is one this volume answers: a ray in its row, of a
+// caster mask this volume is in.
+fn stream_sees(ray: SceneRay) -> bool {
+    let movable = (params.volume.w & RAY_VOLUME_MOVABLE) != 0u;
+    let mask = select(RAY_MASK_STATIC, RAY_MASK_MOVABLE, movable);
+    return ray.t_max > 0.0 && (scene_ray_mask(ray) & mask) != 0u;
+}
+
+// Ray `ray`'s origin eye-relative in the volume's frame.
+fn stream_origin(ray: SceneRay) -> vec3<f32> {
+    let offset = (ray_frame.origin_hi.xyz - ray_eye.hi.xyz) + (ray_frame.origin_lo.xyz - ray_eye.lo.xyz);
+    return to_local(ray.origin + offset);
+}
+
+// A terrain hit (`scene_nearest`): in the payload of `a` the walk's hit pair
+// (bits 0..17, `ROCK_PAIR` a Solid or Buried node's), the face's axis
+// (17..19) and side (19: 1 the positive); `b` the chunk's slot (NONE: none,
+// a ray that starts in rock); `c` the cell in it (6 bits an axis) and the
+// volume's index (18..30). What `ray_surface` finds the face again by.
+fn stream_hit(t: f32, inside: bool, slot: u32, cell: vec3<i32>, axis: u32, sign: u32, pair: u32) -> SceneHit {
+    let c = vec3<u32>(clamp(cell, vec3<i32>(0), vec3<i32>(63)));
+    let payload = (pair & 0x1ffffu) | (axis << 17u) | (sign << 19u);
+    return scene_nearest(ray_frame.tracer.x, max(t, 1e-6), inside, payload, slot, c.x | (c.y << 6u) | (c.z << 12u) | (params.volume.x << 18u));
+}
+
+// How close to a solid cell's face (in cells) an origin counts as in it:
+// far past the frames' rounding (a millionth of a cell), so a ray from a
+// face (a consumer that started it on the surface, not off it) is a hit
+// from inside at once whichever way it goes, never what rounding picks.
+const ON_FACE: f32 = 1.0 / 1024.0;
+
+// The walk's hit pair (`Hit::material`) of solid cell `c` of chunk `slot`
+// (in it), as `trace_chunk` reads it.
+fn cell_pair(slot: u32, c: vec3<i32>) -> u32 {
+    let root = chunk_meta[slot];
+    let m = u32((c.x >> 4u) + ((c.y >> 4u) << 2u) + ((c.z >> 4u) << 4u));
+    let index = stored_leaf(slot, c);
+    if bit64(root.root_full, m) || index == NONE { return mid_materials[slot * 64u + m] & 0xffffu; }
+    return leaf_pair(index);
+}
+
+// The solid cell eye-relative `org` lies on a face of, of the chunk it
+// starts in (`start`, a chunk finer than the exact levels): within ON_FACE
+// of a side whose neighbour across is solid; x 64 where none. Its hit pair
+// in w (a neighbour in the chunk beside: none known, 0).
+fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
+    let none = vec4<i32>(64, 0, 0, 0);
+    if !start.real || exact_level(key_level(start.key.x)) { return none; }
+    let f = chunk_frame(start.slot);
+    let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, org), dot(f.i1.xyz, org), dot(f.i2.xyz, org));
+    let c = vec3<i32>(floor(o));
+    let into = o - vec3<f32>(c);
+    for (var axis = 0u; axis < 3u; axis++) {
+        var step = vec3<i32>(0);
+        if into[axis] < ON_FACE {
+            step[axis] = -1;
+        } else if into[axis] > 1.0 - ON_FACE {
+            step[axis] = 1;
+        } else {
+            continue;
+        }
+        let n = c + step;
+        if solid_near(start.slot, start.key, n) {
+            let inside = all(n >= vec3<i32>(0)) && all(n <= vec3<i32>(63));
+            return vec4<i32>(clamp(n, vec3<i32>(0), vec3<i32>(63)), select(0, i32(cell_pair(start.slot, n)), inside));
+        }
+    }
+    return none;
+}
+
+// Where ray `index` first meets this volume within `reach`: a walk's end,
+// and whether the ray starts in rock.
+struct StreamEnd {
+    hit: bool,
+    end: WalkEnd,
+    inside: bool,
+}
+
+fn stream_walk(index: u32, ray: SceneRay, reach: f32) -> StreamEnd {
+    var out = StreamEnd(false, WalkEnd(false, 0.0, NONE, vec3<i32>(0), 0u, 0u, 0u), false);
+    let org = stream_origin(ray);
+    let dir = to_local(ray.dir);
+    let q = vec2<u32>(index & 63u, index >> 6u);
+    let r = fade_dither(q);
+    let e = enter_volume(org, dir, reach, r);
+    if e.kind == 2u { return out; }
+    if e.kind == 1u {
+        // Rock where it enters: from inside where it starts there.
+        out.hit = e.t < reach;
+        out.end = WalkEnd(true, e.t, NONE, vec3<i32>(0), 0u, 0u, e.rock);
+        out.inside = e.t <= 0.0;
+        return out;
+    }
+    // From the origin itself (it starts in the volume) on a solid cell's
+    // face: in the cell.
+    if e.t <= 0.0 {
+        let face = on_solid_face(e.walk, org);
+        if face.x < 64 {
+            out.hit = true;
+            out.end = WalkEnd(true, 0.0, e.walk.slot, face.xyz, 0u, 0u, u32(face.w));
+            out.inside = true;
+            return out;
+        }
+    }
+    let end = walk(e.walk, org, dir, e.t, reach, r, 96u, false, q);
+    out.hit = end.hit && end.t < reach;
+    out.end = end;
+    // Its first cell solid where it starts.
+    out.inside = end.t <= 0.0;
+    return out;
+}
+
+// A nearest-hit stream: each ray's nearest terrain within what its row
+// leaves (`scene_hit_reach`), written where nearer.
+@compute @workgroup_size(64)
+fn ray_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= ray_header.count { return; }
+    let ray = stream_rays[id.x];
+    if !stream_sees(ray) { return; }
+    let s = stream_walk(id.x, ray, scene_hit_reach(ray, stream_hits[id.x]));
+    if !s.hit { return; }
+    stream_hits[id.x] = stream_hit(s.end.t, s.inside, s.end.slot, s.end.cell, s.end.axis, s.end.sign, s.end.material);
+}
+
+// An occlusion stream: a ray the terrain meets before its end lets nothing
+// through (voxels are opaque, foliage cells too, as the sun's walks see
+// them); rows already blocked are left.
+@compute @workgroup_size(64)
+fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= ray_header.count { return; }
+    let ray = stream_rays[id.x];
+    if !stream_sees(ray) || stream_hits[id.x].t > 0.0 { return; }
+    if stream_walk(id.x, ray, ray.t_max).hit {
+        stream_hits[id.x] = scene_occlusion(vec3<f32>(0.0));
+    }
+}
+
+// The surfaces of the hits this volume found (its tracer's, its index):
+// the face's normal and the one it is lit with (`face_rule` at the ray's
+// footprint there, its cone's spread times the distance), facing where the
+// ray came from (a ray that starts in rock: back along it); the cell's
+// material (`shown_material`: its own where it has one) shaded as the
+// G-buffer's publish shades it (patches and clumps at the footprint, no
+// voxel pigment; not metallic), the share of light it lets through and
+// what it emits.
+@compute @workgroup_size(64)
+fn ray_surface(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= ray_header.count { return; }
+    let hit = stream_hits[id.x];
+    if scene_hit_tracer(hit) != ray_frame.tracer.x || (hit.c >> 18u) != params.volume.x { return; }
+    let ray = stream_rays[id.x];
+    let payload = scene_hit_payload(hit);
+    let pair = payload & 0x1ffffu;
+    let axis = (payload >> 17u) & 3u;
+    let sign = (payload >> 19u) & 1u;
+    let slot = hit.b;
+    let cell = vec3<i32>(vec3<u32>(hit.c, hit.c >> 6u, hit.c >> 12u) & vec3<u32>(63u));
+    let dir = to_local(ray.dir);
+    let position = stream_origin(ray) + dir * hit.t;
+    let footprint = max(scene_ray_spread(ray), 0.0) * hit.t;
+    var normal = -dir;
+    var shading = -dir;
+    var material = pair & 0xffu;
+    // Where the material varies from: the cell's centre (rock: the hit).
+    var at = position;
+    if slot != NONE {
+        material = shown_material(pair, slot, cell, axis == 2u && sign == 1u);
+        let c = cell_frame(slot, cell);
+        at = vec3<f32>(c.m0.w, c.m1.w, c.m2.w) + mat3x3<f32>(c.m0.xyz, c.m1.xyz, c.m2.xyz) * (vec3<f32>(cell) + 0.5);
+        if !scene_hit_inside(hit) {
+            let rule = face_rule(slot, cell, axis, sign, position, footprint, vec3<f32>(0.0));
+            var f = rule.f;
+            if !rule.done { f = face_lit(rule, slot, cell, rule.ground); }
+            normal = f.normal;
+            shading = f.shading;
+        }
+    }
+    let m = min(material, 31u);
+    let p = params.eye_domain.xyz + vec3<i32>(floor(params.eye_domain_frac.xyz + at / DOMAIN_UNIT));
+    let albedo = clamp(material_albedo(m, p, 0.0, footprint, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
+    let row = slot_material(m);
+    // The row's emission (its colour times its strength), varied as its
+    // colour is (the publish's).
+    let base = row.base_color.rgb;
+    let emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
+    stream_surfaces[id.x] = scene_surface(to_world(shading), to_world(normal), albedo, 0.0, clamp(row.roughness_metallic.x, 0.04, 1.0), material_transmission(row), emissive);
 }

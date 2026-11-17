@@ -19,6 +19,7 @@ mod volumes;
 pub use sun_pages::SunPageStats;
 pub mod ground;
 pub mod pass;
+pub mod rays;
 pub mod residency;
 pub mod scene;
 
@@ -313,6 +314,14 @@ struct ChunkStatic {
 /// its slot, its `ChunkStatic` (9), its key; and in bytes.
 const RECORD_VEC4S: usize = 2 + std::mem::size_of::<ChunkStatic>() / 16;
 const RECORD_BYTES: usize = RECORD_VEC4S * 16;
+
+/// A volume's eye column (face, i, j), first exact level and form, as
+/// its anchor was placed for (`ChunkWorld::place_anchors`).
+type AnchorColumn = ((u8, i32, i32), u32, bool);
+
+/// `RAY_VOLUME_MOVABLE` of chunk_draw.wgsl: a volume's ray parameters'
+/// `volume.w` when it has moved since it was added.
+const RAY_VOLUME_MOVABLE: u32 = 16;
 
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
@@ -2123,6 +2132,13 @@ pub struct ChunkWorld {
     /// Each form's passes lighting other volumes' points, compiled once the
     /// world holds more than one volume ([`Self::pipelines_ready`]).
     cross: [Option<helio_core::compile::Compiling<volumes::CrossPipelines>>; 2],
+    /// Each form's ray stream kernels, compiled once a stream is traced
+    /// ([`Self::want_rays`]); the eye of the last camera draw (world, high
+    /// and low parts) and the cut it left for ray streams (`rays`).
+    ray_pipelines: [Option<std::sync::Arc<helio_core::compile::Compiling<rays::RayPipelines>>>; 2],
+    rays_wanted: bool,
+    ray_eye: wgpu::Buffer,
+    ray_cut: Option<std::sync::Arc<rays::RayCut>>,
     /// The world's own pipelines (chunk table, records, leaf pool).
     base: helio_core::compile::Compiling<BasePipelines>,
     /// Whether every pipeline the volumes held need is ready: the world
@@ -2321,8 +2337,10 @@ pub struct ChunkWorld {
     /// removed ones still drawn.
     volumes: Vec<Option<volumes::Volume>>,
     primary: Option<u16>,
-    /// Each volume's anchor this draw (`place_anchors`), by index.
+    /// Each volume's anchor this draw (`place_anchors`), by index, and the
+    /// drawn set's version and eye columns they were placed for.
     anchors: Vec<u32>,
+    anchors_for: Option<(u64, Vec<Option<AnchorColumn>>)>,
     /// Where each volume but the primary was at the last update (foliage's
     /// ground changes where one near the eye moves).
     ground_placed: FxHashMap<u16, crate::volume::VolumeTransform>,
@@ -3042,7 +3060,7 @@ fn draw_source(plane: bool, counting: bool) -> String {
     let source = |rel: &str, embedded: &'static str| {
         helio_core::shader::hot::source_text(env!("CARGO_MANIFEST_DIR"), rel, embedded)
     };
-    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_gi_api::GI_COMMON_SNIPPET.source + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
+    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_gi_api::GI_COMMON_SNIPPET.source + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
         .replace("COUNTERS", if counting { "@group(0) @binding(9) var<storage, read_write> counters: array<atomic<u32>, 256>;" } else { "" })
         .replace("WCOUNT(1)", &wcount(1))
         .replace("WCOUNT(3)", &wcount(3))
@@ -3404,6 +3422,14 @@ impl ChunkWorld {
             layouts,
             pipelines: [None, None],
             cross: [None, None],
+            ray_pipelines: [None, None],
+            rays_wanted: false,
+            ray_eye: buffer(
+                "chunk ray eye",
+                32,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            ray_cut: None,
             base,
             drawable: false,
             uv_grid_view,
@@ -3642,6 +3668,7 @@ impl ChunkWorld {
             volumes: Vec::new(),
             primary: None,
             anchors: Vec::new(),
+            anchors_for: None,
             ground_placed: FxHashMap::default(),
             unplanned: Vec::new(),
             removed_drawn: Vec::new(),
@@ -6874,6 +6901,26 @@ impl ChunkWorld {
                 ));
             }
         }
+        if self.rays_wanted {
+            for form in 0..2 {
+                if !forms[form] || self.ray_pipelines[form].is_some() {
+                    continue;
+                }
+                let Some(draw) = self.pipelines[form]
+                    .as_ref()
+                    .and_then(helio_core::compile::Compiling::ready)
+                else {
+                    continue;
+                };
+                let (layouts, module) = (self.layouts.clone(), draw.module.clone());
+                self.ray_pipelines[form] =
+                    Some(std::sync::Arc::new(helio_core::compile::Compiling::start(
+                        &self.device,
+                        "voxel ray stream pipelines",
+                        move |device| rays::RayPipelines::new(device, &layouts, &module),
+                    )));
+            }
+        }
         fn built<T: Send + Sync + 'static>(c: &Option<helio_core::compile::Compiling<T>>) -> bool {
             c.as_ref().is_some_and(|c| c.ready().is_some())
         }
@@ -6901,17 +6948,34 @@ impl ChunkWorld {
             for c in self.pipelines.iter().flatten() {
                 c.wait()?;
             }
-            // Starts the passes lighting across volumes, once.
-            if self.pipelines_ready() {
+            // Starts the passes lighting across volumes and the ray
+            // streams' kernels, once.
+            if self.pipelines_ready() && self.ray_pipelines_ready() {
                 return Ok(());
             }
             for c in self.cross.iter().flatten() {
                 c.wait()?;
             }
-            if self.pipelines_ready() {
+            for c in self.ray_pipelines.iter().flatten() {
+                c.wait()?;
+            }
+            if self.pipelines_ready() && self.ray_pipelines_ready() {
                 return Ok(());
             }
         }
+    }
+
+    /// Whether every held form's ray kernels are compiled, when ray streams
+    /// are wanted (drawing never waits for them).
+    fn ray_pipelines_ready(&self) -> bool {
+        let (forms, _) = self.forms_held();
+        !self.rays_wanted
+            || (0..2).all(|form| {
+                !forms[form]
+                    || self.ray_pipelines[form]
+                        .as_ref()
+                        .is_some_and(|c| c.ready().is_some())
+            })
     }
 
     /// The volumes with chunks in the drawn cut.
@@ -6931,17 +6995,17 @@ impl ChunkWorld {
     /// (`enter_volume`), for an eye at `eye` (world): the finest drawn chunk
     /// finer than its exact levels over the eye's column (a sphere's frames
     /// hold near their chunks), else a plane's coarsest drawn chunk (its
-    /// frames are one affine map); none with a single volume.
+    /// frames are one affine map); none with a single volume and no ray
+    /// stream traced. Placed again only when the drawn set or an eye's
+    /// column changes.
     fn place_anchors(&mut self, eye: DVec3) {
-        self.anchors.clear();
-        self.anchors.resize(self.volumes.len(), u32::MAX);
-        if self.volumes.iter().flatten().count() < 2 {
+        if self.volumes.iter().flatten().count() < 2 && !self.rays_wanted {
+            self.anchors.clear();
+            self.anchors_for = None;
             return;
         }
-        // Each volume's eye column (face, i, j), exact level and form; its
-        // best chunk: over the column, its level, slot.
-        type Column = ((u8, i32, i32), u32, bool);
-        let columns: Vec<Option<Column>> = self
+        // Each volume's eye column (face, i, j), exact level and form.
+        let columns: Vec<Option<AnchorColumn>> = self
             .volumes
             .iter()
             .map(|v| {
@@ -6955,6 +7019,17 @@ impl ChunkWorld {
                 })
             })
             .collect();
+        let version = self.drawn_set.version();
+        if self
+            .anchors_for
+            .as_ref()
+            .is_some_and(|(v, c)| *v == version && *c == columns)
+        {
+            return;
+        }
+        self.anchors.clear();
+        self.anchors.resize(self.volumes.len(), u32::MAX);
+        // Each volume's best chunk: over the column, its level, slot.
         let mut best: Vec<Option<(bool, u32, u32)>> = vec![None; self.volumes.len()];
         for c in &self.drawn_set.list {
             let key = self.slot_keys[c.slot as usize];
@@ -6984,6 +7059,69 @@ impl ChunkWorld {
                 *anchor = slot;
             }
         }
+        self.anchors_for = Some((version, columns));
+    }
+
+    /// Ray streams will be traced through this world (`chunks::rays`): its
+    /// draws keep a cut for them ([`Self::ray_cut`]) and its forms' ray
+    /// kernels compile off the frame.
+    pub fn want_rays(&mut self) {
+        self.rays_wanted = true;
+    }
+
+    /// The cut the last camera draw left for ray streams (none before one,
+    /// or with no stream wanted).
+    pub fn ray_cut(&self) -> Option<std::sync::Arc<rays::RayCut>> {
+        self.ray_cut.clone()
+    }
+
+    /// The cut of camera view `v` for ray streams, after its draw: the eye
+    /// and each volume with drawn chunks' parameters (its pass for the
+    /// camera, `prev` its last transforms; no seed chunk at the eye;
+    /// movable volumes flagged), written in command order, and their bind
+    /// groups.
+    fn keep_ray_cut(
+        &mut self,
+        encoder: &mut helio_core::CommandRecorder<'_>,
+        v: &ViewInput,
+        prev: &[(u16, crate::volume::VolumeTransform)],
+        drawn_in: &FxHashSet<u16>,
+    ) {
+        if !self.rays_wanted {
+            self.ray_cut = None;
+            return;
+        }
+        let (hi, lo) = split(v.eye);
+        self.uploads
+            .write(encoder, &self.ray_eye, 0, bytemuck::cast_slice(&[hi, lo]));
+        let count = self.volumes.iter().flatten().count() as u32;
+        let mut volumes = Vec::new();
+        for vol in self
+            .volumes
+            .iter()
+            .flatten()
+            .filter(|w| drawn_in.contains(&w.index))
+        {
+            let last = prev
+                .iter()
+                .find(|(i, _)| *i == vol.index)
+                .map_or(vol.transform, |(_, t)| *t);
+            let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
+            params.cut[2] = u32::MAX;
+            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 };
+            self.uploads
+                .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
+            volumes.push(rays::RayVolume {
+                plane: vol.grid.is_plane(),
+                group: self.draw_group(&vol.views.rays, vol, self.camera_view(vol)),
+            });
+        }
+        self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
+            volumes,
+            pipelines: self.ray_pipelines.clone(),
+            layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
+            eye: self.ray_eye.clone(),
+        }));
     }
 
     /// The volumes that light the other volumes' points in view `v` (those
@@ -8462,6 +8600,12 @@ impl ChunkWorld {
                 .map(|c| (c.index, c.group))
                 .collect(),
         });
+        // The cut ray streams walk until the next draw: the camera's
+        // (a stereo pair's left eye).
+        if eye_index == 0 {
+            helio_core::cpu_scope!("VoxelChunks: draw: ray cut");
+            self.keep_ray_cut(encoder, &input, &prev, &drawn_in);
+        }
     }
 
     /// The traces' counts since the last call (with

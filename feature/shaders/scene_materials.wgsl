@@ -2,7 +2,7 @@
 // rows (`GpuMaterial`, `//!use material_row`, which chunk_draw.wgsl is
 // composed with) and their descriptor-indexed texture table, bound as the
 // publish pipeline's group 2 (`chunks::scene`). Spliced over the stub
-// `scene_surface` of chunk_draw.wgsl when the device has binding arrays.
+// `voxel_scene_surface` of chunk_draw.wgsl when the device has binding arrays.
 
 // Per voxel material: the scene material rows of its top, side and bottom
 // faces (x, y, z; MATERIAL_NO_TEXTURE: none).
@@ -125,9 +125,9 @@ fn tile_coord(b: i32, t: f32, span: f32, tile: i32) -> f32 {
 // the cosine of the view's angle to it): the normals under the whole
 // footprint widen the roughness (specular anti-aliasing,
 // `normal_map_roughness`).
-fn scene_surface(m: u32, axis: u32, sign: u32, level: u32, cell: vec3<i32>, in_cell: vec3<f32>, pixel_m: f32, slant: f32, world_xz_from_eye: vec2<f32>) -> SceneSurface {
+fn voxel_scene_surface(m: u32, axis: u32, sign: u32, level: u32, cell: vec3<i32>, in_cell: vec3<f32>, pixel_m: f32, slant: f32, world_xz_from_eye: vec2<f32>) -> VoxelSceneSurface {
     let swash = select(vec3<f32>(0.0), swash_at(world_xz_from_eye), axis == 2u && sign == 1u);
-    let none = SceneSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 1.0, swash, false);
+    let none = VoxelSceneSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 1.0, swash, false);
     let faces = scene_map.faces[min(m, 31u)];
     var row = faces.y;
     if axis == 2u {
@@ -181,7 +181,7 @@ fn scene_surface(m: u32, axis: u32, sign: u32, level: u32, cell: vec3<i32>, in_c
         let spread = textureSampleLevel(scene_textures[slot], scene_sampler, uv, footprint).a;
         roughness = normal_map_roughness(roughness, spread, 1.0);
     }
-    return SceneSurface(colour, roughness, material.emissive.rgb * material.emissive.w * texel, normal, occlusion, swash, true);
+    return VoxelSceneSurface(colour, roughness, material.emissive.rgb * material.emissive.w * texel, normal, occlusion, swash, true);
 }
 
 // The mip level whose texels are a pixel wide, for texture `slot` spanning
@@ -192,7 +192,7 @@ fn scene_texels_per_pixel(slot: u32, tile_px: f32) -> f32 {
 }
 
 // Texture `slot` at `uv`, its texels half a pixel wide (see
-// `scene_surface`) on a texture `tile_px` pixels wide.
+// `voxel_scene_surface`) on a texture `tile_px` pixels wide.
 fn scene_sample(slot: u32, uv: vec2<f32>, tile_px: f32) -> vec4<f32> {
     let lod = max(scene_texels_per_pixel(slot, tile_px) - 1.0, 0.0);
     return textureSampleLevel(scene_textures[slot], scene_sampler, uv, lod);
