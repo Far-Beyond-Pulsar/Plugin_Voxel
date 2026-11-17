@@ -23,6 +23,10 @@ use std::sync::Arc;
 
 const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 
+/// The GI probes' finest spacing the tests place probes at: open ground's
+/// (`GiSettings::probe_spacing` over terrain), whatever GI's default is.
+const PROBE_SPACING: f64 = 1.0;
+
 /// As `tests/chunks.rs`'s: parallel tests fit a 12 GB GPU.
 const CAPACITY: Capacity = Capacity {
     chunks: 16384,
@@ -197,7 +201,7 @@ impl Scene {
         );
         if self.gi.is_some() {
             self.world.follow_gi(
-                helio_gi_api::Clipmap::around(camera.eye, helio_gi_api::DEFAULT_FINEST_SPACING),
+                helio_gi_api::Clipmap::around(camera.eye, PROBE_SPACING),
                 camera.eye,
                 camera.eye,
             );
@@ -993,7 +997,7 @@ fn gi_rays_cross_into_other_volumes() {
     };
     // The finest level's probes within 8 m of the block, out of every
     // volume's rock; 64 random rays each.
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let probes: Vec<u32> = (0..helio_gi_api::LEVEL_PROBES)
         .filter(|&p| {
             let o = clipmap.position(p);
@@ -1083,7 +1087,7 @@ fn gi_rays_cross_into_other_volumes() {
 /// tests/chunks.rs's).
 fn gi_rays(gpu: &Gpu, eye: DVec3, probes: &[u32], dirs: &[Vec3], sun: Vec3) -> [wgpu::Buffer; 4] {
     use wgpu::util::DeviceExt;
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let frame = helio_gi_api::GpuFrame {
         levels: clipmap.levels(eye),
         sky: [0.0; 4],
@@ -1190,7 +1194,7 @@ fn stream_rays_cross_every_volume() {
         .wait_for_pipelines()
         .expect("the ray kernels compile");
     scene.settle(gpu, &camera);
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let origins: Vec<DVec3> = (0..helio_gi_api::LEVEL_PROBES)
         .map(|p| clipmap.position(p))
         .filter(|&o| o.distance(at.position) < 8.0 && !volumes.solid(o, Matter::All))

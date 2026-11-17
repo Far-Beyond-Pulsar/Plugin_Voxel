@@ -57,20 +57,6 @@ pub fn read_buffer(gpu: &Gpu, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
 /// The terrain's tracer number in the tests' ray streams.
 pub const VOXEL_TRACER: u32 = 1;
 
-/// `v` as a half float's bits (normal values; the rays' spread).
-pub fn half_bits(v: f32) -> u32 {
-    let bits = v.to_bits();
-    let sign = (bits >> 16) & 0x8000;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    if v == 0.0 || exp <= 0 {
-        sign
-    } else if exp >= 31 {
-        sign | 0x7c00
-    } else {
-        sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)
-    }
-}
-
 /// A ray from world point `from` along unit `dir` up to `t_max`, in the
 /// space of frame origin `frame` (every caster, a footprint `spread` wide a
 /// metre out).
@@ -85,7 +71,11 @@ pub fn scene_ray(
         origin: (from - frame).as_vec3().to_array(),
         t_max,
         dir: dir.as_vec3().to_array(),
-        cone: half_bits(spread) | (u32::from(helio_frame_api::rays::stream::MASK_ALL) << 16),
+        cone: helio_frame_api::rays::stream::SceneRay::cone(
+            0.0,
+            spread,
+            helio_frame_api::rays::stream::MASK_ALL,
+        ),
     }
 }
 

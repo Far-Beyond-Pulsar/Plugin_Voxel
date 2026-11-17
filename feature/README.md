@@ -256,7 +256,10 @@ frame of `ChunkPass`:
 7. **Ray streams.** Any consumer's rays (Helio's ray streams) walk the cut
    the last draw left from wherever they start, in every volume: nearest
    hits and their surfaces, or occlusion
-   ([Ray streams](docs/chunk-octree.md#ray-streams)).
+   ([Ray streams](docs/chunk-octree.md#ray-streams)). Their cost is rays x
+   drawn volumes (a dispatch a volume, a ray that misses one paying its
+   ceiling-ball test), so scenes of hundreds of volumes need a bounds
+   structure over the volumes.
 
 ## Invariants and decisions
 

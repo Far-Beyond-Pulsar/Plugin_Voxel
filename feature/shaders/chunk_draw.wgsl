@@ -4996,27 +4996,44 @@ fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
     return none;
 }
 
-// Where ray `index` first meets this volume within `reach`: a walk's end,
-// and whether the ray starts in rock.
-struct StreamEnd {
-    hit: bool,
-    end: WalkEnd,
-    inside: bool,
+// Where each ray of a nearest-hit stream starts in this volume
+// (`ray_enter_nearest`, a row a ray, read by the walk's kernel after it):
+// the entry (`enter_volume`, `placing_chunk`, `on_solid_face`) and the walk
+// run as kernels of their own, so the walk's keeps the registers of
+// `gi_trace`'s (1.39 ms fused, 1.32 ms split, on 174 080 GI rays). `key`, `lo.xyz`,
+// `hi.xyz`: the walk's start (`Walk`), `lo.w` its chunk, `hi.w` what it is
+// (`START_*`); `at`: the time it starts at (bits), its hit pair, its cell
+// (6 bits an axis), and whether the walk starts in a chunk (`Walk::real`).
+struct RayStart {
+    key: vec4<i32>,
+    lo: vec4<i32>,
+    hi: vec4<i32>,
+    at: vec4<u32>,
+}
+@group(1) @binding(73) var<storage, read_write> ray_starts: array<RayStart>;
+
+// A walk from `at.x`; rock where it enters it (from inside where it starts
+// there); no ray, or one that misses the volume; on a solid cell's face
+// (inside, in cell `at.z` of chunk `lo.w`).
+const START_WALK: i32 = 0;
+const START_ROCK: i32 = 1;
+const START_MISS: i32 = 2;
+const START_FACE: i32 = 3;
+
+fn start_missed() -> RayStart {
+    return RayStart(vec4<i32>(0), vec4<i32>(0), vec4<i32>(0, 0, 0, START_MISS), vec4<u32>(0u));
 }
 
-fn stream_walk(index: u32, ray: SceneRay, reach: f32) -> StreamEnd {
-    var out = StreamEnd(false, WalkEnd(false, 0.0, NONE, vec3<i32>(0), 0u, 0u, 0u), false);
+// Ray `index`'s start in this volume, within `reach`.
+fn stream_enter(index: u32, ray: SceneRay, reach: f32) -> RayStart {
+    var out = start_missed();
     let org = stream_origin(ray);
-    let dir = to_local(ray.dir);
-    let q = vec2<u32>(index & 63u, index >> 6u);
-    let r = fade_dither(q);
-    let e = enter_volume(org, dir, reach, r);
+    let e = enter_volume(org, to_local(ray.dir), reach, fade_dither(vec2<u32>(index & 63u, index >> 6u)));
     if e.kind == 2u { return out; }
+    out.at.x = bitcast<u32>(e.t);
     if e.kind == 1u {
-        // Rock where it enters: from inside where it starts there.
-        out.hit = e.t < reach;
-        out.end = WalkEnd(true, e.t, NONE, vec3<i32>(0), 0u, 0u, e.rock);
-        out.inside = e.t <= 0.0;
+        if e.t < reach { out.hi.w = START_ROCK; }
+        out.at.y = e.rock;
         return out;
     }
     // From the origin itself (it starts in the volume) on a solid cell's
@@ -5024,48 +5041,85 @@ fn stream_walk(index: u32, ray: SceneRay, reach: f32) -> StreamEnd {
     if e.t <= 0.0 {
         let face = on_solid_face(e.walk, org);
         if face.x < 64 {
-            out.hit = true;
-            out.end = WalkEnd(true, 0.0, e.walk.slot, face.xyz, 0u, 0u, u32(face.w));
-            out.inside = true;
+            let c = vec3<u32>(face.xyz);
+            out.hi.w = START_FACE;
+            out.lo.w = i32(e.walk.slot);
+            out.at = vec4<u32>(0u, u32(face.w), c.x | (c.y << 6u) | (c.z << 12u), 0u);
             return out;
         }
     }
-    let end = walk(e.walk, org, dir, e.t, reach, r, 96u, false, q);
-    out.hit = end.hit && end.t < reach;
-    out.end = end;
-    // Its first cell solid where it starts.
-    out.inside = end.t <= 0.0;
+    out.key = e.walk.key;
+    out.lo = vec4<i32>(e.walk.lo, i32(e.walk.slot));
+    out.hi = vec4<i32>(e.walk.hi, START_WALK);
+    out.at.w = u32(e.walk.real);
     return out;
 }
 
+// Where ray `index` (from start `s`) first meets this volume within
+// `reach`, and whether from inside.
+struct StreamEnd {
+    hit: bool,
+    end: WalkEnd,
+    inside: bool,
+}
+
+fn stream_walk(index: u32, ray: SceneRay, s: RayStart, reach: f32) -> StreamEnd {
+    let t = bitcast<f32>(s.at.x);
+    if s.hi.w != START_WALK {
+        let c = vec3<i32>(vec3<u32>(s.at.z, s.at.z >> 6u, s.at.z >> 12u) & vec3<u32>(63u));
+        let slot = select(NONE, u32(s.lo.w), s.hi.w == START_FACE);
+        return StreamEnd(s.hi.w != START_MISS && t < reach, WalkEnd(true, t, slot, c, 0u, 0u, s.at.y), s.hi.w == START_FACE || t <= 0.0);
+    }
+    let q = vec2<u32>(index & 63u, index >> 6u);
+    let start = Walk(u32(s.lo.w), s.key, s.lo.xyz, s.hi.xyz, s.at.w != 0u);
+    let end = walk(start, stream_origin(ray), to_local(ray.dir), t, reach, fade_dither(q), 96u, false, q);
+    // Its first cell solid where it starts: from inside.
+    return StreamEnd(end.hit && end.t < reach, end, end.t <= 0.0);
+}
+
+// The starts of a nearest-hit stream's rays, within what each row leaves
+// (`scene_hit_reach`).
+@compute @workgroup_size(64)
+fn ray_enter_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= ray_header.count { return; }
+    let ray = stream_rays[id.x];
+    var s = start_missed();
+    if stream_sees(ray) { s = stream_enter(id.x, ray, scene_hit_reach(ray, stream_hits[id.x])); }
+    ray_starts[id.x] = s;
+}
+
 // A nearest-hit stream: each ray's nearest terrain within what its row
-// leaves (`scene_hit_reach`), written where nearer.
+// leaves, written where nearer.
 @compute @workgroup_size(64)
 fn ray_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= ray_header.count { return; }
+    let start = ray_starts[id.x];
+    if start.hi.w == START_MISS { return; }
     let ray = stream_rays[id.x];
-    if !stream_sees(ray) { return; }
-    let s = stream_walk(id.x, ray, scene_hit_reach(ray, stream_hits[id.x]));
+    let s = stream_walk(id.x, ray, start, scene_hit_reach(ray, stream_hits[id.x]));
     if !s.hit { return; }
     stream_hits[id.x] = stream_hit(s.end.t, s.inside, s.end.slot, s.end.cell, s.end.axis, s.end.sign, s.end.material);
 }
 
 // An occlusion stream: a ray the terrain meets before its end lets nothing
 // through (voxels are opaque, foliage cells too, as the sun's walks see
-// them); rows already blocked are left.
+// them); rows already blocked are left. Its entry stays in its kernel: its
+// rays (toward the sun, to nearby points) walk little, and a start row's
+// write and read cost them more than the entry's registers do.
 @compute @workgroup_size(64)
 fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= ray_header.count { return; }
     let ray = stream_rays[id.x];
     if !stream_sees(ray) || stream_hits[id.x].t > 0.0 { return; }
-    if stream_walk(id.x, ray, ray.t_max).hit {
+    if stream_walk(id.x, ray, stream_enter(id.x, ray, ray.t_max), ray.t_max).hit {
         stream_hits[id.x] = scene_occlusion(vec3<f32>(0.0));
     }
 }
 
 // The surfaces of the hits this volume found (its tracer's, its index):
 // the face's normal and the one it is lit with (`face_rule` at the ray's
-// footprint there, its cone's spread times the distance), facing where the
+// footprint there, `scene_ray_footprint`: its width at the origin and its
+// spread times the distance), facing where the
 // ray came from (a ray that starts in rock: back along it); the cell's
 // material (`shown_material`: its own where it has one) shaded as the
 // G-buffer's publish shades it (patches and clumps at the footprint, no
@@ -5085,7 +5139,7 @@ fn ray_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     let cell = vec3<i32>(vec3<u32>(hit.c, hit.c >> 6u, hit.c >> 12u) & vec3<u32>(63u));
     let dir = to_local(ray.dir);
     let position = stream_origin(ray) + dir * hit.t;
-    let footprint = max(scene_ray_spread(ray), 0.0) * hit.t;
+    let footprint = max(scene_ray_footprint(ray, hit.t), 0.0);
     var normal = -dir;
     var shading = -dir;
     var material = pair & 0xffu;

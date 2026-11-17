@@ -20,6 +20,10 @@ use helio_pass_voxel_planet::{
 
 const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 
+/// The GI probes' finest spacing the tests place probes at: open ground's
+/// (`GiSettings::probe_spacing` over terrain), whatever GI's default is.
+const PROBE_SPACING: f64 = 1.0;
+
 /// A camera at the eye (camera-relative) looking along `forward`.
 struct View {
     eye: DVec3,
@@ -234,7 +238,7 @@ impl World {
             });
         if self.gi.is_some() {
             self.chunks.follow_gi(
-                helio_gi_api::Clipmap::around(view.eye, helio_gi_api::DEFAULT_FINEST_SPACING),
+                helio_gi_api::Clipmap::around(view.eye, PROBE_SPACING),
                 view.eye,
                 view.eye,
             );
@@ -4300,7 +4304,7 @@ fn terrain_shadows_local_lights() {
 /// toward `sun`.
 fn gi_rays(gpu: &Gpu, eye: DVec3, probes: &[u32], dirs: &[Vec3], sun: Vec3) -> [wgpu::Buffer; 4] {
     use wgpu::util::DeviceExt;
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let frame = helio_gi_api::GpuFrame {
         levels: clipmap.levels(eye),
         sky: [0.0; 4],
@@ -4398,7 +4402,7 @@ struct GiRayCheck {
 /// rays; their hits' sun against the sun's occlusion maps read back.
 fn trace_gi_rays(gpu: &Gpu, planet: &Planet, eye: DVec3, view: &View) -> GiRayCheck {
     let view_proj = view.view_proj(planet);
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let mut probes = Vec::new();
     for z in 8..16 {
         for y in 8..16 {
@@ -5679,7 +5683,7 @@ fn terrain_traces_stream_rays() {
     // Helio's frame origin is snapped near the eye, not at it.
     let frame = eye + DVec3::new(3.75, -1.5, 2.25);
     let mut unit = units(0x2545_f491_4f6c_dd1d);
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let voxel = planet.grid().voxel_size();
 
     // 1. From the finest probes' places: open air and rock.
@@ -6298,7 +6302,7 @@ fn stream_rays_cost_against_gi_trace() {
         return;
     }
     let (planet, eye, view, _, _) = ball_ground();
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
+    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
     let mut next = xorshift(0x6a09_e667_f3bc_c908);
     let mut pick = |n: u64| (next() % n) as i64;
     let mut probes = Vec::new();

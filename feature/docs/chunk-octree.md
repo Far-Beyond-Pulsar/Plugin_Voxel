@@ -752,7 +752,8 @@ offers that to its graph (`stream::offer`).
   (a ray from inside: back along it), the normal it is lit with by
   `hit_face`'s rule without the screen (`face_rule`, `face_lit`: natural
   steps by the stored slope, smooth worlds by `smooth_normal`, cells under
-  the ray's footprint, its cone's spread times the distance, by the slope:
+  the ray's footprint, its width at the origin plus its spread times the
+  distance (`scene_ray_footprint`), by the slope:
   the level the cut drew decides), the cell's material (`shown_material`,
   per-voxel where it has its own) as the G-buffer's publish shades it
   (`material_albedo`'s patches and clumps at the footprint, no voxel
@@ -765,13 +766,21 @@ offers that to its graph (`stream::offer`).
   indirect groups each; a ray that misses a volume's ceiling ball costs it
   the test. Masks: a volume that has moved is `MASK_MOVABLE`, else
   `MASK_STATIC`.
+- **Nearest: entry and walk apart.** A nearest-hit stream's entry
+  (`ray_enter_nearest`) writes each ray's start (`RayStart`, 64 bytes, the
+  tracer's own buffer) and the walk's kernel (`ray_nearest`) reads it, so
+  the walk keeps `gi_trace`'s registers: in one kernel the entry's code
+  cost the walk 0.13 ms on GI's rays. An occlusion stream keeps its entry
+  in its kernel (`ray_occlusion`): its short walks paid more for the row
+  than for the registers.
 - **Cost** (`stream_rays_cost_against_gi_trace`, RTX 3060, a frame of
   GI's 174 080 probe rays about the GI test's ground, pipelined frames,
-  2026-11-17): nearest 1.39 ms, surfaces 0.09 ms, the entry alone 0.14 ms,
-  occlusion toward the sun 0.25 ms; `gi_trace` on the same rays (from
-  CPU-placed cells, its hits shaded in the kernel) 1.12 ms. The nearest
-  kernel is 0.13 ms over `gi_trace` plus the entry: the general entry's
-  code shares the walk's kernel (and its register budget).
+  2026-11-17, six runs within 0.01 ms): `gi_trace` on the same rays (from
+  CPU-placed cells, its hits shaded in its kernel) 1.12 ms; nearest 1.32 ms
+  (its entry 0.17 of it, with the start rows' write; the walk 1.15: the
+  rows' read over `gi_trace`'s walk), surfaces 0.09 ms, occlusion toward
+  the sun 0.25 ms (its entry about 0.14 of it). In one kernel the nearest
+  pass took 1.39 ms; an occlusion pass split took 0.26.
 - **Kernels** compile off the frame per form once a stream is traced
   (`ChunkWorld::want_rays`: the link asks for them), like the cross-volume
   passes; drawing never waits for them.
