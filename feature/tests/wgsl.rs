@@ -8,8 +8,6 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 const SNIPPETS: &[helio_core::shader::ShaderSnippet] = &[
     helio_mats::PBR_EVAL_SNIPPET,
     helio_mats::SPECULAR_AA_SNIPPET,
-    helio_gi_api::GI_COMMON_SNIPPET,
-    helio_gi_api::GI_SAMPLE_SNIPPET,
     helio_light_api::SUN_OCCLUSION_SNIPPET,
 ];
 

@@ -361,8 +361,14 @@ unit tests, `tests/chunks.rs`, `tests/wide_products.rs`) and
   from 25 km over an Earth against CPU casts (distance, inside, face,
   material, emission, transmission), lengths, rows kept and replaced, rows
   past the count; occlusion toward the sun and nearby points;
-  `stream_rays_cost_against_gi_trace` (ignored) times them against
-  `gi_trace` on a frame of GI's rays.
+  `stream_rays_cost` (ignored) times them on a frame of GI's rays.
+- GI over the terrain (`voxel_pass_graph`): GI's probes traced by the
+  terrain's tracer in the deferred graph take the sunlit ground's light
+  and rock holds none (`gi_probes_over_voxel_terrain_take_its_light`); a
+  local light's shadow rays see the terrain
+  (`a_terrain_wall_shadows_a_local_light_from_the_probes`); with a mesh on
+  the terrain, the nearer of the two answers and each shadows the other's
+  hits (`a_mesh_slab_on_terrain_shades_the_probes_under_it`).
 - Residency: the planner (a cut once over every point, bands switching
   as one, nodes refined by their own distance, parents drawn until every
   Mixed child exists, eviction by pressure and release by age, rays

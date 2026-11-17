@@ -4611,18 +4611,8 @@ fn feedback(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invoca
     if first && at < room { reports.keys[at] = key; }
 }
 
-// ---- 6. GI probe rays ----
-// The terrain as a tracer of the probes' rays (helio-pass-gi): a ray walks
-// the cut from its probe's place, and its hit sees the sun by the sun's
-// occlusion maps (`sun_occlusion`: a texture read where a walk to the sun
-// cost several times the ray's own). A probe's
-// place (`gi_cells`: base cell i, j, k and face | 8) is located on the CPU
-// in f64 when the probe comes into the clipmap.
-@group(1) @binding(35) var<uniform> frame_gi: GiFrame;
-@group(1) @binding(36) var<storage, read> gi_rays: array<GiRay>;
-@group(1) @binding(37) var<storage, read_write> gi_hits: array<GiHit>;
-@group(1) @binding(38) var<storage, read> gi_cells: array<vec4<i32>>;
-@group(1) @binding(39) var<storage, read> gi_sun: array<vec4<f32>, 2>;
+// ---- 6. Walks from a located base cell ----
+// The sun's occlusion pages the shadow kernels read (`sun_occlusion`).
 @group(1) @binding(62) var<uniform> sun_occlusion_frame: SunOcclusionFrame;
 @group(1) @binding(63) var sun_occlusion_maps: texture_2d<f32>;
 @group(1) @binding(65) var<storage, read> sun_occlusion_pages: array<u32>;
@@ -4672,87 +4662,11 @@ fn probe_start(c: vec4<i32>, org: vec3<f32>, r: i32) -> ProbeStart {
     return out;
 }
 
-// A thread a ray: its hit (distance, the face's normal, the material's
-// colour, the share of the sun reaching it (`sun_occlusion`); for a
-// material that lets light through, its
-// transmission and the sun's share on its cell's far side; the light it
-// gives off), or none; from rock, a back face at once.
-@compute @workgroup_size(64)
-fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= frame_gi.counts.x * GI_RAYS { return; }
-    let ray = gi_rays[id.x];
-    let q = vec2<u32>(id.x & 63u, id.x >> 6u);
-    let r = fade_dither(q);
-    // In the primary volume's frame (its probes were located there).
-    let org = to_local(ray.origin.xyz);
-    let start = probe_start(gi_cells[ray.probe], org, r);
-    if start.rock {
-        gi_hits[id.x] = GiHit(1e-3, gi_pack_unit(ray.dir), 0u, 1u);
-        return;
-    }
-    if !start.ok { return; }
-    let end = walk(start.walk, org, to_local(ray.dir), 0.0, ray.origin.w, r, 96u, false, q);
-    if !end.hit { return; }
-    gi_shade(id.x, ray, end);
-}
-
-// The other volumes' parts in the probes' rays (`ChunkWorld::draw`: a pass
-// each volume whose bounds the clipmap's rays reach): a ray walks this
-// volume from where it enters it (`enter_volume`), up to the nearer of its
-// reach and the hit already there (each tracer's contract: the hit kept is
-// the nearest); from its rock, a back face at once, as a probe's.
-@compute @workgroup_size(64)
-fn gi_trace_cross(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= frame_gi.counts.x * GI_RAYS { return; }
-    let ray = gi_rays[id.x];
-    let q = vec2<u32>(id.x & 63u, id.x >> 6u);
-    let r = fade_dither(q);
-    let org = to_local(ray.origin.xyz);
-    let dir = to_local(ray.dir);
-    var reach = ray.origin.w;
-    let before = gi_hits[id.x].t;
-    if before > 0.0 { reach = min(reach, before); }
-    let e = enter_volume(org, dir, reach, r);
-    if e.kind == 2u { return; }
-    if e.kind == 1u {
-        gi_hits[id.x] = GiHit(max(e.t, 1e-3), gi_pack_unit(ray.dir), 0u, 1u);
-        return;
-    }
-    let end = walk(e.walk, org, dir, e.t, reach, r, 96u, false, q);
-    if !end.hit || end.t >= reach { return; }
-    gi_shade(id.x, ray, end);
-}
-
-// Ray `index`'s hit `end` (`ray` from its origin): its face, material and
-// light, and the sun's share there (`gi_trace`).
-fn gi_shade(index: u32, ray: GiRay, end: WalkEnd) {
-    let c = cell_frame(end.slot, end.cell);
-    let axis = select(select(c.m2.xyz, c.m1.xyz, end.axis == 1u), c.m0.xyz, end.axis == 0u);
-    let n = to_world(normalize(axis) * select(-1.0, 1.0, end.sign == 1u));
-    let material = shown_material(end.material, end.slot, end.cell, end.axis == 2u && end.sign == 1u);
-    // The sun from off the hit's face by half its cell; through a cell
-    // that lets light through, from off its far side.
-    let hit = ray.origin.xyz + ray.dir * end.t;
-    let cell = length(c.m0.xyz);
-    let towards = dot(n, gi_sun[0].xyz);
-    let through = material_transmission(slot_material(material));
-    var sun = 0.0;
-    var back = 0.0;
-    if towards > 0.0 {
-        sun = sun_occlusion(hit + n * (0.5 * cell), n, cell);
-    } else if through > 0.0 && towards < 0.0 {
-        back = sun_occlusion(hit - n * (1.5 * cell), vec3<f32>(0.0), cell);
-    }
-    let glow = u32(clamp(slot_material(material).emissive.w, 0.0, 15.9375) * 16.0 + 0.5);
-    let light = 1u | (u32(through * 255.0 + 0.5) << 8u) | (u32(back * 255.0 + 0.5) << 16u) | (glow << 24u);
-    gi_hits[index] = GiHit(end.t, gi_pack_unit(n), pack4x8unorm(vec4<f32>(clamp(slot_material(material).base_color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), sun)), light);
-}
-
 // ---- 7. Foliage ground probes ----
 // The terrain as the ground foliage grows on (`chunks::ground`): each query
 // is a segment down a foliage tile's up, from a point its tile's
-// `probe_tiles` entry places in a base cell (located on the CPU in f64, as
-// GI probes are); it walks the drawn cut, and where it meets a top face it
+// `probe_tiles` entry places in a base cell (located on the CPU in f64);
+// it walks the drawn cut, and where it meets a top face it
 // answers the distance, the face's normal and its cell's material (the
 // ground id foliage types are keyed by). Walls, rock and nothing drawn are
 // no ground (`helio_foliage_api`'s ground rows, `GroundQuery`/`GroundHit`).
@@ -5000,7 +4914,7 @@ fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
 // (`ray_enter_nearest`, a row a ray, read by the walk's kernel after it):
 // the entry (`enter_volume`, `placing_chunk`, `on_solid_face`) and the walk
 // run as kernels of their own, so the walk's keeps the registers of
-// `gi_trace`'s (1.39 ms fused, 1.32 ms split, on 174 080 GI rays). `key`, `lo.xyz`,
+// the old GI probe walk's (1.39 ms fused, 1.32 ms split, on 174 080 GI rays). `key`, `lo.xyz`,
 // `hi.xyz`: the walk's start (`Walk`), `lo.w` its chunk, `hi.w` what it is
 // (`START_*`); `at`: the time it starts at (bits), its hit pair, its cell
 // (6 bits an axis), and whether the walk starts in a chunk (`Walk::real`).

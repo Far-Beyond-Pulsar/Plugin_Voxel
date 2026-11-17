@@ -25,6 +25,24 @@ pub struct VoxelSettings {
     /// How chunks stream (budgets, cache; the pixel angle follows the
     /// camera).
     pub residency: ResidencyConfig,
+    /// How far each pixel's sky rays walk (metres), where the frame's
+    /// indirect diffuse resolves the sky's larger occlusion (world-space GI:
+    /// about twice its finest probe spacing), so the two do not darken the
+    /// same occluder twice. `None`: the terrain's own reach,
+    /// `SKY_RANGE_CELLS` cells (`chunk_draw.wgsl`), for a frame without
+    /// indirect diffuse.
+    pub sky_reach: Option<f32>,
+}
+
+impl VoxelSettings {
+    /// The settings `settings` (of [`crate::settings::VOXEL_RESIDENCY`])
+    /// hold.
+    pub fn from_settings(settings: &helio_settings::Resolved) -> Self {
+        Self {
+            residency: ResidencyConfig::from_settings(settings),
+            sky_reach: settings.optional("sky_reach").map(|m| m as f32),
+        }
+    }
 }
 
 /// Voxel worlds ([`crate`]).
@@ -68,11 +86,10 @@ impl Feature for VoxelFeature {
         registrar.consumes(helio_light_api::SCENE_LIGHTS);
         registrar.consumes(helio_mats::MATERIALS);
         registrar.ray_tracer(tracer());
-        // With terrain to draw, it traces GI's probes every frame and its sun
-        // samples rotate over blocks of pixels for TSR to integrate.
+        // With terrain to draw, its sun samples rotate over blocks of pixels
+        // for TSR to integrate.
         registrar.prepare(std::sync::Arc::new(|env| {
             if env.setting::<VoxelSettings>().is_some() {
-                env.insert_setting(helio_gi_api::TerrainTracer);
                 env.insert_setting(helio_pass_tsr::StochasticSamples);
             }
         }));
@@ -81,9 +98,8 @@ impl Feature for VoxelFeature {
                 "helio.pass.voxel_chunks",
                 "Voxel: Chunk Terrain",
                 "Passes: Geometry",
-                "The voxel volumes the scene publishes: residency, generation, the G-buffer, \
-                 the GI probes' rays and the cut ray streams walk. Builds nothing without \
-                 VoxelSettings.",
+                "The voxel volumes the scene publishes: residency, generation, the G-buffer \
+                 and the cut ray streams walk. Builds nothing without VoxelSettings.",
                 |build| {
                     let Some(settings) = build.env.setting::<VoxelSettings>().cloned() else {
                         return Ok(());
@@ -99,6 +115,7 @@ impl Feature for VoxelFeature {
                         return Ok(());
                     }
                     let mut pass = ChunkPass::new(settings.residency);
+                    pass.set_sky_reach(settings.sky_reach);
                     pass.set_ray_link(build.env.shared(SharedRayLink::default).0.clone());
                     build
                         .env

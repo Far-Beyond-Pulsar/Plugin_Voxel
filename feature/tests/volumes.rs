@@ -136,9 +136,6 @@ struct Scene {
     /// The direction to the sun (world).
     sun: Vec3,
     last: Option<Mat4>,
-    /// GI rays to trace each frame (`gi_rays`), from a clipmap around the
-    /// eye.
-    gi: Option<[wgpu::Buffer; 4]>,
 }
 
 impl Scene {
@@ -169,7 +166,6 @@ impl Scene {
             frame: 0,
             sun: Vec3::new(0.3, 0.8, 0.4).normalize(),
             last: None,
-            gi: None,
         }
     }
 
@@ -199,21 +195,6 @@ impl Scene {
             self.frame,
             &camera.config(),
         );
-        if self.gi.is_some() {
-            self.world.follow_gi(
-                helio_gi_api::Clipmap::around(camera.eye, PROBE_SPACING),
-                camera.eye,
-                camera.eye,
-            );
-        }
-        let gi = self.gi.as_ref().map(|[frame, rays, hits, sun]| {
-            helio_pass_voxel_planet::chunks::GiRays {
-                frame,
-                rays,
-                hits,
-                sun,
-            }
-        });
         self.world.draw(
             &mut recorder,
             self.frame,
@@ -226,7 +207,6 @@ impl Scene {
             camera.size,
             None,
             None,
-            gi.as_ref(),
         );
         if let Some(picks) = picks {
             let taken = self
@@ -974,188 +954,6 @@ fn volumes_shadow_each_other() {
     }
 }
 
-/// GI rays from the probes about a block hovering over the ground cross
-/// into it (`gi_trace_cross`) and keep the nearer hit: every ray whose CPU
-/// hit over every volume is in view near the eye (level 0 drawn there) hits
-/// at the CPU's distance with the CPU's face, the block's and the ground's
-/// alike; a hundredth may differ (grazing cells).
-#[test]
-fn gi_rays_cross_into_other_volumes() {
-    let Some(gpu) = gpu() else { return };
-    let (earth, at, ground, up, side) = wall_and_block();
-    let volumes = Volumes::new(vec![
-        VoxelVolume::new(1, earth, VolumeTransform::IDENTITY),
-        VoxelVolume::new(5, Arc::new(block()), at),
-    ]);
-    let fwd = up.cross(side);
-    let eye = ground - fwd * 9.0 + up * 2.0 - side * 3.0;
-    let camera = Camera {
-        eye,
-        forward: (at.position - eye).normalize().as_vec3(),
-        up: up.as_vec3(),
-        size: [320, 180],
-    };
-    // The finest level's probes within 8 m of the block, out of every
-    // volume's rock; 64 random rays each.
-    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
-    let probes: Vec<u32> = (0..helio_gi_api::LEVEL_PROBES)
-        .filter(|&p| {
-            let o = clipmap.position(p);
-            o.distance(at.position) < 8.0 && !volumes.solid(o, Matter::All)
-        })
-        .take(400)
-        .collect();
-    let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
-    let mut unit = || loop {
-        let v =
-            DVec3::new(next() as f64, next() as f64, next() as f64) / u64::MAX as f64 * 2.0 - 1.0;
-        if v.length_squared() > 1e-4 && v.length_squared() <= 1.0 {
-            return v.normalize();
-        }
-    };
-    let dirs: Vec<DVec3> = (0..probes.len() * helio_gi_api::RAYS as usize)
-        .map(|_| unit())
-        .collect();
-    let mut scene = Scene::new(gpu, &volumes);
-    scene.gi = Some(gi_rays(
-        gpu,
-        eye,
-        &probes,
-        &dirs.iter().map(|d| d.as_vec3()).collect::<Vec<_>>(),
-        scene.sun,
-    ));
-    scene.settle(gpu, &camera);
-    // One frame's hits (the GI pass clears them each frame).
-    let hits_buffer = &scene.gi.as_ref().unwrap()[2];
-    gpu.queue
-        .write_buffer(hits_buffer, 0, &vec![0u8; hits_buffer.size() as usize]);
-    scene.frame(gpu, &camera, None);
-    let hits = read_words(gpu, &scene.gi.as_ref().unwrap()[2]);
-    let view_proj = camera.view_proj();
-    let near = 0.7 * 0.1 / camera.pixel_angle();
-    let (mut compared, mut wrong, mut by_volume) = (0, 0, [0usize; 2]);
-    for (k, d) in dirs.iter().enumerate() {
-        let origin = clipmap.position(probes[k / helio_gi_api::RAYS as usize]);
-        let Some(cpu) = volumes.raycast(origin, *d, 30.0, Matter::All) else {
-            continue;
-        };
-        let hit_at = origin + *d * cpu.hit.distance;
-        let clip = view_proj * (hit_at - eye).as_vec3().extend(1.0);
-        let ndc = clip.truncate() / clip.w;
-        if clip.w <= 0.0
-            || ndc.x.abs() > 0.95
-            || ndc.y.abs() > 0.95
-            || (hit_at - eye).length() > near
-        {
-            continue;
-        }
-        compared += 1;
-        by_volume[cpu.index] += 1;
-        let hit = &hits[k * 4..k * 4 + 4];
-        let t = f32::from_bits(hit[0]);
-        let n = (DVec3::new(
-            f64::from(hit[1] & 1023),
-            f64::from((hit[1] >> 10) & 1023),
-            f64::from((hit[1] >> 20) & 1023),
-        ) / 1023.0
-            * 2.0
-            - 1.0)
-            .normalize_or_zero();
-        let exact = t > 0.0
-            && (f64::from(t) - cpu.hit.distance).abs() <= 2e-3 + cpu.hit.distance * 1e-5
-            && n.dot(cpu.normal) > 0.99;
-        if !exact {
-            wrong += 1;
-            if wrong < 8 {
-                eprintln!(
-                    "ray {k}: drawn t {t} n {n}, cpu volume {} at {} n {}",
-                    cpu.id, cpu.hit.distance, cpu.normal
-                );
-            }
-        }
-    }
-    eprintln!(
-        "GI rays: compared {compared} (ground {}, block {}), wrong {wrong}",
-        by_volume[0], by_volume[1]
-    );
-    assert!(by_volume[0] > 500 && by_volume[1] > 500, "{by_volume:?}");
-    assert!(wrong * 100 <= compared, "{wrong} of {compared}");
-}
-
-/// GI's buffers for rays from `probes` (storage indices of a clipmap around
-/// `eye`) along `dirs` (`RAYS` a probe), the sun towards `sun` (as
-/// tests/chunks.rs's).
-fn gi_rays(gpu: &Gpu, eye: DVec3, probes: &[u32], dirs: &[Vec3], sun: Vec3) -> [wgpu::Buffer; 4] {
-    use wgpu::util::DeviceExt;
-    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
-    let frame = helio_gi_api::GpuFrame {
-        levels: clipmap.levels(eye),
-        sky: [0.0; 4],
-        ground: [0.0; 4],
-        counts: [probes.len() as u32, 0, 0, 0],
-        rotation: [0.0, 0.0, 0.0, 1.0],
-        prev_rotation: [0.0, 0.0, 0.0, 1.0],
-    };
-    let mut rays = Vec::with_capacity(dirs.len() * 8);
-    for (k, d) in dirs.iter().enumerate() {
-        let probe = probes[k / helio_gi_api::RAYS as usize];
-        let o = (clipmap.position(probe) - eye).as_vec3();
-        rays.extend_from_slice(&[
-            o.x.to_bits(),
-            o.y.to_bits(),
-            o.z.to_bits(),
-            1e30f32.to_bits(),
-            d.x.to_bits(),
-            d.y.to_bits(),
-            d.z.to_bits(),
-            probe,
-        ]);
-    }
-    let init = |label, contents: &[u8], usage| {
-        gpu.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents,
-                usage,
-            })
-    };
-    let storage =
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-    [
-        init(
-            "gi frame",
-            bytemuck::bytes_of(&frame),
-            wgpu::BufferUsages::UNIFORM,
-        ),
-        init("gi rays", bytemuck::cast_slice(&rays), storage),
-        init("gi hits", &vec![0u8; dirs.len() * 16], storage),
-        init(
-            "gi sun",
-            bytemuck::cast_slice(&[sun.x, sun.y, sun.z, 0.0, 1.0, 1.0, 1.0, 0.0]),
-            storage,
-        ),
-    ]
-}
-
-fn read_words(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u32> {
-    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: buffer.size(),
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut encoder = gpu.device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
-    gpu.queue.submit([encoder.finish()]);
-    staging
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    gpu.device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .unwrap();
-    bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
-}
-
 fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
     move || {
         state ^= state << 13;
@@ -1194,9 +992,8 @@ fn stream_rays_cross_every_volume() {
         .wait_for_pipelines()
         .expect("the ray kernels compile");
     scene.settle(gpu, &camera);
-    let clipmap = helio_gi_api::Clipmap::around(eye, PROBE_SPACING);
-    let origins: Vec<DVec3> = (0..helio_gi_api::LEVEL_PROBES)
-        .map(|p| clipmap.position(p))
+    let origins: Vec<DVec3> = (0..24 * 24 * 24)
+        .map(|n| probe_place(eye, 0, glam::I64Vec3::new(n % 24, (n / 24) % 24, n / 576)))
         .filter(|&o| o.distance(at.position) < 8.0 && !volumes.solid(o, Matter::All))
         .take(400)
         .collect();
@@ -1270,4 +1067,14 @@ fn stream_rays_cross_every_volume() {
     );
     assert!(by_volume[0] > 500 && by_volume[1] > 500, "{by_volume:?}");
     assert!(wrong * 100 <= compared, "{wrong} of {compared}");
+}
+
+/// Level `level`'s probe `at` (0..24 an axis) of GI's probe clipmap about
+/// `eye` as GI lays it out (24 a side, each level twice as far apart as the
+/// one inside it, `PROBE_SPACING` the finest): a set of ray origins in open
+/// air and in rock, as GI's probe rays have.
+fn probe_place(eye: DVec3, level: u32, at: glam::I64Vec3) -> DVec3 {
+    let spacing = PROBE_SPACING * f64::from(1u32 << level);
+    let first = (eye / spacing).floor().as_i64vec3() - 11;
+    (first + at).as_dvec3() * spacing
 }

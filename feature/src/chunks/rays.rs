@@ -23,7 +23,7 @@
 //! - **Two passes a stream.** The trace keeps the walk's kernel small: for
 //!   a nearest-hit stream a volume's entry (`ray_enter_nearest`) writes each
 //!   ray's start (a 64-byte row in the tracer's own buffer), then the walk
-//!   (`ray_nearest`) reads it, so the walk keeps `gi_trace`'s registers (an
+//!   (`ray_nearest`) reads it, so the walk keeps the old GI probe walk's registers (an
 //!   occlusion stream's short walks keep their entry: `ray_occlusion`);
 //!   the surfaces (`ray_surface`) are written once every tracer traced, only
 //!   for the hits that stayed the terrain's. Two dispatches a volume over

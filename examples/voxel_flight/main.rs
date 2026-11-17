@@ -245,7 +245,10 @@ impl Flight {
             .or(helio_pass_voxel_planet::chunks::ResidencyConfig::default().generate_ms);
         // The generator's look with the materials the preset's features add.
         let appearance = preset.appearance(planet.field().appearance());
-        let terrain = helio_pass_voxel_planet::VoxelSettings { residency: config };
+        let terrain = helio_pass_voxel_planet::VoxelSettings {
+            residency: config,
+            sky_reach: Some(2.0),
+        };
         // `HELIO_VOXEL_FLIGHT_NO_AA`: no temporal upscaler and no
         // anti-aliasing at all, every frame drawn on its own (an offline
         // render drawn larger than it is shown, then downscaled).
@@ -283,7 +286,14 @@ impl Flight {
                 .edit::<helio_pass_foliage_place::FoliageSettings>()
                 .range = Some(meadow.range);
         }
-        let config = config.with_feature(terrain);
+        // Open ground: GI's finest probes a metre apart (its default is
+        // half a metre, for rooms), and the pixels' sky rays walking two of
+        // their spacings, past which the probes hold the sky's occlusion.
+        let config = config
+            .with_feature(terrain)
+            .with_feature(helio_pass_gi::GiSettings {
+                probe_spacing: Some(1.0),
+            });
         let mut renderer = RendererBuilder::new(config.clone(), mirror)
             .with_external_device()
             // The voxel world, the leaf kinds (particles, sprites, decals,
@@ -1105,7 +1115,6 @@ fn chunk_hold(flight: &Flight, view: &str, eye: DVec3, forward: Vec3) {
                 [w, h],
                 None,
                 None,
-                None,
             );
             flight.queue.submit([encoder.finish()]);
             world.submitted();
@@ -1170,7 +1179,6 @@ fn chunk_hold(flight: &Flight, view: &str, eye: DVec3, forward: Vec3) {
             [w, h],
             None,
             None,
-            None,
         );
         draw_cpu.push(cpu.elapsed().as_secs_f64() * 1e3);
         pending.push_back(flight.queue.submit([encoder.finish()]));
@@ -1219,7 +1227,6 @@ fn chunk_hold(flight: &Flight, view: &str, eye: DVec3, forward: Vec3) {
             [w, h],
             None,
             None,
-            None,
         );
         flight.queue.submit([encoder.finish()]);
         let counts = world.take_counts();
@@ -1235,7 +1242,6 @@ fn chunk_hold(flight: &Flight, view: &str, eye: DVec3, forward: Vec3) {
                 near,
                 flight.sun_at(eye),
                 [w, h],
-                None,
                 None,
                 None,
             );
@@ -1416,7 +1422,6 @@ fn chunk_dig(
             near,
             flight.sun_at(eye),
             [w, h],
-            None,
             None,
             None,
         );
@@ -2871,7 +2876,6 @@ fn chunk_fly(flight: &Flight, mode: &str, ground: DVec3, heading: f64) {
             near,
             flight.sun_at(eye),
             [w, h],
-            None,
             None,
             None,
         );

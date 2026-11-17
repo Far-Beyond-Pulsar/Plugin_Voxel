@@ -27,7 +27,6 @@ helio-feature-api = { workspace = true }
 helio-frame-api = { workspace = true }
 # Specular anti-aliasing for the scene materials' normal maps.
 helio-mats = { workspace = true }
-helio-gi-api = { workspace = true }
 # Foliage grows on the terrain (`chunks::ground`).
 helio-foliage-api = { workspace = true }
 image = { workspace = true }
@@ -38,6 +37,9 @@ miniz_oxide = { version = "0.8" }
 helio-mats = { workspace = true, features = ["host-rows"] }
 helio-light-host = { workspace = true }
 helio-mesh-host = { workspace = true }
+helio-mesh-api = { workspace = true }
+# GI over terrain with meshes on it (`voxel_pass_graph`): the meshes' tracer.
+helio-pass-mesh-rays = { workspace = true }
 pollster = "0.4"
 # examples/shader_stats.rs: driver statistics of the compute pipelines.
 ash = "0.38"

@@ -72,13 +72,13 @@ One `ChunkWorld` holds them all (`ChunkWorld::add_volume`,
   pipelines (`ChunkWorld::cross_volumes`): its sun shadow on the others'
   hits and the meshes, ANDed in, over the rectangle the shadow can fall in
   (`shadow_cross`; pixels the sun's occlusion pages lit are left: every
-  volume is traced into them); the GI probes' rays, the nearer hit kept
-  (`gi_trace_cross`); foliage's probes, where it stands on the ground
+  volume is traced into them); foliage's probes, where it stands on the ground
   found or holds it (`ground_probe_cross`). Single-volume worlds run and
   build none of them.
 - **The primary volume** is the one whose ground the eye is nearest
-  (`follow_eye`): foliage is tiled on it and GI probes are placed in its
-  cells.
+  (`follow_eye`): foliage is tiled on it. Ray streams (GI's probes among
+  their consumers) enter whichever volume their rays meet (see
+  [Ray streams](#ray-streams)).
 
 CPU queries take world positions: `Volumes` (exact casts and solid tests
 over every volume a ray or point meets, nearest hit first) and
@@ -769,13 +769,14 @@ offers that to its graph (`stream::offer`).
 - **Nearest: entry and walk apart.** A nearest-hit stream's entry
   (`ray_enter_nearest`) writes each ray's start (`RayStart`, 64 bytes, the
   tracer's own buffer) and the walk's kernel (`ray_nearest`) reads it, so
-  the walk keeps `gi_trace`'s registers: in one kernel the entry's code
+  the walk keeps the registers of the old GI probe walk (the draw's
+  `gi_trace`, deleted when GI moved to streams): in one kernel the entry's code
   cost the walk 0.13 ms on GI's rays. An occlusion stream keeps its entry
   in its kernel (`ray_occlusion`): its short walks paid more for the row
   than for the registers.
-- **Cost** (`stream_rays_cost_against_gi_trace`, RTX 3060, a frame of
-  GI's 174 080 probe rays about the GI test's ground, pipelined frames,
-  2026-11-17, six runs within 0.01 ms): `gi_trace` on the same rays (from
+- **Cost** (`stream_rays_cost`, RTX 3060, a frame of GI's 174 080 probe
+  rays about a ball on the ground, pipelined frames, 2026-11-17, six runs
+  within 0.01 ms): the old `gi_trace` on the same rays (from
   CPU-placed cells, its hits shaded in its kernel) 1.12 ms; nearest 1.32 ms
   (its entry 0.17 of it, with the start rows' write; the walk 1.15: the
   rows' read over `gi_trace`'s walk), surfaces 0.09 ms, occlusion toward

@@ -81,9 +81,8 @@ pub struct ChunkPass {
     )>,
     /// Every hit walks its own sun ray (`set_steady_shadows`).
     steady_shadows: bool,
-    /// The eye's world position this frame (`helio_gi_api::eye`), where
-    /// the GI clipmap the terrain traces rays of is centred.
-    gi_eye: Option<DVec3>,
+    /// How far each pixel's sky rays walk (`VoxelSettings::sky_reach`).
+    sky_reach: Option<f32>,
     /// The last frame's projection jitter (NDC).
     last_jitter: [Vec2; 2],
     xr_mode: bool,
@@ -121,7 +120,7 @@ impl ChunkPass {
             cpu_ms: [0.0; 2],
             scene: None,
             steady_shadows: false,
-            gi_eye: None,
+            sky_reach: None,
             last_jitter: [Vec2::ZERO; 2],
             xr_mode: false,
             planet_ground,
@@ -162,6 +161,11 @@ impl ChunkPass {
     /// shadows).
     pub fn set_steady_shadows(&mut self, on: bool) {
         self.steady_shadows = on;
+    }
+
+    /// How far each pixel's sky rays walk (metres; `VoxelSettings::sky_reach`).
+    pub fn set_sky_reach(&mut self, reach: Option<f32>) {
+        self.sky_reach = reach;
     }
 
     /// Override the position used for residency/prefetch, without changing the
@@ -312,10 +316,6 @@ const READS: &[&str] = &[
     "water_shore_params",
     helio_light_api::TILE_LIGHT_LISTS,
     helio_light_api::TILE_LIGHT_COUNTS,
-    helio_gi_api::GI_FRAME,
-    helio_gi_api::GI_RAYS,
-    helio_gi_api::GI_SUN,
-    helio_gi_api::GI_CLIPMAP,
     SKY_FRAME,
 ];
 const WRITES: &[&str] = &[
@@ -328,7 +328,6 @@ const WRITES: &[&str] = &[
     "local_visibility",
     // helio-pass-tsr's STOCHASTIC_MASK.
     helio_pass_tsr::STOCHASTIC_MASK,
-    helio_gi_api::GI_HITS,
     helio_light_api::SUN_OCCLUSION_MAPS,
     helio_light_api::SUN_OCCLUSION_PAGES,
     helio_light_api::SUN_OCCLUSION_FRAME,
@@ -393,7 +392,6 @@ impl RenderPass for ChunkPass {
     }
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
         let started = std::time::Instant::now();
-        self.gi_eye = Some(helio_gi_api::eye(ctx));
         let result = self.prepare_frame(ctx);
         self.cpu_ms[0] = started.elapsed().as_secs_f64() * 1e3;
         result
@@ -696,26 +694,7 @@ impl ChunkPass {
                 helio_light_api::TILE_LIGHT_COUNTS,
             ))
             .map(|b| (*b).clone());
-        // The GI probes' rays, when a GI pass runs before this one.
         let binding = |name: &str| ctx.registry.buffer_binding(name).cloned();
-        let clipmap = ctx
-            .registry
-            .get::<helio_gi_api::Clipmap>(helio_core::ResourceKey::new(helio_gi_api::GI_CLIPMAP));
-        let gi = match (
-            binding(helio_gi_api::GI_FRAME),
-            binding(helio_gi_api::GI_RAYS),
-            binding(helio_gi_api::GI_HITS),
-            binding(helio_gi_api::GI_SUN),
-            clipmap,
-            self.gi_eye,
-        ) {
-            (Some(frame_gi), Some(rays), Some(hits), Some(sun), Some(clipmap), Some(world_eye)) => {
-                helio_core::cpu_scope!("VoxelChunks: follow GI");
-                world.follow_gi(clipmap, world_eye, trace_eye);
-                Some((frame_gi, rays, hits, sun))
-            }
-            _ => None,
-        };
         // The graph traces ray streams through the terrain: its draws keep
         // a cut for them and their kernels compile.
         if self.rays.wanted() {
@@ -770,6 +749,7 @@ impl ChunkPass {
             world.set_material_map(map);
         }
         world.set_steady_shadows(self.steady_shadows);
+        world.set_sky_reach(self.sky_reach);
         // The atmosphere's sun disk sizes the shadows' penumbrae.
         world.set_atmosphere_frame(
             ctx.registry
@@ -805,14 +785,6 @@ impl ChunkPass {
                 _ => None,
             }
             .as_ref(),
-            gi.as_ref()
-                .map(|(frame, rays, hits, sun)| super::GiRays {
-                    frame,
-                    rays,
-                    hits,
-                    sun,
-                })
-                .as_ref(),
             eye_index,
         );
         self.rays.publish(world.ray_cut());

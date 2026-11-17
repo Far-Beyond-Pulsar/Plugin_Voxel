@@ -298,7 +298,10 @@ impl Showcase {
         );
 
         let appearance = worlds::Preset::Earth.appearance(planet.field().appearance());
-        let terrain = helio_pass_voxel_planet::VoxelSettings::default();
+        let terrain = helio_pass_voxel_planet::VoxelSettings {
+            sky_reach: Some(2.0),
+            ..Default::default()
+        };
         let mut renderer_config = RendererConfig::new(size[0], size[1], format);
         renderer_config
             .features
@@ -316,7 +319,15 @@ impl Showcase {
             .features
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range * 1.5);
-        let renderer_config = renderer_config.with_feature(terrain);
+        // Open ground: GI's finest probes a metre apart (its default is
+        // half a metre, for rooms), and the pixels' sky rays walking two of
+        // their spacings, past which the probes hold the sky's occlusion.
+        let renderer_config =
+            renderer_config
+                .with_feature(terrain)
+                .with_feature(helio_pass_gi::GiSettings {
+                    probe_spacing: Some(1.0),
+                });
         let mut renderer = RendererBuilder::new(renderer_config.clone(), mirror)
             .with_external_device()
             // The voxel world, the leaf kinds (particles, sprites, decals,
