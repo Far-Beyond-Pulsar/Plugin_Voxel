@@ -15,7 +15,6 @@ use helio_pass_sky::{CloudLayer, PlanetWeather};
 use helio_pass_voxel_planet::chunks::pass::ChunkPass;
 use helio_pass_voxel_planet::engine::{PlanetFrame, VOXEL_FRAME};
 use helio_pass_voxel_planet::{Planet, PlanetRecipe};
-use helio_presets::Preset;
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 
 /// The engine's features over Helio's: the voxel terrain's and the media

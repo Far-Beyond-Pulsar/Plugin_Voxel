@@ -284,7 +284,6 @@ impl Game {
             #[cfg(not(target_arch = "wasm32"))]
             vr: vr.as_ref(),
             target: self.interaction.target.map(|target| target.point),
-            dt: dt as f32,
             planet: self.world.planet(),
             player: &self.player,
             eye,

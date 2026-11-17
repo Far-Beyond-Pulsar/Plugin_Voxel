@@ -18,7 +18,6 @@ use helio_pass_voxel_planet::chunks::pass::ChunkPass;
 use helio_pass_voxel_planet::engine::{PlanetFrame, VOXEL_FRAME};
 use helio_pass_voxel_planet::terrain::material;
 use helio_pass_voxel_planet::{Brush, BrushOp, BrushShape, Cell, Planet, PlanetRecipe, RayHit};
-use helio_presets::Preset;
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 
 /// The engine's features over Helio's: the voxel terrain's and the media

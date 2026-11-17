@@ -1401,7 +1401,6 @@ fn varied_spots(
 /// when every one of its 16 columns tops in it with the same canonical
 /// material: what the leaf's vote must draw on its top faces.
 fn uniform_leaf_top(planet: &Planet, c: Cell) -> Option<u32> {
-    let grid = planet.grid();
     let (li, lj, lk) = (
         c.i.div_euclid(4) * 4,
         c.j.div_euclid(4) * 4,

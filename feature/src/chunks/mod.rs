@@ -2506,8 +2506,8 @@ pub struct Targets {
     pub sun: wgpu::Texture,
     sun_view: wgpu::TextureView,
     /// The share of each pixel's light its sun samples give stochastically
-    /// (helio-pass-tsr's `tsr_stochastic`; r, the rest unused).
-    stochastic: wgpu::Texture,
+    /// (helio-pass-tsr's `tsr_stochastic`; r, the rest unused). The view
+    /// keeps its texture alive.
     stochastic_view: wgpu::TextureView,
     /// Each pixel's sun as the walks found it, 0 or 1; whether it is its
     /// own walk's (1) or a neighbour's (0); whether a terrain hit is shown
@@ -2678,7 +2678,6 @@ impl Targets {
             sun_view: view(&sun),
             sun,
             stochastic_view: view(&stochastic),
-            stochastic,
             sun_walked: buffer("chunk walked sun", 4),
             sky: texture("chunk sky", wgpu::TextureFormat::R32Float, s),
             local_seen: device.create_buffer(&wgpu::BufferDescriptor {
@@ -6559,8 +6558,7 @@ impl ChunkWorld {
                     let above = resident.z.is_some_and(|(_, hi)| {
                         (i64::from(cz * CHUNK + hi) << level) > i64::from(cell.k)
                     });
-                    (above && self.drawn_set.contains(resident.slot))
-                        .then_some((cz, resident.slot))
+                    (above && self.drawn_set.contains(resident.slot)).then_some((cz, resident.slot))
                 })
                 .min_by_key(|&(cz, _)| cz);
             if let Some((_, slot)) = holding {
@@ -9082,8 +9080,7 @@ impl ChunkWorld {
         // The host's scene materials, when a map is written and the table is
         // the length the pipeline was built for.
         let scene = self.scene.as_ref().zip(inputs).filter(|(s, i)| {
-            s.map_written.is_some()
-                && i.texture_views.len() == s.capacity as usize
+            s.map_written.is_some() && i.texture_views.len() == s.capacity as usize
         });
         let scene_group = scene.as_ref().map(|(s, i)| {
             let mut cached = s.group.lock().unwrap();

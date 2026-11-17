@@ -67,7 +67,6 @@ use helio_pass_voxel_planet::engine::{
 use helio_pass_voxel_planet::{
     Brush, BrushOp, BrushShape, Planet, PlanetRecipe, VolumeTransform, VoxelVolume,
 };
-use helio_presets::Preset;
 use pulsar_scenedb::gpu::{EngineGpuContext, GpuMirrorHandle, SceneGpuConfig, SceneGpuStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -485,9 +484,7 @@ impl Flight {
             buffer
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-            device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .unwrap();
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             let data = buffer.slice(..).get_mapped_range().unwrap();
             // RGB: the target's alpha is not coverage.
             let mut pixels = Vec::with_capacity(w * h as usize * 3);
