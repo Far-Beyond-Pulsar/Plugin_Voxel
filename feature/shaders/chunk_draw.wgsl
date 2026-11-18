@@ -5064,150 +5064,20 @@ fn ray_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     stream_hits[id.x] = stream_hit(s.end.t, s.inside, s.end.slot, s.end.cell, s.end.axis, s.end.sign, s.end.material);
 }
 
-// `params.volume.w` of the cut's first volume: the sun's occlusion pages
-// answer its rays for every volume (`paged_occlusion`).
-const RAY_VOLUME_FIRST: u32 = 32u;
-
-// The most a tap's bias in `paged_share` grows by the pages' own slope: as
-// `sun_occlusion_read_level`'s receiver slope, four texels a texel.
-const PAGE_SLOPE: f32 = 4.0;
-
-// How far an epoch's sun may be from a ray's direction, as the part of the
-// ray's width the two drift apart by over the ray's length to the pages'
-// near plane: half the width.
-const PAGE_DRIFT: f32 = 0.5;
-
-// The sine of the angle within which a ray asks for the current epoch's
-// pages: four times the sun's turn that starts a new epoch
-// (`sun_pages::TURN`), so a ray along the scene's sun asks for them
-// whichever way the epoch lags it.
-const PAGE_ASK_SINE: f32 = 0.008;
-
-// The sun's share at camera-relative `p` by level `level` of epoch `e`'s
-// pages, for a receiver whose normal is not known (a ray's origin): the
-// pages' 2x2 filter, each tap's occluder compared with the receiver's depth
-// plus a texel and the depth the surface the four taps hold changes by
-// between the tap and the receiver (their own slope, `PAGE_SLOPE` texels a
-// texel at most). A receiver on the surface the pages hold keeps none of
-// its own shadow at any slope (the shadow maps' receiver plane, read from
-// the depths themselves: Dou et al., "Adaptive Depth Bias for Shadow
-// Maps", 2014); one under an occluder is shaded; across an occluder's edge
-// the bias leaks up to a texel. x: the share, y: 1 when the four taps'
-// pages are resident (else 0).
-fn paged_share(p: vec3<f32>, e: u32, level: u32) -> vec2<f32> {
-    let texel = sun_occlusion_frame.info.x * exp2(f32(level));
-    let at = sun_occlusion_texel(p, e, level);
-    let shift = select(vec2<i32>(0), vec2<i32>(-1), at.frac < vec2<f32>(0.5));
-    let base = at.texel + shift;
-    // Where the receiver lies between the taps' centres (0..1).
-    let f = at.frac - 0.5 - vec2<f32>(shift);
-    let eye = sun_occlusion_frame.epochs[e].levels[level].texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT);
-    let slot = u32(sun_occlusion_frame.epochs[e].right.w) - 1u;
-    let side = sun_occlusion_frame.atlas.x;
-    let page_side = 1 << SUN_OCCLUSION_PAGE_SHIFT;
-    // Each tap's occluder along the sun (camera-relative, as the near
-    // planes are), and whether it holds one.
-    var occluder = vec4<f32>(0.0);
-    var held = vec4<bool>(false);
-    for (var k = 0; k < 4; k++) {
-        let t = base + vec2<i32>(k & 1, k >> 1);
-        let physical = sun_occlusion_physical(slot, level, t >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT), eye);
-        if physical == SUN_OCCLUSION_NONE { return vec2<f32>(1.0, 0.0); }
-        let corner = vec2<i32>(i32(physical % side), i32(physical / side)) * page_side;
-        let stored = textureLoad(sun_occlusion_maps, corner + (t & vec2<i32>(page_side - 1)), 0).r;
-        let near = bitcast<f32>(sun_occlusion_pages[sun_occlusion_frame.atlas.y + physical]);
-        occluder[k] = near + stored;
-        held[k] = stored > 0.0;
-    }
-    // The taps' slope (depth a texel across, then down), from the pairs
-    // that both hold an occluder.
-    var slope = vec2<f32>(0.0);
-    var pairs = vec2<f32>(0.0);
-    if held.x && held.y { slope.x += occluder.y - occluder.x; pairs.x += 1.0; }
-    if held.z && held.w { slope.x += occluder.w - occluder.z; pairs.x += 1.0; }
-    if held.x && held.z { slope.y += occluder.z - occluder.x; pairs.y += 1.0; }
-    if held.y && held.w { slope.y += occluder.w - occluder.y; pairs.y += 1.0; }
-    slope = clamp(slope / max(pairs, vec2<f32>(1.0)), vec2<f32>(-PAGE_SLOPE * texel), vec2<f32>(PAGE_SLOPE * texel));
-    let depth = dot(p, sun_occlusion_frame.epochs[e].forward.xyz);
-    var lit = vec4<f32>(0.0);
-    for (var k = 0; k < 4; k++) {
-        let tap = vec2<f32>(f32(k & 1), f32(k >> 1));
-        let bias = texel + abs(dot(tap - f, slope));
-        lit[k] = select(0.0, 1.0, !held[k] || depth <= occluder[k] + bias);
-    }
-    return vec2<f32>(mix(mix(lit.x, lit.y, f.x), mix(lit.z, lit.w, f.x), f.y), 1.0);
-}
-
-// The terrain's occlusion of ray `ray` from its sun occlusion pages
-// (`helio_light_api::sun_occlusion`, `ChunkWorld::draw_sun_occlusion`):
-// geometry at the level of detail of the ray's footprint. The pages hold
-// every volume's occlusion along their epoch's sun, a level's texels 2^k of
-// the finest wide; a ray along that sun (within PAGE_DRIFT of its width over
-// its length) that sees every volume and is at least a finest texel wide is
-// answered by the level whose texel is the largest no wider than its width,
-// where that level's pages are resident and the ray reaches their near
-// plane: the share that gets through (`paged_share`), below 0 where the
-// pages cannot answer (the ray walks). Every ray that could be answered so asks for its pages
-// (`ask_sun_pages`), so they come for the rays that need them, as the
-// pixels' do.
-fn paged_occlusion(ray: SceneRay) -> f32 {
-    let none = -1.0;
-    let every = RAY_MASK_STATIC | RAY_MASK_MOVABLE;
-    let finest = sun_occlusion_frame.info.x;
-    let width = scene_ray_width(ray);
-    if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
-    let level = sun_occlusion_level(width);
-    let offset = (ray_frame.origin_hi.xyz - ray_eye.hi.xyz) + (ray_frame.origin_lo.xyz - ray_eye.lo.xyz);
-    let p = ray.origin + offset;
-    for (var e = 0u; e < SUN_OCCLUSION_EPOCH_COUNT; e++) {
-        if sun_occlusion_frame.epochs[e].right.w == 0.0 { continue; }
-        let forward = sun_occlusion_frame.epochs[e].forward.xyz;
-        // The ray's length to the pages' near plane over the origin, by
-        // the physical page there.
-        let at = sun_occlusion_texel(p, e, level);
-        let eye = sun_occlusion_frame.epochs[e].levels[level].texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT);
-        let slot = u32(sun_occlusion_frame.epochs[e].right.w) - 1u;
-        let physical = sun_occlusion_physical(slot, level, at.texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT), eye);
-        // Off the epoch's sun by more than the width allows over a length
-        // the pages are as deep as.
-        let sine = length(cross(ray.dir, -forward));
-        if dot(ray.dir, -forward) <= 0.0 { continue; }
-        if e == 0u && sine <= PAGE_ASK_SINE { ask_sun_pages(p, width); }
-        if physical == SUN_OCCLUSION_NONE { continue; }
-        let near = bitcast<f32>(sun_occlusion_pages[sun_occlusion_frame.atlas.y + physical]);
-        let length_to_near = max(dot(p, forward) - near, 0.0);
-        if length_to_near > ray.t_max || sine * length_to_near > PAGE_DRIFT * width { continue; }
-        let r = paged_share(p, e, level);
-        if r.y > 0.0 { return r.x; }
-    }
-    return none;
-}
-
 // An occlusion stream: a ray the terrain meets before its end lets nothing
 // through (voxels are opaque, foliage cells too, as the sun's walks see
-// them); rows already blocked are left. A ray the sun's occlusion pages
-// answer (`paged_occlusion`) takes their share, for every volume, written
-// by the cut's first volume's dispatch; it is not walked. Its entry stays in
-// its kernel: its rays (toward the sun, to nearby points) walk little, and
-// a start row's write and read cost them more than the entry's registers
-// do.
+// them); rows already blocked are left. Its entry stays in its kernel: its
+// rays (toward the sun, to nearby points) walk little, and a start row's
+// write and read cost them more than the entry's registers do.
 @compute @workgroup_size(64)
 fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= ray_header.count { return; }
     let ray = stream_rays[id.x];
     if !stream_sees(ray) || stream_hits[id.x].t > 0.0 { return; }
-    let paged = paged_occlusion(ray);
-    if paged >= 0.0 {
-        if (params.volume.w & RAY_VOLUME_FIRST) != 0u && paged < 1.0 {
-            stream_hits[id.x] = scene_occlusion(scene_occlusion_through(stream_hits[id.x]) * paged);
-        }
-        return;
-    }
     if stream_walk(id.x, ray, stream_enter(id.x, ray, ray.t_max), ray.t_max).hit {
         stream_hits[id.x] = scene_occlusion(vec3<f32>(0.0));
     }
 }
-
 
 // The surfaces of the hits this volume found (its tracer's, its index):
 // the face's normal and the one it is lit with (`face_rule` at the ray's

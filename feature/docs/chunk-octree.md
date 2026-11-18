@@ -771,33 +771,21 @@ offers that to its graph (`stream::offer`).
 - **Occlusion** (`ray_occlusion`): blocked rows are left; a walk that
   meets the terrain before `t_max` blocks the ray (voxels are opaque, leaf
   cells too, as the sun's walks see them).
-- **Occlusion at the ray's footprint** (`paged_occlusion`): the sun's
-  occlusion pages (`sun_pages.rs`) hold every volume's occlusion along their
-  epoch's sun at texels 2^k of the finest wide, which is the terrain's
-  geometry at a level of detail. A ray that sees every volume (both caster
-  masks), whose width at its origin is at least the finest texel, and
-  that runs along an epoch's sun (its drift from it over its length to the
-  pages' near plane within half its width) is answered by the level whose
-  texel is the largest no wider than its width, where that level's pages
-  are resident and the ray reaches their near plane (`paged_share`): the
-  pages' 2x2 filter, each tap's occluder compared with the ray's origin
-  plus a texel and the change of the four taps' own depths between the tap
-  and the origin (their slope, at most `PAGE_SLOPE` texels a texel): the
-  shadow maps' receiver plane read from the depths, since a ray carries no
-  normal, so an origin on the surface the pages hold keeps none of its own
-  shadow at any slope while one under a roof or a canopy is shaded (an
-  origin lifted up the sun instead, as cone tracing starts a cone a
-  footprint off its surface, lost roofs and canopies a few metres up to
-  the footprints of GI's rays and lit the inside of houses: +4 to +8 % of
-  the final image's luminance on voxel_craft). It is not walked. The
-  cut's first volume's dispatch writes the answer (`RAY_VOLUME_FIRST`), the
-  others return. Every ray that could be answered asks for its pages
-  (`ask_sun_pages`), so the pages come for the rays that need them, as the
-  pixels' do; the requests are copied back at the start of the next
-  frame's `draw_sun_occlusion` (with the frame they were asked against), so
-  the rays traced after a draw are heard. Narrower rays, rays off the sun
-  and rays whose pages are not there walk. The choice is the ray's
-  footprint and the pages' residency, never who sent it.
+- **Not done: occlusion from the sun's pages at the ray's footprint.**
+  Answering occlusion rays along the sun from the sun's occlusion pages,
+  at the level whose texel is the ray's width (GI's shadow rays are as
+  wide as their probe ray's footprint), cut GI's sun rays on voxel_craft
+  from 0.41 to 0.07-0.09 ms and matched CPU rays to the sun beside towers
+  (5 wrong of 1,295 rays 0.5 m wide), but brightened voxel_craft's shade
+  by 3-8 % (mean |Δ| 0.007-0.014 against r0, where r0-r0 is
+  0.0001-0.0025), with every filter tried (the origin lifted two texels up
+  the sun; a slope bias from the taps' depths; an origin on the taps'
+  interpolated surface taken as lit, else a texel's bias), while the same
+  build with the pages turned off matched the walk (0.0006-0.0013, inside
+  run-to-run noise). Coarse pages under canopies let more sun through than
+  the walk does; why (their trace through a coarse cut, the texel's one
+  ray through gaps, transmissive leaves) is open, and occlusion rays walk
+  until it is known.
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
   they came, or a form's ray kernels still compiling: `RayLink::complete`;

@@ -28,10 +28,8 @@
 //!   origin once (`ray_enter_runs`, a thread a run) and its rays read that
 //!   row; rays whose origin is outside the volume, or a stream of single
 //!   rays, enter one by one (`ray_enter_nearest`). An occlusion stream's
-//!   short walks keep their entry in their kernel (`ray_occlusion`), and
-//!   the rays along the sun as wide as a page texel or more read the sun's
-//!   occlusion pages at their footprint instead of walking
-//!   (`paged_occlusion`). The surfaces (`ray_surface`) are written once
+//!   short walks keep their entry in their kernel (`ray_occlusion`). The
+//!   surfaces (`ray_surface`) are written once
 //!   every tracer traced, only for the hits that stayed the terrain's.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,20 +111,6 @@ pub struct RayCut {
     /// The stream's layouts: the traces' and the surfaces'.
     pub(super) layouts: [wgpu::BindGroupLayout; 2],
     pub(super) eye: wgpu::Buffer,
-    /// The sun's occlusion pages, which answer occlusion rays along the sun
-    /// at their footprint (chunk_draw.wgsl `paged_occlusion`).
-    pub(super) sun: SunPages,
-}
-
-/// What occlusion rays read of the sun's occlusion pages
-/// (`helio_light_api::sun_occlusion`) and where they ask for those they
-/// lack.
-#[derive(Clone)]
-pub(super) struct SunPages {
-    pub frame: wgpu::Buffer,
-    pub atlas: wgpu::TextureView,
-    pub pages: wgpu::Buffer,
-    pub requests: wgpu::Buffer,
 }
 
 impl RayCut {
@@ -337,17 +321,7 @@ impl StreamTracer {
         ];
         entries.extend(surfaces.map(|s| entry(70, s)));
         if let Some([starts, runs]) = &starts {
-            entries.extend([
-                entry(73, starts),
-                entry(74, runs),
-                entry(62, &cut.sun.frame),
-                wgpu::BindGroupEntry {
-                    binding: 63,
-                    resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
-                },
-                entry(65, &cut.sun.pages),
-                entry(66, &cut.sun.requests),
-            ]);
+            entries.extend([entry(73, starts), entry(74, runs)]);
         }
         self.cache.bind_group(
             device,

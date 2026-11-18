@@ -322,10 +322,6 @@ type AnchorColumn = ((u8, i32, i32), u32, bool);
 /// `RAY_VOLUME_MOVABLE` of chunk_draw.wgsl: a volume's ray parameters'
 /// `volume.w` when it has moved since it was added.
 const RAY_VOLUME_MOVABLE: u32 = 16;
-/// `RAY_VOLUME_FIRST` of chunk_draw.wgsl: the cut's first volume, whose
-/// rays' dispatch writes what the sun's occlusion pages answer for every
-/// volume.
-const RAY_VOLUME_FIRST: u32 = 32;
 
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
@@ -7088,12 +7084,7 @@ impl ChunkWorld {
                 .map_or(vol.transform, |(_, t)| *t);
             let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
             params.cut[2] = u32::MAX;
-            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 }
-                | if volumes.is_empty() {
-                    RAY_VOLUME_FIRST
-                } else {
-                    0
-                };
+            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 };
             self.uploads
                 .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
             volumes.push(rays::RayVolume {
@@ -7101,23 +7092,11 @@ impl ChunkWorld {
                 group: self.draw_group(&vol.views.rays, vol, self.camera_view(vol)),
             });
         }
-        // The sun's occlusion pages: occlusion rays along the sun read them
-        // at their footprint, and ask for those they lack.
-        let o = self
-            .sun_occlusion
-            .as_ref()
-            .expect("a camera draw has the sun's occlusion pages");
         self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
             volumes,
             pipelines: self.ray_pipelines.clone(),
             layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
             eye: self.ray_eye.clone(),
-            sun: rays::SunPages {
-                frame: o.frame.clone(),
-                atlas: o.atlas_view.clone(),
-                pages: o.pages_buffer.clone(),
-                requests: o.requests.clone(),
-            },
         }));
     }
 
@@ -7340,22 +7319,7 @@ impl ChunkWorld {
             .try_take()
             .map_or_else(Default::default, |p| (p.windows, p.rows, Some(p.parts)));
         laps[2] = clock.elapsed().as_secs_f64() * 1e3;
-        // The pages the last frame asked for (its pixels', and the ray
-        // streams' traced after its draw), back without waiting (when a
-        // slot is free), against what that frame asked by; then this
-        // frame's. (No epoch before the first plan: nothing is read against
-        // one.)
-        if let Some(asking) = o.asking.take() {
-            if let Some(r) = o
-                .request_slots
-                .iter_mut()
-                .find(|r| matches!(r.slot.state, ReachState::Free))
-            {
-                encoder.copy_buffer_to_buffer(&o.requests, 0, &r.slot.buffer, 0, SUN_REQUEST_BYTES);
-                r.slot.state = ReachState::Copied;
-                r.asking = Some(asking);
-            }
-        }
+        // (No epoch before the first plan: nothing is read against one.)
         o.asking = o.pages.current().map(|current| sun_pages::Asking {
             epoch: current.id,
             frame,
@@ -8458,6 +8422,27 @@ impl ChunkWorld {
             );
         }
         helio_core::cpu_scope!("VoxelChunks: draw: reports");
+        // The sun's occlusion pages this frame's pixels asked for, back
+        // without waiting (when a slot is free).
+        if let Some(o) = &mut self.sun_occlusion {
+            if let Some(asking) = o.asking.take() {
+                if let Some(r) = o
+                    .request_slots
+                    .iter_mut()
+                    .find(|r| matches!(r.slot.state, ReachState::Free))
+                {
+                    encoder.copy_buffer_to_buffer(
+                        &o.requests,
+                        0,
+                        &r.slot.buffer,
+                        0,
+                        SUN_REQUEST_BYTES,
+                    );
+                    r.slot.state = ReachState::Copied;
+                    r.asking = Some(asking);
+                }
+            }
+        }
         // Ray reports, back without waiting (a frame's copy when a slot is
         // free): the nodes the sampled hits want, and the Buried nodes rays
         // met.
