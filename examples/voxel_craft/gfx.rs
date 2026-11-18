@@ -429,7 +429,6 @@ impl Gfx {
         let appearance = palette.appearance;
         let terrain = helio_pass_voxel_planet::VoxelSettings {
             residency: chunk_config(render_size[1]),
-            sky_reach: Some(2.0),
         };
         let renderer_config = RendererConfig::new(render_size[0], render_size[1], render_format);
         // Render VR eyes at Performance scale by default, then reconstruct to
@@ -459,8 +458,8 @@ impl Gfx {
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range);
         // Open ground: GI's finest probes a metre apart (its default is
-        // half a metre, for rooms), and the pixels' sky rays walking two of
-        // their spacings, past which the probes hold the sky's occlusion.
+        // half a metre, for rooms); the pixels' sky rays follow, stopping
+        // where the probes resolve occlusion (`indirect_occlusion`).
         let renderer_config =
             renderer_config
                 .with_feature(terrain)

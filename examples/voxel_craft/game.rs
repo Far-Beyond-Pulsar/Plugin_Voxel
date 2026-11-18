@@ -374,8 +374,9 @@ impl Game {
 struct Tour {
     dir: String,
     pose: usize,
-    /// Frames since the pose was set.
+    /// Frames since the pose was set, and of those since the view settled.
     waited: u32,
+    settled_for: u32,
     /// Look at the nearest tree trunk instead of the posed views.
     trunk: bool,
     /// Consecutive frames saved a pose (`VOXEL_CRAFT_BURST`), and those
@@ -454,6 +455,7 @@ impl Tour {
             dir,
             pose: 0,
             waited: u32::MAX,
+            settled_for: 0,
             trunk: std::env::var_os("VOXEL_CRAFT_TRUNK").is_some(),
             burst,
             shots: 0,
@@ -567,8 +569,11 @@ impl Tour {
             self.set_pose(player);
         }
         self.waited += 1;
-        // A pose is shot once the terrain has settled and the temporal
-        // anti-aliasing has had frames to converge (or after a long wait).
+        self.settled_for = if settled { self.settled_for + 1 } else { 0 };
+        // A pose is shot once the terrain has settled (generated, and seen
+        // by the frame's ray streams) and the temporal anti-aliasing and
+        // GI's probes have had frames since to converge (or after a long
+        // wait).
         let frames = |name: &str, default: u32| {
             std::env::var(name)
                 .ok()
@@ -576,7 +581,7 @@ impl Tour {
                 .unwrap_or(default)
         };
         let minimum = frames("VOXEL_CRAFT_WAIT", 120);
-        let ready = (settled && self.waited >= minimum)
+        let ready = self.settled_for >= minimum
             || self.waited >= minimum.max(frames("VOXEL_CRAFT_WAIT_MAX", 900));
         if !ready {
             return None;
@@ -587,9 +592,10 @@ impl Tour {
             format!("{}/shot_{:02}_{:03}.png", self.dir, self.pose, self.shots)
         };
         log::info!(
-            "shot {} at {} frames, settled {settled}",
+            "shot {} at {} frames, settled {settled} for {} frames",
             self.pose,
-            self.waited
+            self.waited,
+            self.settled_for
         );
         self.shots += 1;
         if self.shots < self.burst {
@@ -624,6 +630,7 @@ impl Tour {
         }
         player.velocity = DVec3::ZERO;
         self.waited = 0;
+        self.settled_for = 0;
     }
 }
 

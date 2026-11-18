@@ -298,10 +298,7 @@ impl Showcase {
         );
 
         let appearance = worlds::Preset::Earth.appearance(planet.field().appearance());
-        let terrain = helio_pass_voxel_planet::VoxelSettings {
-            sky_reach: Some(2.0),
-            ..Default::default()
-        };
+        let terrain = helio_pass_voxel_planet::VoxelSettings::default();
         let mut renderer_config = RendererConfig::new(size[0], size[1], format);
         renderer_config
             .features
@@ -320,8 +317,8 @@ impl Showcase {
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range * 1.5);
         // Open ground: GI's finest probes a metre apart (its default is
-        // half a metre, for rooms), and the pixels' sky rays walking two of
-        // their spacings, past which the probes hold the sky's occlusion.
+        // half a metre, for rooms); the pixels' sky rays follow, stopping
+        // where the probes resolve occlusion (`indirect_occlusion`).
         let renderer_config =
             renderer_config
                 .with_feature(terrain)

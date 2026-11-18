@@ -49,6 +49,8 @@ naga = { version = "30.0.1", features = ["wgsl-in", "spv-out"] }
 # crate depends on Helio core and other plugins' api crates only.
 helio = { workspace = true }
 helio-presets = { workspace = true }
+# A preset graph with a node bypassed (voxel_pass_graph.rs).
+helio-graph-asset = { workspace = true }
 helio-components = { workspace = true }
 helio-pass-foliage-place = { workspace = true, features = ["host-rows"] }
 helio-pass-foliage-gbuffer = { workspace = true }

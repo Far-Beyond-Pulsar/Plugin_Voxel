@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use helio_feature_api::{BuildEnv, Feature, FeatureRegistrar, NodeDescriptor, ParamDesc};
+use helio_frame_api::lighting::indirect_occlusion;
 use helio_frame_api::rays::stream::{RegisterRayTracer, Tracer};
 use helio_frame_api::{FrameNode, Phase};
 
@@ -25,13 +26,6 @@ pub struct VoxelSettings {
     /// How chunks stream (budgets, cache; the pixel angle follows the
     /// camera).
     pub residency: ResidencyConfig,
-    /// How far each pixel's sky rays walk (metres), where the frame's
-    /// indirect diffuse resolves the sky's larger occlusion (world-space GI:
-    /// about twice its finest probe spacing), so the two do not darken the
-    /// same occluder twice. `None`: the terrain's own reach,
-    /// `SKY_RANGE_CELLS` cells (`chunk_draw.wgsl`), for a frame without
-    /// indirect diffuse.
-    pub sky_reach: Option<f32>,
 }
 
 impl VoxelSettings {
@@ -40,7 +34,6 @@ impl VoxelSettings {
     pub fn from_settings(settings: &helio_settings::Resolved) -> Self {
         Self {
             residency: ResidencyConfig::from_settings(settings),
-            sky_reach: settings.optional("sky_reach").map(|m| m as f32),
         }
     }
 }
@@ -64,7 +57,8 @@ pub fn tracer() -> Tracer {
     let add = |surface: bool| -> helio_frame_api::rays::stream::TracerBuild {
         Arc::new(move |build, stream, id| {
             let link = build.env.shared(SharedRayLink::default).0.clone();
-            let pass = VoxelRayPass::new(build.env.device, link, *stream, id, surface);
+            let answers = helio_frame_api::rays::stream::answers(build.env, stream);
+            let pass = VoxelRayPass::new(build.env.device, link, answers, *stream, id, surface);
             build.graph.add_pass(Box::new(pass));
             Ok(())
         })
@@ -115,7 +109,10 @@ impl Feature for VoxelFeature {
                         return Ok(());
                     }
                     let mut pass = ChunkPass::new(settings.residency);
-                    pass.set_sky_reach(settings.sky_reach);
+                    // The pixels' sky rays stop where the frame's indirect
+                    // diffuse resolves the sky's occlusion (none: their own
+                    // reach).
+                    pass.set_sky_reach(indirect_occlusion::distance(build.env));
                     pass.set_ray_link(build.env.shared(SharedRayLink::default).0.clone());
                     build
                         .env

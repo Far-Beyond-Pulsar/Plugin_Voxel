@@ -81,7 +81,7 @@ pub struct ChunkPass {
     )>,
     /// Every hit walks its own sun ray (`set_steady_shadows`).
     steady_shadows: bool,
-    /// How far each pixel's sky rays walk (`VoxelSettings::sky_reach`).
+    /// How far each pixel's sky rays walk (`set_sky_reach`).
     sky_reach: Option<f32>,
     /// The last frame's projection jitter (NDC).
     last_jitter: [Vec2; 2],
@@ -163,9 +163,18 @@ impl ChunkPass {
         self.steady_shadows = on;
     }
 
-    /// How far each pixel's sky rays walk (metres; `VoxelSettings::sky_reach`).
+    /// How far each pixel's sky rays walk (metres): the distance at which
+    /// the frame's indirect diffuse resolves occlusion
+    /// (`helio_frame_api::lighting::indirect_occlusion`), so the two do not
+    /// darken the same occluder twice; none: the terrain's own reach
+    /// (`SKY_RANGE_CELLS` cells, `chunk_draw.wgsl`).
     pub fn set_sky_reach(&mut self, reach: Option<f32>) {
         self.sky_reach = reach;
+    }
+
+    /// How far each pixel's sky rays walk ([`Self::set_sky_reach`]).
+    pub fn sky_reach(&self) -> Option<f32> {
+        self.sky_reach
     }
 
     /// Override the position used for residency/prefetch, without changing the
@@ -220,9 +229,12 @@ impl ChunkPass {
         self.world.as_ref()
     }
 
-    /// Whether nothing is left to generate for the current eye.
+    /// Whether nothing is left to generate for the current eye. Ray streams
+    /// traced through the terrain see it in full too: its cut is drawn and
+    /// its ray kernels compiled (`chunks::rays::RayLink::complete`).
     pub fn settled(&self) -> bool {
         self.world.as_ref().is_some_and(ChunkWorld::settled)
+            && (!self.rays.wanted() || self.rays.complete())
     }
 
     /// What the sun's occlusion pages did last frame (`ChunkWorld::sun_page_stats`).
@@ -507,8 +519,10 @@ impl ChunkPass {
             self.world = None;
             self.held.clear();
             self.rays.publish(None);
+            self.rays.set_volumes(false);
             return Ok(());
         };
+        self.rays.set_volumes(!frame.volumes.is_empty());
         let world = self.world.get_or_insert_with(|| {
             let mut world = ChunkWorld::new(ctx.device, ctx.queue);
             world.set_plain_colour(false);

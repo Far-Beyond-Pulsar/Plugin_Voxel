@@ -80,17 +80,20 @@ keyboard, it holds the time of day at mid-morning, poses the camera at the
 spawn in nine views (looking ahead, to the side, up and down; two third-person
 views; from 45 m up looking down; behind; and from 400 m up looking out to
 the horizon), saves each as `<dir>/shot_NN.png` and quits after the last.
-A pose is shot once the planet pass reports the view settled and at least
-`VOXEL_CRAFT_WAIT` frames have passed (default 120, for the temporal
-anti-aliasing to converge), or after 900 frames regardless
-(`VOXEL_CRAFT_WAIT_MAX`).
+A pose is shot once the planet pass has reported the view settled (the
+terrain generated, and its ray-stream kernels compiled so GI's rays see it)
+for `VOXEL_CRAFT_WAIT` frames (default 120, for the temporal anti-aliasing
+and GI's probes to converge), or after 900 frames regardless
+(`VOXEL_CRAFT_WAIT_MAX`; with a cold shader cache the terrain's pipelines
+take about a minute to compile, so an A/B against a baseline wants it in
+thousands).
 
 ```
 VOXEL_CRAFT_SHOTS=shots cargo run -p helio-voxel-examples --release --bin voxel_craft
 ```
 
 * `VOXEL_CRAFT_POSES=<n>`: shoot only the first `n` poses.
-* `VOXEL_CRAFT_WAIT=<frames>`: the minimum frames before each shot.
+* `VOXEL_CRAFT_WAIT=<frames>`: the frames settled before each shot.
 * `VOXEL_CRAFT_WAIT_MAX=<frames>`: the frames after which a pose is shot
   settled or not (default 900; with `VOXEL_CRAFT_WAIT=1`, the shot's log
   line gives the frames the view took to settle).

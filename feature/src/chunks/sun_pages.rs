@@ -877,6 +877,9 @@ pub(super) struct Planned {
     pub epochs: Vec<EpochGrid>,
     pub rows: Vec<(usize, Vec<u32>)>,
     pub stats: SunPageStats,
+    /// Whether its inputs' residency was settled (`PlanJob::settled`): only
+    /// such a plan has queued the pages a settled cut traces again.
+    pub settled: bool,
     pub parts: [f64; 3],
     pub spent: Vec<Vec<u32>>,
 }
@@ -907,6 +910,10 @@ pub(super) struct SunPlanner {
     /// Each physical page's epoch and near plane, as last traced.
     nears: Vec<(u64, f64)>,
     pub stats: SunPageStats,
+    /// Whether the plan taken last was made for a settled residency
+    /// ([`Planned::settled`]): its stats then count the pages a settled cut
+    /// traces again; an earlier plan's do not yet.
+    pub planned_settled: bool,
     /// Request word buffers to reuse.
     pub spare: Vec<Vec<u32>>,
 }
@@ -941,6 +948,7 @@ impl SunPlanner {
                         epochs: pages.epochs.iter().map(|e| e.grid).collect(),
                         rows: pages.take_rows(),
                         stats: pages.stats,
+                        settled: job.settled,
                         parts: [t0, t1 - t0, clock.elapsed().as_secs_f64() * 1e3 - t1],
                         spent: job.asked.drain(..).map(|(_, words)| words).collect(),
                     };
@@ -960,6 +968,7 @@ impl SunPlanner {
             epochs: Vec::new(),
             nears: vec![(u64::MAX, 0.0); SUN_OCCLUSION_PHYSICAL as usize],
             stats: SunPageStats::default(),
+            planned_settled: false,
             spare: Vec::new(),
         }
     }
@@ -991,6 +1000,13 @@ impl SunPlanner {
         }
     }
 
+    /// Whether the stats are the latest the planner will give for its
+    /// inputs so far: the plan taken last was made for a settled residency,
+    /// or no plan is on its way or queued.
+    pub fn stats_current(&self) -> bool {
+        self.planned_settled || (!self.in_flight && self.next.is_none())
+    }
+
     /// The plan on its way, if it is done (never waits): its epochs and
     /// stats kept; the inputs gathered since go to the planner.
     pub fn try_take(&mut self) -> Option<Planned> {
@@ -1012,6 +1028,7 @@ impl SunPlanner {
         self.in_flight = false;
         self.epochs.clone_from(&planned.epochs);
         self.stats = planned.stats;
+        self.planned_settled = planned.settled;
         self.spare.append(&mut planned.spent);
         if let Some(next) = self.next.take() {
             self.queue(next);

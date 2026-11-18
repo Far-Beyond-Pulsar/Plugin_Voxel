@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use glam::DVec3;
 use helio_core::compile::Compiling;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
-use helio_frame_api::rays::stream::{RayClass, Stream, TracerId};
+use helio_frame_api::rays::stream::{Answers, RayClass, Stream, TracerId};
 
 use super::volumes::DrawLayouts;
 use super::{entry, split};
@@ -133,6 +133,10 @@ impl RayCut {
 pub struct RayLink {
     cut: Mutex<Option<Arc<RayCut>>>,
     wanted: AtomicBool,
+    /// The frame holds volumes (the chunk pass, each frame), and a cut
+    /// with drawn chunks of them was published since they came.
+    volumes: AtomicBool,
+    drawn: AtomicBool,
 }
 
 impl RayLink {
@@ -146,6 +150,9 @@ impl RayLink {
 
     /// The cut the world drew (its chunk pass, after each draw).
     pub fn publish(&self, cut: Option<Arc<RayCut>>) {
+        if cut.as_ref().is_some_and(|c| c.volumes() > 0) {
+            self.drawn.store(true, Ordering::Relaxed);
+        }
         *self
             .cut
             .lock()
@@ -160,6 +167,26 @@ impl RayLink {
 
     pub fn wanted(&self) -> bool {
         self.wanted.load(Ordering::Relaxed)
+    }
+
+    /// Whether this frame holds volumes (the chunk pass, as it takes the
+    /// frame's).
+    pub fn set_volumes(&self, held: bool) {
+        self.volumes.store(held, Ordering::Relaxed);
+        if !held {
+            self.drawn.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the cut answers rays for every volume the frame holds: none
+    /// held, or chunks of them drawn once and the cut's kernels compiled.
+    /// Short (`stream::Answers::short`) until the volumes' first chunks are
+    /// drawn and while their ray kernels compile. Later frames that draw
+    /// none of them (an eye looking away) and chunks still generating are
+    /// what the cut holds of the volumes, no shortfall.
+    pub fn complete(&self) -> bool {
+        !self.volumes.load(Ordering::Relaxed)
+            || (self.drawn.load(Ordering::Relaxed) && self.cut().is_some_and(|cut| cut.ready()))
     }
 }
 
@@ -350,6 +377,9 @@ impl StreamTracer {
 /// its surfaces, through the cut its graph's chunk pass drew last.
 pub struct VoxelRayPass {
     link: Arc<RayLink>,
+    /// The stream's answers this frame: short while the cut does not
+    /// answer for every volume ([`RayLink::complete`]).
+    answers: Arc<Answers>,
     stream: Stream,
     tracer: StreamTracer,
     surface: bool,
@@ -360,10 +390,12 @@ pub struct VoxelRayPass {
 
 impl VoxelRayPass {
     /// `stream`'s trace (or `surface`s) as tracer `id` of the graph, through
-    /// the cut published to `link`.
+    /// the cut published to `link`, telling the stream's `answers` when the
+    /// cut is short.
     pub fn new(
         device: &wgpu::Device,
         link: Arc<RayLink>,
+        answers: Arc<Answers>,
         stream: Stream,
         id: TracerId,
         surface: bool,
@@ -379,6 +411,7 @@ impl VoxelRayPass {
         };
         Self {
             link,
+            answers,
             tracer: StreamTracer::new(device, stream.class, id),
             surface,
             name: helio_frame_api::static_name(&name),
@@ -410,6 +443,9 @@ impl RenderPass for VoxelRayPass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
+        if !self.surface && !self.link.complete() {
+            self.answers.short();
+        }
         let Some(cut) = self.link.cut() else {
             return Ok(());
         };

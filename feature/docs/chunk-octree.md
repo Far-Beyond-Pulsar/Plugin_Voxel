@@ -762,6 +762,18 @@ offers that to its graph (`stream::offer`).
 - **Occlusion** (`ray_occlusion`): blocked rows are left; a walk that
   meets the terrain before `t_max` blocks the ray (voxels are opaque, leaf
   cells too, as the sun's walks see them).
+- **Answered short** (`stream::Answers`): while the frame holds volumes
+  and the cut cannot answer for them (none of their chunks drawn yet since
+  they came, or a form's ray kernels still compiling: `RayLink::complete`;
+  a later view that draws none, looking away, is no shortfall), the
+  trace pass marks the stream short, so a consumer that keeps history
+  (GI's probes) holds instead of learning a world without the terrain.
+  `ChunkPass::settled` waits for it too: a host that renders until settled
+  gets frames whose ray streams see the terrain.
+- **The pixels' sky rays** stop at the frame's
+  `lighting::indirect_occlusion` distance (GI: twice its finest probe
+  spacing), read when the chunk node builds; without one, at
+  `SKY_RANGE_CELLS` cells.
 - **Every volume**: a dispatch a volume with drawn chunks, the stream's
   indirect groups each; a ray that misses a volume's ceiling ball costs it
   the test. Masks: a volume that has moved is `MASK_MOVABLE`, else

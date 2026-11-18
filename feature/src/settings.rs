@@ -112,14 +112,5 @@ pub static VOXEL_RESIDENCY: Group = Group {
             0.0,
             "Milliseconds a frame may take: generation grows into what the frame leaves; 0: the display's frame time",
         ),
-        number(
-            "sky_reach",
-            "Sky Occlusion Reach (m)",
-            "Lighting",
-            (0.0, 64.0, 0.25),
-            0.0,
-            "Metres each pixel's sky rays walk, where world-space GI resolves the sky's larger occlusion \
-             (about twice its probe spacing); 0: the terrain's own reach (48 cells)",
-        ),
     ],
 };

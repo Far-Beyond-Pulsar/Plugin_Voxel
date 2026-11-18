@@ -6327,7 +6327,10 @@ impl ChunkWorld {
             && self.residency_settled()
             && self.sun_occlusion.as_ref().is_none_or(|o| {
                 let s = o.pages.stats;
-                (s.missing == 0 && s.stale == 0 && s.coarse == 0)
+                // The stats of a plan made for the settled residency (the
+                // planner runs a frame or more behind): an earlier plan's
+                // have not queued the coarse pages a settled cut retraces.
+                (o.pages.stats_current() && s.missing == 0 && s.stale == 0 && s.coarse == 0)
                     || s.out_of_pages
                     || o.settled_since
                         .is_some_and(|f| o.drawn_frame + 1 >= f + PAGES_SETTLE_FRAMES)
@@ -6698,7 +6701,7 @@ impl ChunkWorld {
                     .unwrap_or(u32::MAX),
             ],
             light_eye: v.light_eye.map_or([0.0; 4], |e| e.extend(1.0).to_array()),
-            // A camera's pixels' sky rays (`VoxelSettings::sky_reach`).
+            // A camera's pixels' sky rays (`set_sky_reach`).
             sky: [
                 self.sky_reach.filter(|_| v.ortho.is_none()).unwrap_or(0.0),
                 self.sun_angular_radius,
@@ -9033,7 +9036,8 @@ impl ChunkWorld {
         self.steady_shadows = on;
     }
 
-    /// How far each pixel's sky rays walk (metres, `VoxelSettings::sky_reach`;
+    /// How far each pixel's sky rays walk (metres: where the frame's
+    /// indirect diffuse resolves occlusion, `ChunkPass::set_sky_reach`;
     /// none: `SKY_RANGE_CELLS` cells).
     pub fn set_sky_reach(&mut self, reach: Option<f32>) {
         self.sky_reach = reach;

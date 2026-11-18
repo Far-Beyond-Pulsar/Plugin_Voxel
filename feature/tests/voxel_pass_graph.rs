@@ -401,6 +401,37 @@ fn publish(renderer: &mut helio::Renderer, frame: Option<PlanetFrame>) {
     }
 }
 
+/// The deferred preset over the meshes' features and `features`, its nodes
+/// of the kinds `bypass` bypassed.
+fn deferred_graph(
+    features: &helio_feature_api::FeatureSet,
+    bypass: &[&str],
+) -> Box<dyn helio::IntoGraph> {
+    let preset = helio_mesh_host::presets::with(Preset::Deferred, features);
+    if bypass.is_empty() {
+        return Box::new(preset);
+    }
+    let registry = preset.registry().clone();
+    let mut asset = Preset::Deferred.asset(&registry);
+    let mut bypassed = 0;
+    for node in &mut asset.nodes {
+        if bypass.contains(&node.kind.as_str()) {
+            node.params
+                .insert("enabled".into(), serde_json::Value::Bool(false));
+            bypassed += 1;
+        }
+    }
+    assert_eq!(
+        bypassed,
+        bypass.len(),
+        "the preset holds every kind bypassed"
+    );
+    Box::new(
+        helio_graph_asset::GraphAssetPipeline::new(Arc::new(asset), registry)
+            .with_views(Preset::Deferred.views()),
+    )
+}
+
 struct Editor {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -412,6 +443,18 @@ struct Editor {
 }
 
 fn editor(width: u32, height: u32) -> Option<Editor> {
+    editor_with(width, height, voxel_features(), None, &[])
+}
+
+/// [`editor`] with `features`, GI's settings `gi` (none: its defaults) and
+/// the preset's nodes of the kinds `bypass` bypassed (`enabled: false`).
+fn editor_with(
+    width: u32,
+    height: u32,
+    features: helio_feature_api::FeatureSet,
+    gi: Option<helio_pass_gi::GiSettings>,
+    bypass: &[&str],
+) -> Option<Editor> {
     let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         eprintln!("GPU_VALIDATION_SKIPPED_NO_ADAPTER: editor overlays");
@@ -459,17 +502,17 @@ fn editor(width: u32, height: u32) -> Option<Editor> {
         .features
         .edit::<helio_pass_foliage_place::FoliageSettings>()
         .enabled = false;
-    let config = config.with_feature(helio_pass_voxel_planet::VoxelSettings::default());
+    let mut config = config.with_feature(helio_pass_voxel_planet::VoxelSettings::default());
+    if let Some(gi) = gi {
+        config = config.with_feature(gi);
+    }
     let mut renderer = RendererBuilder::new(config.clone(), mirror)
         .with_feature(helio::AmbientLight {
             color: [0.5, 0.5, 0.6],
             intensity: 1.0,
         })
         .with_external_device()
-        .with_graph(helio_mesh_host::presets::with(
-            helio_presets::Preset::Deferred,
-            &voxel_features(),
-        ))
+        .with_boxed_graph(deferred_graph(&features, bypass))
         .build(
             Arc::clone(&device),
             Arc::clone(&queue),
@@ -1453,6 +1496,49 @@ fn saved_edited_chunks_come_back_through_the_frame() {
     assert!(pollster::block_on(validation.pop()).is_none());
 }
 
+/// The pixels' sky rays stop where the frame's indirect diffuse resolves
+/// occlusion (`helio_frame_api::lighting::indirect_occlusion`): GI's offer,
+/// twice its finest probes' spacing, whatever that spacing is; without GI
+/// building in the graph, the terrain's own reach (none set).
+#[test]
+fn the_sky_rays_reach_follows_the_indirect_diffuse() {
+    let _gpu = gpu_serial();
+    let reach = |features, gi, bypass: &[&str]| {
+        let editor = editor_with(64, 64, features, gi, bypass)?;
+        Some(
+            editor
+                .renderer
+                .find_pass::<ChunkPass>()
+                .unwrap()
+                .sky_reach(),
+        )
+    };
+    let Some(default) = reach(voxel_features(), None, &[]) else {
+        return;
+    };
+    assert_eq!(
+        default,
+        Some(2.0 * helio_pass_gi::DEFAULT_FINEST_SPACING as f32)
+    );
+    let open_ground = helio_pass_gi::GiSettings {
+        probe_spacing: Some(1.0),
+    };
+    assert_eq!(
+        reach(voxel_features(), Some(open_ground), &[]).unwrap(),
+        Some(2.0)
+    );
+    // GI absent; GI's probe update bypassed in the graph: no indirect
+    // diffuse, the terrain's own reach.
+    let without_gi = helio_feature_api::FeatureSet::new()
+        .with(helio_pass_voxel_planet::VoxelFeature)
+        .with(helio_pass_sky::SkyFeature);
+    assert_eq!(reach(without_gi, None, &[]).unwrap(), None);
+    assert_eq!(
+        reach(voxel_features(), Some(open_ground), &["helio.pass.gi"]).unwrap(),
+        None
+    );
+}
+
 // ---- GI over the voxel terrain ----
 //
 // GI's probes traced through the frame's ray streams by the voxel terrain's
@@ -1496,16 +1582,12 @@ impl Editor {
         loop {
             each(self);
             self.render(camera);
+            // Settled: generated, and traced by ray streams in full (its
+            // ray kernels compile off the frame).
             let pass = self.renderer.find_pass::<ChunkPass>().unwrap();
-            // The terrain answers ray streams once its ray kernels compiled
-            // (off the frame: the cut holds them when they are).
-            let traced = pass
-                .world()
-                .and_then(|w| w.ray_cut())
-                .is_some_and(|cut| cut.ready());
-            if (pass.settled() && traced) || started.elapsed().as_secs() > 600 {
+            if pass.settled() || started.elapsed().as_secs() > 600 {
                 eprintln!(
-                    "settled {} traced {traced} after {:.1} s",
+                    "settled {} after {:.1} s",
                     pass.settled(),
                     started.elapsed().as_secs_f64()
                 );
@@ -1751,11 +1833,27 @@ fn a_terrain_wall_shadows_a_local_light_from_the_probes() {
 /// A mesh on the terrain: a slab 6 m square, 3 m over flat ground, under a
 /// high sun. The probes under it meet the slab above (the meshes' nearest
 /// hit, nearer than the sky), and the ground they see is in the slab's
-/// shadow (the terrain's hits' shadow rays stopped by the meshes): both far
+/// shadow (the terrain's hits' shadow rays stopped by the meshes): both
 /// darker than probes in the open, which see the sky above and sunlit
 /// ground below. Needs hardware ray queries (the meshes' tracer).
+///
+/// How much darker, for probes holding irradiance in L1 harmonics: an L1
+/// probe's irradiance toward `n` is its rays' mean radiance plus a dipole,
+/// `mean ± (1/2π)∫L cos`, and under a slab 6 m across a probe 1-2 m up sees
+/// the horizon (sunlit ground and sky past the slab's edges) over about 40%
+/// of the sphere's solid angle, though only a sixth of the upper
+/// hemisphere's cosine weight and under a third of the lower's. That horizon lifts both of its values: integrated from
+/// this world's rays (the open ground's radiance 0.26, the shaded ground's
+/// 0.06, the slab's underside 0.13, the sky 0.5), L1 gives the probes under
+/// the slab 0.45 of the open probes' irradiance from above and 0.64 from
+/// below, where the exact cosine-weighted irradiance is 0.35 and 0.40. A
+/// slab the rays did not see would leave above at 1; a shadow they did not
+/// see would put below at about 1.3 (sunlit ground under the probe, the
+/// horizon's light on top). The bounds sit between: 0.6 and 0.8. (Probes
+/// that took rays before the terrain's tracer answered, the meshes'
+/// answering alone, kept a world without ground for many updates: the
+/// open probes' below at 0.18 instead of 0.26, under / open 0.84.)
 #[test]
-#[ignore = "open (r1): measured above 0.40 and below 0.84 of the open ground's; the meshes' shadow on the terrain's hits is not seen yet (r1 GI report)"]
 fn a_mesh_slab_on_terrain_shades_the_probes_under_it() {
     let _gpu = gpu_serial();
     let Some(mut editor) = editor(320, 180) else {
@@ -1836,11 +1934,11 @@ fn a_mesh_slab_on_terrain_shades_the_probes_under_it() {
         under[0], under[1], open[0], open[1]
     );
     assert!(
-        under[0] < 0.3 * open[0],
+        under[0] < 0.6 * open[0],
         "the slab is nearer than the sky: {under:?} {open:?}"
     );
     assert!(
-        under[1] < 0.3 * open[1],
+        under[1] < 0.8 * open[1],
         "the ground under it is in its shadow: {under:?} {open:?}"
     );
 }
