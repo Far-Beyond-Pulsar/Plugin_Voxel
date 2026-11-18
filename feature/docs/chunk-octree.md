@@ -734,13 +734,22 @@ offers that to its graph (`stream::offer`).
   f32 frame space: its rounding is |origin| / 2^24, 24 um at GI's coarsest
   probes (400 m), 0.4 m at 6000 km, where the cut draws cells of kilometres.
   A tracer traces from the origin itself, with no offset of its own (the
-  contract): a ray that starts in rock is a hit from inside at once
-  (`SCENE_HIT_INSIDE`, t 1e-6, its face back along the ray), and so is one
-  that starts on a solid cell's face, within `ON_FACE` (1/1024) of a cell
-  of it, whichever way it goes (`on_solid_face`: far past the frames'
-  rounding, so the answer never depends on it; as GI's probes on a mesh's
-  surface count as inside). Consumers start rays off the surfaces they
-  leave.
+  contract): a ray that starts in rock, or in a solid cell of the chunk it
+  starts in, is a hit from inside at once (`SCENE_HIT_INSIDE`, t 1e-6, its
+  face back along the ray: no walk), and so is one that starts on a solid
+  cell's face, within `ON_FACE` (1/1024) of a cell of it, whichever way it
+  goes (`on_solid_face`: far past the frames' rounding, so the answer never
+  depends on it; as GI's probes on a mesh's surface count as inside).
+  Consumers start rays off the surfaces they leave.
+- **Runs from one origin** (`Stream::run`: GI's probe stream, 64 rays a
+  probe). Where a ray starts depends on its direction only when its origin
+  is outside the volume; inside, placing the origin (`enter_volume`,
+  `placing_chunk`, `point_start`, the in-solid and on-face checks) is the
+  run's, so `ray_enter_runs` does it once a run, a thread a run (its first
+  ray's dither picks a fading level's side; the walks keep their own), and
+  the walk's kernel reads the run's row. A run whose origin is outside the
+  volume is marked `START_RAYS` and its rays enter one by one
+  (`ray_enter_nearest`), as a stream without runs does.
 - **Nearest** (`ray_nearest`): the walk (`walk`, the camera's and GI's)
   up to `scene_hit_reach`, the hit written where nearer. Payload: `a` bits
   0..17 the walk's hit pair (`ROCK_PAIR` a Solid or Buried node's), 17..19
@@ -762,6 +771,33 @@ offers that to its graph (`stream::offer`).
 - **Occlusion** (`ray_occlusion`): blocked rows are left; a walk that
   meets the terrain before `t_max` blocks the ray (voxels are opaque, leaf
   cells too, as the sun's walks see them).
+- **Occlusion at the ray's footprint** (`paged_occlusion`): the sun's
+  occlusion pages (`sun_pages.rs`) hold every volume's occlusion along their
+  epoch's sun at texels 2^k of the finest wide, which is the terrain's
+  geometry at a level of detail. A ray that sees every volume (both caster
+  masks), whose width at its origin is at least the finest texel, and
+  that runs along an epoch's sun (its drift from it over its length to the
+  pages' near plane within half its width) is answered by the level whose
+  texel is the largest no wider than its width, where that level's pages
+  are resident and the ray reaches their near plane (`paged_share`): the
+  pages' 2x2 filter, each tap's occluder compared with the ray's origin
+  plus a texel and the change of the four taps' own depths between the tap
+  and the origin (their slope, at most `PAGE_SLOPE` texels a texel): the
+  shadow maps' receiver plane read from the depths, since a ray carries no
+  normal, so an origin on the surface the pages hold keeps none of its own
+  shadow at any slope while one under a roof or a canopy is shaded (an
+  origin lifted up the sun instead, as cone tracing starts a cone a
+  footprint off its surface, lost roofs and canopies a few metres up to
+  the footprints of GI's rays and lit the inside of houses: +4 to +8 % of
+  the final image's luminance on voxel_craft). It is not walked. The
+  cut's first volume's dispatch writes the answer (`RAY_VOLUME_FIRST`), the
+  others return. Every ray that could be answered asks for its pages
+  (`ask_sun_pages`), so the pages come for the rays that need them, as the
+  pixels' do; the requests are copied back at the start of the next
+  frame's `draw_sun_occlusion` (with the frame they were asked against), so
+  the rays traced after a draw are heard. Narrower rays, rays off the sun
+  and rays whose pages are not there walk. The choice is the ray's
+  footprint and the pages' residency, never who sent it.
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
   they came, or a form's ray kernels still compiling: `RayLink::complete`;

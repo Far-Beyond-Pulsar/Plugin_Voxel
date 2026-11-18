@@ -95,6 +95,25 @@ pub fn trace_stream(
     Vec<helio_frame_api::rays::stream::SceneHit>,
     Vec<helio_frame_api::rays::stream::SceneSurface>,
 ) {
+    trace_stream_in_runs(gpu, world, class, frame, rays, before, past, 1)
+}
+
+/// [`trace_stream`] of a stream whose rays come in runs of `run` from one
+/// origin (`Stream::run`).
+#[allow(clippy::too_many_arguments)]
+pub fn trace_stream_in_runs(
+    gpu: &Gpu,
+    world: &helio_pass_voxel_planet::chunks::ChunkWorld,
+    class: helio_frame_api::rays::stream::RayClass,
+    frame: glam::DVec3,
+    rays: &[helio_frame_api::rays::stream::SceneRay],
+    before: Option<&[helio_frame_api::rays::stream::SceneHit]>,
+    past: usize,
+    run: u32,
+) -> (
+    Vec<helio_frame_api::rays::stream::SceneHit>,
+    Vec<helio_frame_api::rays::stream::SceneSurface>,
+) {
     use helio_frame_api::rays::stream::{SceneHit, SceneSurface, Stream, StreamBuffers, TracerId};
     use helio_pass_voxel_planet::chunks::rays::{StreamBindings, StreamTracer};
     let stream = Stream::new("voxel_test", class, rays.len() as u32);
@@ -108,7 +127,7 @@ pub fn trace_stream(
         0,
         bytemuck::cast_slice(before.unwrap_or(&cleared)),
     );
-    let tracer = StreamTracer::new(&gpu.device, class, TracerId(VOXEL_TRACER));
+    let tracer = StreamTracer::new(&gpu.device, class, TracerId(VOXEL_TRACER)).with_run(run);
     tracer.write_frame(frame, |buffer, bytes| {
         gpu.queue.write_buffer(buffer, 0, bytes)
     });

@@ -4300,19 +4300,25 @@ fn read_words(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u32> {
     bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
 }
 
-/// The terrain occludes the sun for the volumetric fog and fine
-/// cells (`sun_occlusion`): towers out to a kilometre cast shadows under a
-/// low sun; points around each, between a quarter and three quarters of
-/// its height, read at the footprint a pixel there has (or the nearest
-/// coarser level resident), are lit by the pages as a CPU ray toward their
-/// epoch's sun finds them, but for occluders within a few texels (the
-/// bias) and reads across a shadow's edge (the filter's blend); a fiftieth
-/// may differ (a texel's edge along a step). The same with the sun turning
-/// a little each frame (as a day goes by): new epochs traced, each page
-/// read with the sun it was traced for.
-#[test]
-fn sun_occlusion_matches_cpu_rays_to_the_sun() {
-    let Some(gpu) = gpu() else { return };
+/// Four brick towers on an Earth's ground (10 m to a kilometre from the
+/// eye, 4 m to 160 m tall) under a low sun across their line: long shadows
+/// beside them, the sun's occlusion pages settled
+/// (`sun_occlusion_matches_cpu_rays_to_the_sun`,
+/// `wide_sun_rays_take_the_sun_pages`).
+struct TowerShadows {
+    planet: Planet,
+    eye: DVec3,
+    up: DVec3,
+    side: DVec3,
+    fwd: DVec3,
+    /// (distance from the eye, height, width), m, and each one's base.
+    towers: [(f64, f64, f64); 4],
+    bases: Vec<DVec3>,
+    view: View,
+    world: World,
+}
+
+fn tower_shadows(gpu: &Gpu, want_rays: bool) -> TowerShadows {
     let mut planet = Planet::new(PlanetRecipe::default()).unwrap();
     let dir = land(&planet, 1, 0.52, 0.48);
     let eye = planet.surface_point(dir, 2.0);
@@ -4345,31 +4351,75 @@ fn sun_occlusion_matches_cpu_rays_to_the_sun() {
         })
         .collect();
     let view = View::new(eye, (fwd - up * 0.1).normalize().as_vec3(), [320, 180]);
-    let mut world = World::new(gpu, &planet);
+    let mut world = if want_rays {
+        ray_world(gpu, &planet)
+    } else {
+        World::new(gpu, &planet)
+    };
     world.sun_occlusion = true;
     // A low sun, across the line of towers: long shadows beside them.
     world.sun = (up * 0.5 + side * 0.87).normalize().as_vec3();
     world.settle(gpu, &planet, &view);
     world.settle_sun_pages(gpu, &planet, &view);
-    let check = |world: &World| {
+    TowerShadows {
+        planet,
+        eye,
+        up,
+        side,
+        fwd,
+        towers,
+        bases,
+        view,
+        world,
+    }
+}
+
+/// A point beside tower `k % 4`, from its sunward side out past its
+/// shadow, in the air above a fifth of its height: none where that is in
+/// rock.
+fn beside_tower(t: &TowerShadows, k: usize, unit: &mut impl FnMut() -> f64) -> Option<DVec3> {
+    let (&(_, height, width), &base) = (&t.towers[k % 4], &t.bases[k % 4]);
+    let up = base.normalize();
+    let (a, b) = ((unit() * 2.0 - 0.25) * height, (unit() - 0.5) * 1.5 * width);
+    let ground = t
+        .planet
+        .surface_point((base - t.side * a + t.fwd * b).normalize(), 0.0);
+    let p = ground + ground.normalize() * (0.25 + unit() * 0.5) * height;
+    if t.planet.solid(t.planet.grid().locate(p).0) || (p - base).dot(up) < 0.2 * height {
+        return None;
+    }
+    Some(p)
+}
+
+/// The terrain occludes the sun for the volumetric fog and fine
+/// cells (`sun_occlusion`): towers out to a kilometre cast shadows under a
+/// low sun; points around each, between a quarter and three quarters of
+/// its height, read at the footprint a pixel there has (or the nearest
+/// coarser level resident), are lit by the pages as a CPU ray toward their
+/// epoch's sun finds them, but for occluders within a few texels (the
+/// bias) and reads across a shadow's edge (the filter's blend); a fiftieth
+/// may differ (a texel's edge along a step). The same with the sun turning
+/// a little each frame (as a day goes by): new epochs traced, each page
+/// read with the sun it was traced for.
+#[test]
+fn sun_occlusion_matches_cpu_rays_to_the_sun() {
+    let Some(gpu) = gpu() else { return };
+    let mut t = tower_shadows(gpu, false);
+    let check = |t: &TowerShadows| {
         let clock = std::time::Instant::now();
-        let pages = world.chunks.read_sun_occlusion().expect("drawn");
+        let pages = t.world.chunks.read_sun_occlusion().expect("drawn");
         let mut next = xorshift(0x2545_f491_4f6c_dd1d);
         let mut unit = || (next() >> 11) as f64 / (1u64 << 53) as f64;
         let (mut compared, mut shadowed, mut wrong) = (0usize, 0usize, 0usize);
         let mut levels = std::collections::BTreeMap::new();
         for k in 0..960 {
-            let (&(_, height, width), &base) = (&towers[k % 4], &bases[k % 4]);
-            let up = base.normalize();
-            // Beside the tower, from its sunward side out past its shadow.
-            let (a, b) = ((unit() * 2.0 - 0.25) * height, (unit() - 0.5) * 1.5 * width);
-            let ground = planet.surface_point((base - side * a + fwd * b).normalize(), 0.0);
-            let p = ground + ground.normalize() * (0.25 + unit() * 0.5) * height;
-            if planet.solid(planet.grid().locate(p).0) || (p - base).dot(up) < 0.2 * height {
+            let height = t.towers[k % 4].1;
+            let Some(p) = beside_tower(t, k, &mut unit) else {
                 continue;
-            }
-            let footprint = ((p - eye).length() * view.pixel_angle()) as f32;
-            let Some(read) = pages.read((p - eye).as_vec3().to_array(), [0.0; 3], footprint) else {
+            };
+            let footprint = ((p - t.eye).length() * t.view.pixel_angle()) as f32;
+            let Some(read) = pages.read((p - t.eye).as_vec3().to_array(), [0.0; 3], footprint)
+            else {
                 continue;
             };
             // Across a shadow's edge the filter blends.
@@ -4381,7 +4431,9 @@ fn sun_occlusion_matches_cpu_rays_to_the_sun() {
             // see to the ceiling; a CPU walk of 10 cm cells that far takes
             // seconds a point).
             let sun = DVec3::from_array(read.sun.map(f64::from)).normalize();
-            let hit = planet.raycast(p, sun, f64::from(read.depth).min(4.0 * height));
+            let hit = t
+                .planet
+                .raycast(p, sun, f64::from(read.depth).min(4.0 * height));
             // Occluders within a few texels: the bias and texels decide.
             if hit
                 .as_ref()
@@ -4397,7 +4449,7 @@ fn sun_occlusion_matches_cpu_rays_to_the_sun() {
                 wrong += 1;
                 if wrong < 8 {
                     eprintln!(
-                        "point {k} level {} ({a:.1}, {b:.1}): pages {}, cpu {cpu}",
+                        "point {k} level {}: pages {}, cpu {cpu}",
                         read.level, read.lit
                     );
                 }
@@ -4413,17 +4465,17 @@ fn sun_occlusion_matches_cpu_rays_to_the_sun() {
         );
         assert!(wrong * 50 <= compared, "{wrong} of {compared} wrong");
     };
-    check(&world);
+    check(&t);
     // The sun turns 0.03 degrees a frame for 40 frames: epochs traced under
     // suns up to a degree apart, each page read with its own.
-    let axis = up.cross(world.sun.as_dvec3()).normalize();
+    let axis = t.up.cross(t.world.sun.as_dvec3()).normalize();
     for _ in 0..40 {
-        world.sun = glam::DQuat::from_axis_angle(axis, 0.03_f64.to_radians())
-            .mul_vec3(world.sun.as_dvec3())
+        t.world.sun = glam::DQuat::from_axis_angle(axis, 0.03_f64.to_radians())
+            .mul_vec3(t.world.sun.as_dvec3())
             .as_vec3();
-        world.frame(gpu, &planet, &view, None);
+        t.world.frame(gpu, &t.planet, &t.view, None);
     }
-    check(&world);
+    check(&t);
 }
 
 /// The sun's occlusion pages a pixel reads have texels about its footprint
@@ -5405,6 +5457,23 @@ fn terrain_traces_stream_rays() {
         None,
         0,
     );
+    // The same rays as runs of a probe's 64 (`Stream::run`: each origin
+    // placed once) hit and shade the same, bit for bit (a settled world
+    // fades no level, so no dither tells a run's start from a ray's).
+    let runs = common::trace_stream_in_runs(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+        64,
+    );
+    let differ = (0..rays.len())
+        .filter(|&k| runs.0[k] != hits[k] || runs.1[k] != surfaces[k])
+        .count();
+    assert_eq!(differ, 0, "{differ} rays differ traced in runs");
     let (mut compared, mut wrong, mut rock, mut rock_wrong, mut surface_wrong) = (0, 0, 0, 0, 0);
     let mut balls = 0;
     // The CPU hits near the eye: ray, origin, direction, hit.
@@ -5866,6 +5935,96 @@ fn terrain_traces_occlusion_streams() {
     assert_eq!(lost, 0);
 }
 
+/// Occlusion rays toward the sun as wide as a page texel or more take the
+/// sun's occlusion pages at their footprint (`paged_occlusion`) and see the
+/// terrain as CPU rays toward the sun do: beside the towers of
+/// `tower_shadows`, rays 0.5 m and 4 m wide are blocked where a CPU ray
+/// from the point meets a tower, but for occluders within a few of their
+/// level's texels and rays across a shadow's edge (the pages' filter
+/// blends: the share between 0 and 1 a walk never gives, so the pages
+/// answered); a fiftieth may differ. The pages the rays ask for come
+/// (traced frames later, `ask_sun_pages`); rays the pages cannot answer
+/// (no width, off the sun: `terrain_traces_occlusion_streams`) walk.
+#[test]
+fn wide_sun_rays_take_the_sun_pages() {
+    use helio_frame_api::rays::stream::MASK_ALL;
+    let Some(gpu) = gpu() else { return };
+    let mut t = tower_shadows(gpu, true);
+    let frame = t.eye + DVec3::new(0.75, -0.5, 1.25);
+    let sun = t.world.sun.as_dvec3().normalize();
+    let mut next = xorshift(0x1f83_d9ab_fb41_bd6b);
+    let mut unit = || (next() >> 11) as f64 / (1u64 << 53) as f64;
+    let points: Vec<(usize, DVec3)> = (0..1600)
+        .filter_map(|k| Some((k, beside_tower(&t, k, &mut unit)?)))
+        .collect();
+    let ray = |p: DVec3, width: f32| SceneRay {
+        origin: (p - frame).as_vec3().to_array(),
+        t_max: 1e9,
+        dir: sun.as_vec3().to_array(),
+        cone: SceneRay::cone(width, 0.0, MASK_ALL),
+    };
+    let mut blended_first = 0;
+    for width in [0.5f32, 4.0] {
+        let stream: Vec<SceneRay> = points.iter().map(|&(_, p)| ray(p, width)).collect();
+        let trace = |t: &World| {
+            common::trace_stream(gpu, &t.chunks, RayClass::Occlusion, frame, &stream, None, 0).0
+        };
+        // The first trace asks for the pages its rays lack; frames later
+        // they are there.
+        let first = trace(&t.world);
+        for _ in 0..8 {
+            t.world.frame(gpu, &t.planet, &t.view, None);
+        }
+        let hits = trace(&t.world);
+        let blended = |hits: &[SceneHit]| {
+            hits.iter()
+                .filter(|h| (0.01..0.99).contains(&h.through()[0]))
+                .count()
+        };
+        blended_first += blended(&first);
+        let paged = blended(&hits);
+        let (mut compared, mut shadowed, mut wrong) = (0, 0, 0);
+        for (&(k, p), hit) in points.iter().zip(&hits) {
+            let through = hit.through()[0];
+            if (0.01..0.99).contains(&through) {
+                continue;
+            }
+            let height = t.towers[k % 4].1;
+            let cpu = t.planet.raycast(p, sun, 4.0 * height);
+            // Occluders within a few texels of the ray's level: its lift
+            // and the pages' bias decide.
+            if cpu
+                .as_ref()
+                .is_some_and(|h| h.distance < 8.0 * f64::from(width))
+            {
+                continue;
+            }
+            compared += 1;
+            shadowed += usize::from(cpu.is_some());
+            if (through >= 0.5) != cpu.is_none() {
+                wrong += 1;
+                if wrong < 8 {
+                    eprintln!(
+                        "point {k} width {width}: through {through}, cpu {:?}",
+                        cpu.map(|c| c.distance)
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{width} m sun rays: compared {compared}, shadowed {shadowed}, wrong {wrong}, blended {paged} (first trace {})",
+            blended(&first)
+        );
+        assert!(
+            compared > 300 && shadowed > 40,
+            "{compared} compared, {shadowed} shadowed"
+        );
+        assert!(wrong * 50 <= compared, "{wrong} of {compared} wrong");
+        assert!(paged > 20, "the pages answered {paged} rays");
+    }
+    eprintln!("blended rows before the pages came: {blended_first}");
+}
+
 /// A plane (one affine frame: rays are placed by its anchor) traces ray
 /// streams from about the eye as the CPU casts them.
 #[test]
@@ -5972,7 +6131,8 @@ fn record_streams(
 /// four coarser: 2720 probes, 64 rays each, 174 080 rays) about a ball on
 /// the ground, traced every frame by the stream kernels: the nearest hits,
 /// their surfaces, the entry alone (the same rays a ten-thousandth of a
-/// metre long) and occlusion toward the sun. Frames are pipelined (two in
+/// metre long), each a probe's 64 rays a run from it (`Stream::run`), and
+/// occlusion toward the sun (narrow rays: walked). Frames are pipelined (two in
 /// flight, none waited for alone: a synchronised harness downclocks), the
 /// streams recorded before the draw on odd frames and after it on even
 /// ones; GPU timestamps, medians in milliseconds. A report: ignored.
@@ -6045,7 +6205,9 @@ fn stream_rays_cost() {
             gpu.queue
                 .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
             buffers.set_count(&gpu.queue, rays.len() as u32);
-            let tracer = StreamTracer::new(&gpu.device, *class, TracerId(common::VOXEL_TRACER));
+            // A probe's 64 rays a run from it, as GI's stream says.
+            let tracer =
+                StreamTracer::new(&gpu.device, *class, TracerId(common::VOXEL_TRACER)).with_run(64);
             tracer.write_frame(eye, |buffer, bytes| {
                 gpu.queue.write_buffer(buffer, 0, bytes)
             });

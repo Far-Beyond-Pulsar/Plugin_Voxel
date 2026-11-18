@@ -239,16 +239,24 @@ fn chunk_pass_builds_settles_and_resizes_in_the_deferred_graph() {
             0.05,
             40_000_000.0,
         );
-        for _ in 0..600 {
+        // Until it settles: no frame count, as the world's pipelines compile
+        // off the frame first (a debug build's frames outrun them: the world
+        // keeps asking for frames until it can draw, and then has nothing to
+        // stream).
+        let started = std::time::Instant::now();
+        while started.elapsed().as_secs() < 300 {
             renderer.render(&centre, &view).unwrap();
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             if !renderer.find_pass::<ChunkPass>().unwrap().needs_frame() {
                 break;
             }
         }
+        let pass = renderer.find_pass::<ChunkPass>().unwrap();
         assert!(
-            !renderer.find_pass::<ChunkPass>().unwrap().needs_frame(),
-            "the centre never settled"
+            !pass.needs_frame(),
+            "the centre never settled: {}; sun pages {:?}",
+            pass.stats_line(),
+            pass.sun_page_stats()
         );
 
         // Moved to the surface, it streams the planet around the eye until

@@ -20,14 +20,19 @@
 //!   (`enter_volume`, `placing_chunk` in chunk_draw.wgsl: the anchor near the
 //!   eye, else the drawn node a sphere's exact levels find, then the chunk it
 //!   starts in), so it walks from its exact cell.
-//! - **Two passes a stream.** The trace keeps the walk's kernel small: for
-//!   a nearest-hit stream a volume's entry (`ray_enter_nearest`) writes each
-//!   ray's start (a 64-byte row in the tracer's own buffer), then the walk
-//!   (`ray_nearest`) reads it, so the walk keeps the old GI probe walk's registers (an
-//!   occlusion stream's short walks keep their entry: `ray_occlusion`);
-//!   the surfaces (`ray_surface`) are written once every tracer traced, only
-//!   for the hits that stayed the terrain's. Two dispatches a volume over
-//!   the stream's indirect groups.
+//! - **Entry apart from the walk.** The trace keeps the walk's kernel
+//!   small: for a nearest-hit stream a volume's entry writes each ray's
+//!   start (`RayStart`, a 64-byte row in the tracer's own buffer), then the
+//!   walk (`ray_nearest`) reads it. A stream whose rays come in runs from
+//!   one origin (`Stream::run`: GI's probes, 64 rays each) places each run's
+//!   origin once (`ray_enter_runs`, a thread a run) and its rays read that
+//!   row; rays whose origin is outside the volume, or a stream of single
+//!   rays, enter one by one (`ray_enter_nearest`). An occlusion stream's
+//!   short walks keep their entry in their kernel (`ray_occlusion`), and
+//!   the rays along the sun as wide as a page texel or more read the sun's
+//!   occlusion pages at their footprint instead of walking
+//!   (`paged_occlusion`). The surfaces (`ray_surface`) are written once
+//!   every tracer traced, only for the hits that stayed the terrain's.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +52,8 @@ pub(super) struct RayPipelines {
     /// occlusion stream's both in one.
     enter_nearest: wgpu::ComputePipeline,
     nearest: wgpu::ComputePipeline,
+    /// A stream in runs from one origin: each run's start.
+    enter_runs: wgpu::ComputePipeline,
     occlusion: wgpu::ComputePipeline,
     surface: wgpu::ComputePipeline,
 }
@@ -82,6 +89,7 @@ impl RayPipelines {
             ),
             nearest: compute("voxel nearest rays", &layouts.rays, "ray_nearest"),
             occlusion: compute("voxel occlusion rays", &layouts.rays, "ray_occlusion"),
+            enter_runs: compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"),
             surface: compute("voxel ray surfaces", &layouts.ray_surfaces, "ray_surface"),
         }
     }
@@ -105,6 +113,20 @@ pub struct RayCut {
     /// The stream's layouts: the traces' and the surfaces'.
     pub(super) layouts: [wgpu::BindGroupLayout; 2],
     pub(super) eye: wgpu::Buffer,
+    /// The sun's occlusion pages, which answer occlusion rays along the sun
+    /// at their footprint (chunk_draw.wgsl `paged_occlusion`).
+    pub(super) sun: SunPages,
+}
+
+/// What occlusion rays read of the sun's occlusion pages
+/// (`helio_light_api::sun_occlusion`) and where they ask for those they
+/// lack.
+#[derive(Clone)]
+pub(super) struct SunPages {
+    pub frame: wgpu::Buffer,
+    pub atlas: wgpu::TextureView,
+    pub pages: wgpu::Buffer,
+    pub requests: wgpu::Buffer,
 }
 
 impl RayCut {
@@ -221,10 +243,13 @@ struct GpuRayFrame {
 pub struct StreamTracer {
     class: RayClass,
     tracer: TracerId,
+    /// The stream's rays a run from one origin (`Stream::run`; 1: none).
+    run: u32,
     frame: wgpu::Buffer,
     /// The rays' starts in the volume being traced (`RayStart`,
-    /// [`START_BYTES`] a ray), as large as the stream's rays need.
-    starts: Mutex<Option<wgpu::Buffer>>,
+    /// [`START_BYTES`] a ray), and the runs' (one a run), as large as the
+    /// stream's rays need.
+    starts: Mutex<Option<[wgpu::Buffer; 2]>>,
     cache: helio_core::gpu_cache::GpuCache,
 }
 
@@ -236,6 +261,7 @@ impl StreamTracer {
         Self {
             class,
             tracer,
+            run: 1,
             frame: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("voxel ray frame"),
                 size: std::mem::size_of::<GpuRayFrame>() as u64,
@@ -247,22 +273,35 @@ impl StreamTracer {
         }
     }
 
-    /// The starts' buffer for `rays` (made, or remade larger, when short).
-    fn starts(&self, device: &wgpu::Device, rays: &wgpu::Buffer) -> wgpu::Buffer {
+    /// A stream whose rays come in runs of `run` from one origin
+    /// (`Stream::run`): a nearest-hit stream's entry is then a run's, not a
+    /// ray's (chunk_draw.wgsl `ray_enter_runs`). An occlusion stream's rays
+    /// enter in their walk's kernel and ignore it.
+    pub fn with_run(mut self, run: u32) -> Self {
+        self.run = run.max(1);
+        self
+    }
+
+    /// The starts' buffers for `rays`, a ray's and a run's (made, or remade
+    /// larger, when short).
+    fn starts(&self, device: &wgpu::Device, rays: &wgpu::Buffer) -> [wgpu::Buffer; 2] {
         let rows = (rays.size() / helio_frame_api::rays::stream::SceneRay::BYTES).max(1);
+        let sizes = [rows, rows.div_ceil(u64::from(self.run))].map(|n| n * START_BYTES);
         let mut starts = self
             .starts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if starts
             .as_ref()
-            .is_none_or(|b| b.size() < rows * START_BYTES)
+            .is_none_or(|b| b[0].size() < sizes[0] || b[1].size() < sizes[1])
         {
-            *starts = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("voxel ray starts"),
-                size: rows * START_BYTES,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
+            *starts = Some(sizes.map(|size| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("voxel ray starts"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
             }));
         }
         starts.as_ref().unwrap().clone()
@@ -276,7 +315,7 @@ impl StreamTracer {
         let frame = GpuRayFrame {
             origin_hi,
             origin_lo,
-            tracer: [self.tracer.0, 0, 0, 0],
+            tracer: [self.tracer.0, self.run, 0, 0],
         };
         write(&self.frame, bytemuck::bytes_of(&frame));
     }
@@ -297,7 +336,19 @@ impl StreamTracer {
             entry(72, &cut.eye),
         ];
         entries.extend(surfaces.map(|s| entry(70, s)));
-        entries.extend(starts.as_ref().map(|s| entry(73, s)));
+        if let Some([starts, runs]) = &starts {
+            entries.extend([
+                entry(73, starts),
+                entry(74, runs),
+                entry(62, &cut.sun.frame),
+                wgpu::BindGroupEntry {
+                    binding: 63,
+                    resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
+                },
+                entry(65, &cut.sun.pages),
+                entry(66, &cut.sun.requests),
+            ]);
+        }
         self.cache.bind_group(
             device,
             &wgpu::BindGroupDescriptor {
@@ -320,6 +371,10 @@ impl StreamTracer {
         timing: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
         let group = self.group(device, cut, stream, None);
+        // The runs' starts: a thread a run, over as many as the rays' rows
+        // hold (those past the header's count return at once).
+        let rows = stream.rays.size() / helio_frame_api::rays::stream::SceneRay::BYTES;
+        let run_groups = rows.div_ceil(u64::from(self.run)).div_ceil(64) as u32;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("voxel rays"),
             timestamp_writes: timing,
@@ -331,6 +386,10 @@ impl StreamTracer {
             };
             pass.set_bind_group(0, &v.group, &[]);
             if self.class == RayClass::Nearest {
+                if self.run > 1 {
+                    pass.set_pipeline(&kernels.enter_runs);
+                    pass.dispatch_workgroups(run_groups, 1, 1);
+                }
                 pass.set_pipeline(&kernels.enter_nearest);
                 pass.dispatch_workgroups_indirect(stream.header, 0);
             }
@@ -412,7 +471,7 @@ impl VoxelRayPass {
         Self {
             link,
             answers,
-            tracer: StreamTracer::new(device, stream.class, id),
+            tracer: StreamTracer::new(device, stream.class, id).with_run(stream.run),
             surface,
             name: helio_frame_api::static_name(&name),
             reads: helio_frame_api::static_names(&[stream.header, stream.rays, stream.hits]),
