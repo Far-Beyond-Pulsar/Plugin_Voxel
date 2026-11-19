@@ -38,8 +38,8 @@ pub use helio_voxel_data as data;
 
 use helio_pass_voxel_planet::terrain::material;
 
-/// The voxel feature: the chunk terrain at the G-buffer, its sun, GI tracer,
-/// foliage ground and water terrain.
+/// The voxel feature: the chunk terrain at the G-buffer, its sun, its ray
+/// stream tracer, foliage ground and water terrain.
 pub fn render_features() -> helio_feature_api::FeatureSet {
     helio_feature_api::FeatureSet::new().with(helio_pass_voxel_planet::VoxelFeature)
 }
@@ -47,11 +47,9 @@ pub fn render_features() -> helio_feature_api::FeatureSet {
 /// The feature's settings from the project's voxel settings.
 pub fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
     use engine_backend::subsystems::render::helio_renderer::project_settings;
-    config.with_feature(helio_pass_voxel_planet::VoxelSettings {
-        residency: helio_pass_voxel_planet::chunks::ResidencyConfig::from_settings(
-            &project_settings::resolved(&helio_pass_voxel_planet::settings::VOXEL_RESIDENCY),
-        ),
-    })
+    config.with_feature(helio_pass_voxel_planet::VoxelSettings::from_settings(
+        &project_settings::resolved(&helio_pass_voxel_planet::settings::VOXEL_RESIDENCY),
+    ))
 }
 
 /// A terrain material's name (ids start at 1).

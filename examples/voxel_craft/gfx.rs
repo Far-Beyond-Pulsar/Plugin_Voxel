@@ -71,7 +71,7 @@ struct PassTimings {
     passes: std::collections::BTreeMap<&'static str, f64>,
     /// The voxel pass's stages over the window: frames, then draw (seed and
     /// trace), seed, sun shadows, denoiser, generation (ms summed).
-    voxel: (u32, [f64; 12]),
+    voxel: (u32, [f64; 11]),
     /// Generation by kernel over the window (`FrameTimings::stages`,
     /// `tile_stages`), summed ms.
     generation: [f64; 7],
@@ -119,7 +119,7 @@ impl PassTimings {
         }
         for t in voxel {
             self.voxel.0 += 1;
-            let [a, b, c, d, e] = t.shadow_stages;
+            let [a, b, c, d] = t.shadow_stages;
             for (sum, ms) in self.voxel.1.iter_mut().zip([
                 t.draw,
                 t.seed,
@@ -130,7 +130,6 @@ impl PassTimings {
                 b,
                 c,
                 d,
-                e,
                 t.occlusion,
                 t.fallbacks,
             ]) {
@@ -179,10 +178,10 @@ impl PassTimings {
             list.join(", ")
         );
         if self.voxel.0 > 0 {
-            let [draw, seed, shadow, denoise, generate, sun, sky, hits, local, gi, occlusion, fallbacks] =
+            let [draw, seed, shadow, denoise, generate, sun, sky, hits, local, occlusion, fallbacks] =
                 self.voxel.1.map(|ms| ms / f64::from(self.voxel.0));
             log::info!(
-                "[timings] voxel stages over {} frames: draw {draw:.3} (seed {seed:.3}), shadow {shadow:.3} (sun samples {sun:.3}, sky samples {sky:.3}, hits {hits:.3} (fallbacks {fallbacks:.3}), local {local:.3}, GI rays {gi:.3}), denoise {denoise:.3}, generate {generate:.3}, sun occlusion {occlusion:.3}",
+                "[timings] voxel stages over {} frames: draw {draw:.3} (seed {seed:.3}), shadow {shadow:.3} (sun samples {sun:.3}, sky samples {sky:.3}, hits {hits:.3} (fallbacks {fallbacks:.3}), local {local:.3}), denoise {denoise:.3}, generate {generate:.3}, sun occlusion {occlusion:.3}",
                 self.voxel.0
             );
         }
@@ -235,7 +234,7 @@ impl PassTimings {
             );
         }
         self.residency = [0; 4];
-        self.voxel = (0, [0.0; 12]);
+        self.voxel = (0, [0.0; 11]);
         self.frames = 0;
         self.total = 0.0;
         self.passes.clear();
@@ -458,7 +457,15 @@ impl Gfx {
             .features
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range);
-        let renderer_config = renderer_config.with_feature(terrain);
+        // Open ground: GI's finest probes a metre apart (its default is
+        // half a metre, for rooms); the pixels' sky rays follow, stopping
+        // where the probes resolve occlusion (`indirect_occlusion`).
+        let renderer_config =
+            renderer_config
+                .with_feature(terrain)
+                .with_feature(helio_pass_gi::GiSettings {
+                    probe_spacing: Some(1.0),
+                });
         let handle = scene_db_handle(&scene);
         let builder = RendererBuilder::new(renderer_config.clone(), handle).with_graph(
             // The voxel world, the leaf kinds (particles, sprites, decals,
@@ -518,7 +525,7 @@ impl Gfx {
                 last: u64::MAX,
                 total: 0.0,
                 passes: Default::default(),
-                voxel: (0, [0.0; 12]),
+                voxel: (0, [0.0; 11]),
                 cpu: Vec::new(),
                 cycles: Vec::new(),
                 residency: [0; 4],

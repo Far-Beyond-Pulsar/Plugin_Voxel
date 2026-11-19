@@ -6,7 +6,7 @@ mod common;
 use common::{gpu, Gpu};
 use glam::{DVec3, Mat4, Vec3};
 use helio_pass_voxel_planet::chunks::{
-    residency, Capacity, ChunkWorld, GiRays, KeptChunks, ResidencyConfig, SceneLights, VolumeId,
+    residency, Capacity, ChunkWorld, KeptChunks, ResidencyConfig, SceneLights, VolumeId,
 };
 use helio_pass_voxel_planet::engine::{PickHit, PickResult, VolumeAnswer, VolumeAnswers};
 use helio_pass_voxel_planet::features::{FeatureSet, Spawn};
@@ -19,6 +19,10 @@ use helio_pass_voxel_planet::{
 };
 
 const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+
+/// The GI probes' finest spacing the tests place probes at: open ground's
+/// (`GiSettings::probe_spacing` over terrain), whatever GI's default is.
+const PROBE_SPACING: f64 = 1.0;
 
 /// A camera at the eye (camera-relative) looking along `forward`.
 struct View {
@@ -127,9 +131,6 @@ struct World {
     /// Scene lights the draws shadow (`SceneLights`, eye-relative: lights,
     /// tile lists, tile counts).
     lights: Option<[wgpu::Buffer; 3]>,
-    /// GI probe rays the draws trace (`GiRays`: frame, rays, hits, sun),
-    /// the clipmap around the eye.
-    gi: Option<[wgpu::Buffer; 4]>,
     /// Whether each frame draws the sun's occlusion pages it lacks.
     sun_occlusion: bool,
     /// The projection jittered each frame as Helio's (`r1_r2_jitter`): the
@@ -151,7 +152,6 @@ impl World {
             sun: Vec3::new(0.3, 0.8, 0.4).normalize(),
             scene_depth: None,
             lights: None,
-            gi: None,
             sun_occlusion: false,
             jitter: None,
             last: None,
@@ -232,20 +232,7 @@ impl World {
                 tile_counts,
                 eye: Vec3::ZERO,
             });
-        if self.gi.is_some() {
-            self.chunks.follow_gi(
-                helio_gi_api::Clipmap::around(view.eye, helio_gi_api::DEFAULT_FINEST_SPACING),
-                view.eye,
-                view.eye,
-            );
-        }
-        let gi = self.gi.as_ref().map(|[frame, rays, hits, sun]| GiRays {
-            frame,
-            rays,
-            hits,
-            sun,
-        });
-        // As the pass: the sun's occlusion before the draw (its GI hits read it).
+        // As the pass: the sun's occlusion before the draw.
         if self.sun_occlusion {
             self.chunks
                 .draw_sun_occlusion(&mut recorder, self.frame, view.eye, self.sun);
@@ -262,7 +249,6 @@ impl World {
             view.size,
             self.scene_depth.as_ref(),
             lights.as_ref(),
-            gi.as_ref(),
         );
         if let Some(picks) = picks {
             let taken = self
@@ -4295,61 +4281,6 @@ fn terrain_shadows_local_lights() {
     eprintln!("shadow stage, denoiser: {:.3}, {:.3} ms with the light (every hit walking); {:.3}, {:.3} ms (samples shared); {:.3}, {:.3} ms without", steady.0, steady.1, sampled.0, sampled.1, unlit.0, unlit.1);
 }
 
-/// GI probe rays (`GiRays`) from probes `probes` of the clipmap around
-/// `eye`, a ray each along `dirs` (probe-major, 64 a probe), and the sun
-/// toward `sun`.
-fn gi_rays(gpu: &Gpu, eye: DVec3, probes: &[u32], dirs: &[Vec3], sun: Vec3) -> [wgpu::Buffer; 4] {
-    use wgpu::util::DeviceExt;
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
-    let frame = helio_gi_api::GpuFrame {
-        levels: clipmap.levels(eye),
-        sky: [0.0; 4],
-        ground: [0.0; 4],
-        counts: [probes.len() as u32, 0, 0, 0],
-        rotation: [0.0, 0.0, 0.0, 1.0],
-        prev_rotation: [0.0, 0.0, 0.0, 1.0],
-    };
-    let mut rays = Vec::with_capacity(dirs.len() * 8);
-    for (k, d) in dirs.iter().enumerate() {
-        let probe = probes[k / helio_gi_api::RAYS as usize];
-        let o = (clipmap.position(probe) - eye).as_vec3();
-        rays.extend_from_slice(&[
-            o.x.to_bits(),
-            o.y.to_bits(),
-            o.z.to_bits(),
-            1e30f32.to_bits(),
-            d.x.to_bits(),
-            d.y.to_bits(),
-            d.z.to_bits(),
-            probe,
-        ]);
-    }
-    let init = |label, contents: &[u8], usage| {
-        gpu.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents,
-                usage,
-            })
-    };
-    let storage =
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-    [
-        init(
-            "gi frame",
-            bytemuck::bytes_of(&frame),
-            wgpu::BufferUsages::UNIFORM,
-        ),
-        init("gi rays", bytemuck::cast_slice(&rays), storage),
-        init("gi hits", &vec![0u8; dirs.len() * 16], storage),
-        init(
-            "gi sun",
-            bytemuck::cast_slice(&[sun.x, sun.y, sun.z, 0.0, 1.0, 1.0, 1.0, 0.0]),
-            storage,
-        ),
-    ]
-}
-
 fn read_words(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u32> {
     let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -4369,241 +4300,7 @@ fn read_words(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u32> {
     bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
 }
 
-/// What the terrain's GI rays met against CPU rays (`trace_gi_rays`).
-#[derive(Debug, Default)]
-struct GiRayCheck {
-    /// Probes in rock and those not reported so (rays).
-    rock: usize,
-    rock_wrong: usize,
-    /// Hits in view near the eye (level 0) and those off the CPU's.
-    compared: usize,
-    wrong: usize,
-    /// Hits facing the sun the sun's occlusion maps hold, those the maps
-    /// shadow, and disagreements with the maps (by more than half).
-    lit: usize,
-    shadowed: usize,
-    sun_wrong: usize,
-    /// Hits on leaves, those whose transmission is not the material's, and
-    /// of those facing away from the sun, the sun on the leaf cell's far
-    /// side by the maps: compared, none, disagreements.
-    leaves: usize,
-    through_wrong: usize,
-    back: usize,
-    back_shadowed: usize,
-    back_wrong: usize,
-}
-
-/// GI rays from the finest level's middle 8^3 probes around `eye` (64
-/// random rays each), traced by the settled terrain of `view`, against CPU
-/// rays; their hits' sun against the sun's occlusion maps read back.
-fn trace_gi_rays(gpu: &Gpu, planet: &Planet, eye: DVec3, view: &View) -> GiRayCheck {
-    let view_proj = view.view_proj(planet);
-    let clipmap = helio_gi_api::Clipmap::around(eye, helio_gi_api::DEFAULT_FINEST_SPACING);
-    let mut probes = Vec::new();
-    for z in 8..16 {
-        for y in 8..16 {
-            for x in 8..16 {
-                probes.push(helio_gi_api::Clipmap::index(
-                    0,
-                    clipmap.first[0] + glam::I64Vec3::new(x, y, z),
-                ));
-            }
-        }
-    }
-    let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
-    let mut unit = || loop {
-        let v =
-            DVec3::new(next() as f64, next() as f64, next() as f64) / u64::MAX as f64 * 2.0 - 1.0;
-        if v.length_squared() > 1e-4 && v.length_squared() <= 1.0 {
-            return v.normalize();
-        }
-    };
-    let dirs: Vec<DVec3> = (0..probes.len() * helio_gi_api::RAYS as usize)
-        .map(|_| unit())
-        .collect();
-    let mut world = World::new(gpu, planet);
-    world.gi = Some(gi_rays(
-        gpu,
-        eye,
-        &probes,
-        &dirs.iter().map(|d| d.as_vec3()).collect::<Vec<_>>(),
-        world.sun,
-    ));
-    world.sun_occlusion = true;
-    world.settle(gpu, planet, view);
-    // The sun's occlusion pages this view asks for.
-    world.settle_sun_pages(gpu, planet, view);
-    // One frame's hits (the GI pass clears them each frame).
-    let gi = world.gi.as_ref().unwrap();
-    gpu.queue
-        .write_buffer(&gi[2], 0, &vec![0u8; gi[2].size() as usize]);
-    world.frame(gpu, planet, view, None);
-    let hits = read_words(gpu, &world.gi.as_ref().unwrap()[2]);
-    let pages = world.chunks.read_sun_occlusion().expect("drawn");
-    let near = 0.7 * planet.grid().voxel_size() / view.pixel_angle();
-    let voxel = planet.grid().voxel_size();
-    let sun = world.sun.as_dvec3();
-    let leaf = planet.field().appearance().materials[material::LEAVES as usize].transmission;
-    let leaf_through = (leaf * 255.0 + 0.5) as u32;
-    // The sun at `from` (receiver normal `n`) by the pages, as the tracer
-    // reads them: a hit's cell its footprint (none: no page holds it).
-    let sun_seen = |from: DVec3, n: DVec3| {
-        pages
-            .read(
-                (from - eye).as_vec3().to_array(),
-                n.as_vec3().to_array(),
-                voxel as f32,
-            )
-            .map(|r| f64::from(r.lit))
-    };
-    let mut c = GiRayCheck::default();
-    for (k, d) in dirs.iter().enumerate() {
-        let probe = probes[k / helio_gi_api::RAYS as usize];
-        let origin = clipmap.position(probe);
-        let hit = &hits[k * 4..k * 4 + 4];
-        let t = f32::from_bits(hit[0]);
-        if planet.solid(planet.grid().locate(origin).0) {
-            c.rock += 1;
-            c.rock_wrong += usize::from(t != 1e-3);
-            continue;
-        }
-        let Some(cpu) = planet.raycast(origin, *d, 60.0) else {
-            continue;
-        };
-        let at = origin + *d * cpu.distance;
-        let clip = view_proj * (at - eye).as_vec3().extend(1.0);
-        let ndc = clip.truncate() / clip.w;
-        if clip.w <= 0.0 || ndc.x.abs() > 0.95 || ndc.y.abs() > 0.95 || (at - eye).length() > near {
-            continue;
-        }
-        c.compared += 1;
-        let p = DVec3::new(
-            f64::from(hit[1] & 1023),
-            f64::from((hit[1] >> 10) & 1023),
-            f64::from((hit[1] >> 20) & 1023),
-        ) / 1023.0
-            * 2.0
-            - 1.0;
-        let n = p.normalize_or_zero();
-        let exact = t > 0.0
-            && (f64::from(t) - cpu.distance).abs() <= 2e-3 + cpu.distance * 1e-5
-            && n.dot(cpu.normal) > 0.99;
-        if !exact {
-            c.wrong += 1;
-            if c.wrong < 8 {
-                eprintln!(
-                    "ray {k}: drawn t {t} n {n}, cpu {} n {}",
-                    cpu.distance, cpu.normal
-                );
-            }
-            continue;
-        }
-        let leaf = planet.material(cpu.cell) == material::LEAVES;
-        c.leaves += usize::from(leaf);
-        c.through_wrong += usize::from((hit[3] >> 8) & 255 != if leaf { leaf_through } else { 0 });
-        let facing = cpu.normal.dot(sun);
-        if facing > 0.2 {
-            // Where the tracer reads the maps: half a cell off the face.
-            let Some(seen) = sun_seen(at + cpu.normal * (0.5 * voxel), cpu.normal) else {
-                continue;
-            };
-            c.lit += 1;
-            c.shadowed += usize::from(seen < 0.5);
-            c.sun_wrong += usize::from((seen - f64::from(hit[2] >> 24) / 255.0).abs() > 0.5);
-        } else if leaf && facing < -0.2 {
-            // Past the leaf cell, half a cell off its far side.
-            let Some(seen) = sun_seen(at - cpu.normal * (1.5 * voxel), DVec3::ZERO) else {
-                continue;
-            };
-            c.back += 1;
-            c.back_shadowed += usize::from(seen == 0.0);
-            c.back_wrong +=
-                usize::from((seen - f64::from((hit[3] >> 16) & 255) / 255.0).abs() > 0.5);
-        }
-    }
-    eprintln!("{c:?}");
-    c
-}
-
-/// The terrain traces the GI probes' rays: from the finest level's probes
-/// around the eye (a ball raised on the ground beside them), a probe in the
-/// ground reports rock (a back face at once); every other ray whose CPU hit
-/// is in view near the eye (level 0 drawn there) hits at the CPU's distance
-/// with the CPU's face, and sees the sun from half a cell off it as the
-/// sun's occlusion maps do; a hundredth may differ (grazing cells).
-#[test]
-fn terrain_traces_gi_probe_rays() {
-    let Some(gpu) = gpu() else { return };
-    let mut planet = Planet::new(PlanetRecipe::default()).unwrap();
-    let dir = land(&planet, 4, 0.37, 0.61);
-    let ground = planet.surface_point(dir, 0.0);
-    let up = planet.grid().up(ground);
-    let side = up.any_orthonormal_vector();
-    let fwd = up.cross(side);
-    planet
-        .apply(Brush {
-            center: (ground + fwd * 2.0 + up * 0.8).to_array(),
-            radius: 1.0,
-            shape: BrushShape::Sphere,
-            op: BrushOp::Add,
-            material: material::BRICK,
-            height: 0.0,
-        })
-        .unwrap();
-    let eye = ground + up * 3.0 - fwd * 4.0 + side * 1.5;
-    let view = View::new(
-        eye,
-        ((ground + fwd * 2.5) - eye).normalize().as_vec3(),
-        [320, 180],
-    );
-    let c = trace_gi_rays(gpu, &planet, eye, &view);
-    assert!(c.rock > 50 && c.rock_wrong == 0, "{c:?}");
-    assert!(c.compared > 1500 && c.wrong * 100 <= c.compared, "{c:?}");
-    // The pages answer as the tracer reads them.
-    assert!(c.shadowed > 10 && c.sun_wrong * 100 <= c.lit, "{c:?}");
-    assert_eq!(c.through_wrong, 0, "{c:?}");
-}
-
-/// Leaves let light through for GI: among a forest's trees, a GI ray's hit
-/// on leaves carries the leaves' transmission (nothing else does), and the
-/// sun at a hit, and at a leaf cell's far side when the leaf faces away, is
-/// the sun's occlusion maps'.
-#[test]
-fn gi_rays_see_light_through_leaves() {
-    let Some(gpu) = gpu() else { return };
-    let (planet, dir) = forest_planet();
-    // Under a tree: a column topped by leaves, the eye a metre beside its
-    // trunk under the canopy, looking up at it.
-    let grid = *planet.grid();
-    let (c, _) = grid.locate(planet.surface_point(dir, 0.0));
-    // A trunk: wood with the crown's leaves ten cells over it.
-    let trunk = (0..200 * 200)
-        .map(|n| (c.i + n % 200 - 100, c.j + n / 200 - 100))
-        .find_map(|(i, j)| {
-            let top = planet.column_top(c.face, i, j, 0);
-            (top - 2..top + 3)
-                .map(|k| Cell::new(c.face, i, j, k))
-                .find(|&w| {
-                    planet.material(w) == material::WOOD
-                        && planet.material(Cell::new(w.face, w.i, w.j, w.k + 10))
-                            == material::LEAVES
-                })
-        })
-        .expect("a tree");
-    let trunk = grid.cell_center(Cell::new(trunk.face, trunk.i, trunk.j, trunk.k + 9));
-    let up = grid.up(trunk);
-    let side = up.any_orthonormal_vector();
-    let eye = planet.surface_point(trunk.normalize(), 0.0) + up * 0.5 + side * 0.15;
-    let view = View::new(eye, (trunk - eye).normalize().as_vec3(), [320, 180]);
-    let c = trace_gi_rays(gpu, &planet, eye, &view);
-    assert!(c.compared > 400 && c.wrong * 100 <= c.compared, "{c:?}");
-    assert!(c.leaves > 100 && c.through_wrong == 0, "{c:?}");
-    // The pages' 2x2 filter as the tracer reads it: a tenth may differ.
-    assert!(c.back > 8 && c.back_wrong * 10 <= c.back, "{c:?}");
-    assert!(c.sun_wrong * 50 <= c.lit, "{c:?}");
-}
-
-/// The terrain occludes the sun for the volumetric fog, GI hits and fine
+/// The terrain occludes the sun for the volumetric fog and fine
 /// cells (`sun_occlusion`): towers out to a kilometre cast shadows under a
 /// low sun; points around each, between a quarter and three quarters of
 /// its height, read at the footprint a pixel there has (or the nearest
@@ -5519,4 +5216,1099 @@ fn smooth_surfaces_are_lit_not_moved() {
         .count();
     eprintln!("smoothing relit {relit} of {} pixels", smooth_sun.len());
     assert!(relit > 0, "smoothing changed no pixel's light");
+}
+
+// ---- Ray streams (`chunks::rays`) ----
+
+use helio_frame_api::rays::stream::{
+    unpack_radiance, unpack_unit, RayClass, SceneHit, SceneRay, SceneSurface,
+};
+
+/// A world drawn for ray streams: its ray kernels compiled.
+fn ray_world(gpu: &Gpu, planet: &Planet) -> World {
+    let mut world = World::new(gpu, planet);
+    world.chunks.want_rays();
+    world
+        .chunks
+        .wait_for_pipelines()
+        .expect("the ray kernels compile");
+    world
+}
+
+/// The terrain's hit in row `hit`, if any: its distance and whether it is
+/// from inside.
+fn terrain_hit(hit: &SceneHit) -> Option<(f64, bool)> {
+    (hit.t > 0.0 && hit.tracer().0 == common::VOXEL_TRACER)
+        .then(|| (f64::from(hit.t), hit.inside()))
+}
+
+/// Whether a CPU hit `distance` along `dir` from `origin` lies in view near
+/// the eye, where level 0 is drawn.
+fn near_in_view(view: &View, planet: &Planet, origin: DVec3, dir: DVec3, distance: f64) -> bool {
+    let at = origin + dir * distance;
+    let clip = view.view_proj(planet) * (at - view.eye).as_vec3().extend(1.0);
+    let ndc = clip.truncate() / clip.w;
+    let near = 0.7 * planet.grid().voxel_size() / view.pixel_angle();
+    clip.w > 0.0 && ndc.x.abs() <= 0.95 && ndc.y.abs() <= 0.95 && (at - view.eye).length() <= near
+}
+
+/// What a terrain surface written for a CPU hit gets wrong against the
+/// world's appearance: its face (against the CPU's normal), its lit normal
+/// (not on the face's side), base colour (outside the material's patch
+/// colours), metalness, roughness, the share it lets through, emission.
+fn surface_errors(
+    s: &SceneSurface,
+    appearance: &helio_pass_voxel_planet::engine::TerrainAppearance,
+    material: u32,
+    normal: DVec3,
+) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let face = DVec3::from_array(unpack_unit(s.face).map(f64::from));
+    let lit = DVec3::from_array(unpack_unit(s.normal).map(f64::from));
+    if face.dot(normal) < 0.99 {
+        out.push("face");
+    }
+    if lit.dot(face) <= 0.0 {
+        out.push("shading normal");
+    }
+    let m = &appearance.materials[material as usize];
+    let linear = |c: f32| f64::from(c.clamp(0.0, 1.0)).powf(2.2);
+    let base = s.base_color();
+    for c in 0..3 {
+        let (lo, hi) = match m.patches {
+            Some(p) => (
+                (0..3).map(|k| linear(p[k][c])).fold(f64::MAX, f64::min),
+                (0..3).map(|k| linear(p[k][c])).fold(f64::MIN, f64::max),
+            ),
+            None => (linear(m.colour[c]), linear(m.colour[c])),
+        };
+        let got = f64::from(base[c]);
+        if got < lo - 2.0 / 255.0 || got > hi + 2.0 / 255.0 {
+            out.push("base colour");
+            break;
+        }
+    }
+    if base[3] != 0.0 {
+        out.push("metallic");
+    }
+    let roughness = f64::from(m.colour[3].clamp(0.04, 1.0));
+    if (f64::from(s.roughness()) - roughness).abs() > 1.0 / 255.0 {
+        out.push("roughness");
+    }
+    let through = (m.transmission.clamp(0.0, 1.0) * 255.0).round() / 255.0;
+    if (s.transmission() - through).abs() > 0.5 / 255.0 {
+        out.push("transmission");
+    }
+    let emitted = unpack_radiance(s.emissive);
+    for c in 0..3 {
+        let want = base[c] * m.emission;
+        if (emitted[c] - want).abs() > want / 64.0 + 2.0 / 255.0 * m.emission + 1e-6 {
+            out.push("emission");
+            break;
+        }
+    }
+    out
+}
+
+/// Random unit vectors.
+fn units(seed: u64) -> impl FnMut() -> DVec3 {
+    let mut next = xorshift(seed);
+    move || loop {
+        let v =
+            DVec3::new(next() as f64, next() as f64, next() as f64) / u64::MAX as f64 * 2.0 - 1.0;
+        if v.length_squared() > 1e-4 && v.length_squared() <= 1.0 {
+            return v.normalize();
+        }
+    }
+}
+
+/// A brick ball raised beside the eye on the ground; the planet, eye,
+/// view, up.
+fn ball_ground() -> (Planet, DVec3, View, DVec3, DVec3) {
+    let mut planet = Planet::new(PlanetRecipe::default()).unwrap();
+    let dir = land(&planet, 4, 0.37, 0.61);
+    let ground = planet.surface_point(dir, 0.0);
+    let up = planet.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let fwd = up.cross(side);
+    planet
+        .apply(Brush {
+            center: (ground + fwd * 2.0 + up * 0.8).to_array(),
+            radius: 1.0,
+            shape: BrushShape::Sphere,
+            op: BrushOp::Add,
+            material: material::BRICK,
+            height: 0.0,
+        })
+        .unwrap();
+    let eye = ground + up * 3.0 - fwd * 4.0 + side * 1.5;
+    let view = View::new(
+        eye,
+        ((ground + fwd * 2.5) - eye).normalize().as_vec3(),
+        [320, 180],
+    );
+    (planet, eye, view, up, ground)
+}
+
+/// The terrain traces ray streams from anywhere on an Earth (6371 km, 10 cm
+/// voxels): from GI's finest probes about the eye (open air; in the ground:
+/// a hit from inside at once), from hits on the ground and on a glowing,
+/// translucent brick ball, from points hundreds of metres off, and from far
+/// over the ground (outside the volume, entering it). Every ray whose CPU
+/// hit is in view near the eye (level 0 drawn there) hits at the CPU's
+/// distance and face, its surface the cell's material as the world's
+/// appearance gives it; the far ones at the drawn level's cells. A ray ends
+/// at its length, a nearer hit already in its row stays and a farther one
+/// is replaced, and rows past the header's count are left untouched. The
+/// rays are relative to a frame origin off the eye (as Helio's snapped
+/// origin is).
+#[test]
+fn terrain_traces_stream_rays() {
+    let Some(gpu) = gpu() else { return };
+    let (planet, eye, view, up, ground) = ball_ground();
+    // The ball glows and lets light through: its surfaces carry both.
+    let mut appearance = planet.field().appearance();
+    appearance.materials[material::BRICK as usize].emission = 3.0;
+    appearance.materials[material::BRICK as usize].transmission = 0.4;
+    let mut world = ray_world(gpu, &planet);
+    world.chunks.set_appearance(VolumeId(0), &appearance);
+    world.settle(gpu, &planet, &view);
+    // Helio's frame origin is snapped near the eye, not at it.
+    let frame = eye + DVec3::new(3.75, -1.5, 2.25);
+    let mut unit = units(0x2545_f491_4f6c_dd1d);
+    let voxel = planet.grid().voxel_size();
+
+    // 1. From the finest probes' places: open air and rock.
+    let mut origins = Vec::new();
+    for z in 8..16 {
+        for y in 8..16 {
+            for x in 8..16 {
+                origins.push(probe_place(eye, 0, glam::I64Vec3::new(x, y, z)));
+            }
+        }
+    }
+    let rays: Vec<(DVec3, DVec3)> = origins
+        .iter()
+        .flat_map(|&o| std::iter::repeat_n(o, 64))
+        .map(|o| (o, unit()))
+        .collect();
+    let stream: Vec<SceneRay> = rays
+        .iter()
+        .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.0))
+        .collect();
+    let (hits, surfaces) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    // The same rays as runs of a probe's 64 (`Stream::run`: each origin
+    // placed once) hit and shade the same, bit for bit (a settled world
+    // fades no level, so no dither tells a run's start from a ray's).
+    let runs = common::trace_stream_in_runs(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+        64,
+    );
+    let differ = (0..rays.len())
+        .filter(|&k| runs.0[k] != hits[k] || runs.1[k] != surfaces[k])
+        .count();
+    assert_eq!(differ, 0, "{differ} rays differ traced in runs");
+    let (mut compared, mut wrong, mut rock, mut rock_wrong, mut surface_wrong) = (0, 0, 0, 0, 0);
+    let mut balls = 0;
+    // The CPU hits near the eye: ray, origin, direction, hit.
+    let mut near_hits = Vec::new();
+    for (k, &(o, d)) in rays.iter().enumerate() {
+        let got = terrain_hit(&hits[k]);
+        if planet.solid(planet.grid().locate(o).0) {
+            rock += 1;
+            let face = DVec3::from_array(unpack_unit(surfaces[k].face).map(f64::from));
+            if !got.is_some_and(|(t, inside)| inside && t < 1e-5) || face.dot(-d) < 0.99 {
+                rock_wrong += 1;
+            }
+            continue;
+        }
+        let Some(cpu) = planet.raycast(o, d, 60.0) else {
+            continue;
+        };
+        if !near_in_view(&view, &planet, o, d, cpu.distance) {
+            continue;
+        }
+        compared += 1;
+        let exact = got.is_some_and(|(t, inside)| {
+            !inside && (t - cpu.distance).abs() <= 2e-3 + cpu.distance * 1e-5
+        });
+        if !exact {
+            wrong += 1;
+            if wrong < 8 {
+                eprintln!(
+                    "ray {k}: traced {:?}, cpu {} n {}",
+                    hits[k], cpu.distance, cpu.normal
+                );
+            }
+            continue;
+        }
+        let m = planet.material(cpu.cell);
+        balls += usize::from(m == material::BRICK);
+        let errors = surface_errors(&surfaces[k], &appearance, m, cpu.normal);
+        if !errors.is_empty() {
+            surface_wrong += 1;
+            if surface_wrong < 8 {
+                eprintln!(
+                    "ray {k}: surface {:?} of material {m}: {errors:?}",
+                    surfaces[k]
+                );
+            }
+        }
+        near_hits.push((o, d, cpu));
+    }
+    eprintln!(
+        "probe rays: compared {compared}, wrong {wrong}, surfaces wrong {surface_wrong}, \
+         ball {balls}; rock {rock}, wrong {rock_wrong}"
+    );
+    assert!(
+        rock > 50 && rock_wrong == 0,
+        "{rock} in rock, {rock_wrong} wrong"
+    );
+    assert!(
+        compared > 1500 && wrong * 100 <= compared,
+        "{wrong} of {compared}"
+    );
+    assert!(balls > 100, "{balls} hits on the ball");
+    assert!(
+        surface_wrong * 100 <= compared,
+        "{surface_wrong} surfaces of {compared}"
+    );
+
+    // 2. From those hits (a twentieth of a cell off the face) out over it,
+    // with a footprint (the lit normal at it).
+    let surface_rays: Vec<(DVec3, DVec3)> = near_hits
+        .iter()
+        .step_by(2)
+        .map(|&(o, d, cpu)| {
+            let from = o + d * cpu.distance + cpu.normal * (0.05 * voxel);
+            let out = unit();
+            (from, if out.dot(cpu.normal) < 0.0 { -out } else { out })
+        })
+        .collect();
+    let stream: Vec<SceneRay> = surface_rays
+        .iter()
+        .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.01))
+        .collect();
+    let (hits, surfaces) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let (mut compared, mut wrong, mut inside, mut surface_wrong) = (0, 0, 0, 0);
+    for (k, &(o, d)) in surface_rays.iter().enumerate() {
+        inside += usize::from(terrain_hit(&hits[k]).is_some_and(|h| h.1));
+        let Some(cpu) = planet.raycast(o, d, 60.0) else {
+            continue;
+        };
+        if !near_in_view(&view, &planet, o, d, cpu.distance) {
+            continue;
+        }
+        compared += 1;
+        let exact = terrain_hit(&hits[k])
+            .is_some_and(|(t, _)| (t - cpu.distance).abs() <= 2e-3 + cpu.distance * 1e-5);
+        if !exact {
+            wrong += 1;
+            continue;
+        }
+        let errors = surface_errors(
+            &surfaces[k],
+            &appearance,
+            planet.material(cpu.cell),
+            cpu.normal,
+        );
+        surface_wrong += usize::from(!errors.is_empty());
+    }
+    eprintln!(
+        "surface rays: {} rays, compared {compared}, wrong {wrong}, surfaces wrong \
+         {surface_wrong}, inside {inside}",
+        surface_rays.len()
+    );
+    // A start over a face can lie on the side of a step beside it
+    // (`ON_FACE`): in that cell, a few in a thousand.
+    assert!(
+        inside * 100 <= surface_rays.len(),
+        "{inside} rays from over a face start in rock"
+    );
+    // From exactly on those faces (no offset: the consumer's to give), out
+    // and in: in the cell at once, whichever way they go.
+    let on_face: Vec<SceneRay> = near_hits
+        .iter()
+        .step_by(4)
+        .flat_map(|&(o, d, cpu)| {
+            let at = o + d * cpu.distance;
+            [
+                common::scene_ray(frame, at, cpu.normal, 1e30, 0.0),
+                common::scene_ray(frame, at, -cpu.normal, 1e30, 0.0),
+            ]
+        })
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &on_face,
+        None,
+        0,
+    );
+    let not_inside = hits
+        .iter()
+        .filter(|h| !terrain_hit(h).is_some_and(|(t, inside)| inside && t < 1e-5))
+        .count();
+    eprintln!(
+        "rays from on faces: {} rays, {not_inside} not inside",
+        on_face.len()
+    );
+    assert!(
+        not_inside * 100 <= on_face.len(),
+        "{not_inside} of {} on faces",
+        on_face.len()
+    );
+    assert!(
+        compared > 200 && wrong * 50 <= compared,
+        "{wrong} of {compared}"
+    );
+    assert!(
+        surface_wrong * 50 <= compared,
+        "{surface_wrong} surfaces of {compared}"
+    );
+
+    // 3. From 100 to 300 m off, 2 to 20 m over the ground there, down at
+    // it: at the drawn level's cells (coarser out there).
+    let mut far_rays = Vec::new();
+    while far_rays.len() < 400 {
+        let a = unit();
+        let across = (a - up * a.dot(up)).normalize_or_zero();
+        if across == DVec3::ZERO {
+            continue;
+        }
+        let r = 100.0 + 200.0 * (unit().x * 0.5 + 0.5);
+        let under = planet.surface_point(eye + across * r, 0.0);
+        let at = under + planet.grid().up(under) * (2.0 + 18.0 * (unit().y * 0.5 + 0.5));
+        let d = unit();
+        if d.dot(planet.grid().up(at)) > -0.3 || planet.solid(planet.grid().locate(at).0) {
+            continue;
+        }
+        far_rays.push((at, d));
+    }
+    let stream: Vec<SceneRay> = far_rays
+        .iter()
+        .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.0))
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let (mut compared, mut wrong) = (0, 0);
+    for (k, &(o, d)) in far_rays.iter().enumerate() {
+        let Some(cpu) = planet.raycast(o, d, 200.0) else {
+            continue;
+        };
+        compared += 1;
+        let level = world
+            .chunks
+            .chunk_at(hits[k].b)
+            .map_or(0, |(key, _)| key.level);
+        let cell = voxel * f64::from(1u32 << level);
+        let close = terrain_hit(&hits[k]).is_some_and(|(t, inside)| {
+            !inside && (t - cpu.distance).abs() <= 3.0 * cell / d.dot(cpu.normal).abs().max(0.25)
+        });
+        if !close {
+            wrong += 1;
+            if wrong < 8 {
+                // The drawn chunks over its start's column (level, layer).
+                let (c, _) = planet.grid().locate(o);
+                let drawn: Vec<(u32, i32)> = world
+                    .chunks
+                    .chunks_over(VolumeId(0), c.face, c.i, c.j)
+                    .into_iter()
+                    .filter(|n| n.2)
+                    .map(|n| (n.0.level, n.0.cz))
+                    .collect();
+                eprintln!(
+                    "far ray {k}: traced {:?} (level {level}), cpu {} at layer {} from layer {}; drawn over it {drawn:?}",
+                    hits[k], cpu.distance, cpu.cell.k, c.k
+                );
+            }
+        }
+    }
+    eprintln!("far rays: compared {compared}, wrong {wrong}");
+    assert!(
+        compared > 300 && wrong * 20 <= compared,
+        "{wrong} of {compared}"
+    );
+
+    // 4. From 25 km over the ground about the eye (outside the volume):
+    // down onto the ground (drawn at level 0 there), up into nothing.
+    let mut high = Vec::new();
+    for _ in 0..64 {
+        let a = unit();
+        let p = planet.surface_point(ground + (a - up * a.dot(up)) * 3.0, 0.0);
+        high.push((p, planet.surface_point(p, 25_000.0)));
+    }
+    let stream: Vec<SceneRay> = high
+        .iter()
+        .flat_map(|&(p, o)| {
+            let down = (p - o).normalize();
+            [
+                common::scene_ray(frame, o, down, 1e30, 0.0),
+                common::scene_ray(frame, o, -down, 1e30, 0.0),
+            ]
+        })
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let mut high_wrong = 0;
+    for (k, &(p, o)) in high.iter().enumerate() {
+        let down = terrain_hit(&hits[2 * k]);
+        let expected = (p - o).length();
+        if !down.is_some_and(|(t, inside)| !inside && (t - expected).abs() <= 0.02)
+            || hits[2 * k + 1].t != 0.0
+        {
+            high_wrong += 1;
+            eprintln!(
+                "high ray {k}: traced {:?} / {:?}, ground at {expected}",
+                hits[2 * k],
+                hits[2 * k + 1]
+            );
+        }
+    }
+    assert_eq!(high_wrong, 0, "rays from outside the volume");
+
+    // 5. Lengths, rows already holding hits and rows past the count, on
+    // probe rays that hit near the eye.
+    let picked: Vec<_> = near_hits.iter().take(512).collect();
+    let mut stream = Vec::new();
+    let mut before = Vec::new();
+    for (n, &&(o, d, cpu)) in picked.iter().enumerate() {
+        let t = cpu.distance as f32;
+        // Short of the hit, past it; a nearer hit there, a farther one.
+        let (t_max, row) = match n % 4 {
+            0 => (0.5 * t, SceneHit::default()),
+            1 => (1.5 * t, SceneHit::default()),
+            2 => (
+                1e30,
+                SceneHit {
+                    t: 0.5 * t,
+                    a: 15 << 28,
+                    b: 7,
+                    c: 9,
+                },
+            ),
+            _ => (
+                1e30,
+                SceneHit {
+                    t: 2.0 * t,
+                    a: 15 << 28,
+                    b: 7,
+                    c: 9,
+                },
+            ),
+        };
+        stream.push(common::scene_ray(frame, o, d, t_max, 0.0));
+        before.push(row);
+    }
+    // Rows past the header's count: untouched.
+    let past = 64;
+    for _ in 0..past {
+        stream.push(common::scene_ray(frame, eye, -up, 1e30, 0.0));
+        before.push(SceneHit {
+            t: 7.0,
+            a: 0x1234_5678,
+            b: 1,
+            c: 2,
+        });
+    }
+    let (hits, surfaces) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        Some(&before),
+        past,
+    );
+    let mut kept_wrong = 0;
+    for (n, &&(_, _, cpu)) in picked.iter().enumerate() {
+        let h = &hits[n];
+        let ok = match n % 4 {
+            0 => h.t == 0.0,
+            1 | 3 => terrain_hit(h)
+                .is_some_and(|(t, _)| (t - cpu.distance).abs() <= 2e-3 + cpu.distance * 1e-5),
+            _ => *h == before[n],
+        };
+        kept_wrong += usize::from(!ok);
+    }
+    let n = picked.len();
+    let past_touched = (n..n + past)
+        .filter(|&k| hits[k] != before[k] || surfaces[k] != SceneSurface::default())
+        .count();
+    eprintln!(
+        "lengths and rows: {kept_wrong} of {n} wrong, {past_touched} rows past the count touched"
+    );
+    assert!(n > 400 && kept_wrong * 100 <= n, "{kept_wrong} of {n}");
+    assert_eq!(past_touched, 0);
+}
+
+/// Occlusion streams agree with CPU casts: from hits near the eye (a
+/// twentieth of a cell off their face) toward the sun (to 60 m) and toward
+/// points of the air within 8 m, a ray is blocked exactly where the CPU's
+/// meets solid before its end; rows already blocked stay so.
+#[test]
+fn terrain_traces_occlusion_streams() {
+    let Some(gpu) = gpu() else { return };
+    let (planet, eye, view, up, _) = ball_ground();
+    let mut world = ray_world(gpu, &planet);
+    world.settle(gpu, &planet, &view);
+    let frame = eye - DVec3::new(1.25, 0.5, -2.0);
+    let side = up.any_orthonormal_vector();
+    // A low sun across the ball: its shadow on the ground in view.
+    let sun = (up * 0.45 + side * 0.9).normalize();
+    let voxel = planet.grid().voxel_size();
+    let mut unit = units(0x9e37_79b9_7f4a_7c15);
+    // Starts: the ground's and the ball's faces in view near the eye.
+    let view_proj = view.view_proj(&planet);
+    let mut starts = Vec::new();
+    for y in (0..180).step_by(3) {
+        for x in (0..320).step_by(3) {
+            let d = view.pixel_dir(view_proj, x, y);
+            if let Some(cpu) = planet.raycast(eye, d, 15.0) {
+                starts.push(eye + d * cpu.distance + cpu.normal * (0.05 * voxel));
+            }
+        }
+    }
+    let mut rays = Vec::new();
+    for &s in &starts {
+        rays.push((s, sun, 60.0));
+        // A point of the air within 8 m.
+        let target = s + unit() * (1.0 + 7.0 * (unit().x * 0.5 + 0.5));
+        if !planet.solid(planet.grid().locate(target).0) {
+            let to = target - s;
+            rays.push((s, to.normalize(), to.length()));
+        }
+    }
+    let stream: Vec<SceneRay> = rays
+        .iter()
+        .map(|&(o, d, t)| common::scene_ray(frame, o, d, t as f32, 0.0))
+        .collect();
+    // Every eighth row arrives blocked (by another tracer).
+    let blocked_row = SceneHit {
+        t: 1.0,
+        a: 0,
+        b: 1023 | (1023 << 10) | (1023 << 20),
+        c: 0,
+    };
+    let before: Vec<SceneHit> = (0..rays.len())
+        .map(|k| {
+            if k % 8 == 7 {
+                blocked_row
+            } else {
+                SceneHit::default()
+            }
+        })
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Occlusion,
+        frame,
+        &stream,
+        Some(&before),
+        0,
+    );
+    let (mut compared, mut shadowed, mut wrong, mut lost) = (0, 0, 0, 0);
+    for (k, &(o, d, t_max)) in rays.iter().enumerate() {
+        if k % 8 == 7 {
+            lost += usize::from(hits[k] != blocked_row);
+            continue;
+        }
+        let cpu = planet.raycast(o, d, t_max);
+        // Past level 0's reach the cut is coarser than the CPU's cells.
+        if cpu.is_some_and(|c| !near_in_view(&view, &planet, o, d, c.distance)) {
+            continue;
+        }
+        compared += 1;
+        shadowed += usize::from(cpu.is_some());
+        let traced_blocked = hits[k].t > 0.0 && hits[k].through() == [0.0; 3];
+        let traced_free = hits[k] == SceneHit::default();
+        if (cpu.is_some() && !traced_blocked) || (cpu.is_none() && !traced_free) {
+            wrong += 1;
+            if wrong < 8 {
+                eprintln!(
+                    "ray {k}: traced {:?}, cpu {:?}",
+                    hits[k],
+                    cpu.map(|c| c.distance)
+                );
+            }
+        }
+    }
+    eprintln!(
+        "occlusion rays: compared {compared}, shadowed {shadowed}, wrong {wrong}, blocked rows lost {lost}"
+    );
+    assert!(
+        compared > 1500 && shadowed > 200,
+        "{compared} compared, {shadowed} shadowed"
+    );
+    assert!(wrong * 50 <= compared, "{wrong} of {compared}");
+    assert_eq!(lost, 0);
+}
+
+/// A plane (one affine frame: rays are placed by its anchor) traces ray
+/// streams from about the eye as the CPU casts them.
+#[test]
+fn a_plane_traces_stream_rays() {
+    let Some(gpu) = gpu() else { return };
+    let planet = Planet::new(PlanetRecipe {
+        shape: Shape::Plane,
+        plane_size_m: 3_000.0,
+        ..Default::default()
+    })
+    .unwrap();
+    let eye = planet.surface_point(DVec3::new(12.3, 0.0, -45.6), 1.7);
+    let view = View::new(eye, Vec3::new(0.8, -0.35, 0.6), [320, 180]);
+    let mut world = ray_world(gpu, &planet);
+    world.settle(gpu, &planet, &view);
+    let frame = eye + DVec3::new(-2.5, 0.75, 1.0);
+    let mut unit = units(0x51ed_270b_2c1b_3c6d);
+    let mut rays = Vec::new();
+    while rays.len() < 20_000 {
+        let o = eye + unit() * 4.0;
+        if !planet.solid(planet.grid().locate(o).0) {
+            rays.push((o, unit()));
+        }
+    }
+    let stream: Vec<SceneRay> = rays
+        .iter()
+        .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.0))
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let (mut compared, mut wrong) = (0, 0);
+    for (k, &(o, d)) in rays.iter().enumerate() {
+        let Some(cpu) = planet.raycast(o, d, 60.0) else {
+            continue;
+        };
+        if !near_in_view(&view, &planet, o, d, cpu.distance) {
+            continue;
+        }
+        compared += 1;
+        if !terrain_hit(&hits[k]).is_some_and(|(t, inside)| {
+            !inside && (t - cpu.distance).abs() <= 2e-3 + cpu.distance * 1e-5
+        }) {
+            wrong += 1;
+        }
+    }
+    eprintln!("plane rays: compared {compared}, wrong {wrong}");
+    assert!(
+        compared > 1000 && wrong * 100 <= compared,
+        "{wrong} of {compared}"
+    );
+}
+
+/// The streams of `traced` through `world`'s last cut, each pass timed into
+/// `queries` from `first`: the nearest hits, their surfaces, the entry,
+/// occlusion (`stream_rays_cost`).
+fn record_streams(
+    gpu: &Gpu,
+    world: &ChunkWorld,
+    recorder: &mut helio_core::CommandRecorder<'_>,
+    traced: &[(
+        helio_frame_api::rays::stream::Stream,
+        helio_frame_api::rays::stream::StreamBuffers,
+        helio_pass_voxel_planet::chunks::rays::StreamTracer,
+    )],
+    queries: &wgpu::QuerySet,
+    first: u32,
+) {
+    let cut = world.ray_cut().expect("a cut");
+    let at = |n: u32| wgpu::ComputePassTimestampWrites {
+        query_set: queries,
+        beginning_of_pass_write_index: Some(first + 2 * n),
+        end_of_pass_write_index: Some(first + 2 * n + 1),
+    };
+    for (n, (_, buffers, tracer)) in traced.iter().enumerate() {
+        buffers.clear(recorder);
+        let bindings = helio_pass_voxel_planet::chunks::rays::StreamBindings {
+            header: &buffers.header,
+            rays: &buffers.rays,
+            hits: &buffers.hits,
+            surfaces: buffers.surfaces.as_ref(),
+        };
+        tracer.trace(
+            &gpu.device,
+            recorder,
+            &cut,
+            bindings,
+            Some(at([0, 2, 3][n])),
+        );
+        if n == 0 {
+            tracer.surface(&gpu.device, recorder, &cut, bindings, Some(at(1)));
+        }
+    }
+}
+
+/// What the terrain's ray stream kernels cost: a frame of GI's probe
+/// updates (680 probes on each of the two finest levels, 340 on each of the
+/// four coarser: 2720 probes, 64 rays each, 174 080 rays) about a ball on
+/// the ground, traced every frame by the stream kernels: the nearest hits,
+/// their surfaces, the entry alone (the same rays a ten-thousandth of a
+/// metre long), each a probe's 64 rays a run from it (`Stream::run`: the
+/// run path, as a stream whose rays share an origin takes it; GI's probe
+/// rays no longer do, each starting behind its probe), and occlusion toward
+/// the sun. Frames are pipelined (two in
+/// flight, none waited for alone: a synchronised harness downclocks), the
+/// streams recorded before the draw on odd frames and after it on even
+/// ones; GPU timestamps, medians in milliseconds. A report: ignored.
+#[test]
+#[ignore]
+fn stream_rays_cost() {
+    use helio_frame_api::rays::stream::{Stream, StreamBuffers, TracerId};
+    use helio_pass_voxel_planet::chunks::rays::StreamTracer;
+    let Some(gpu) = gpu() else { return };
+    if !gpu
+        .device
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY)
+    {
+        eprintln!("no timestamps on this device");
+        return;
+    }
+    let (planet, eye, view, _, _) = ball_ground();
+    let mut next = xorshift(0x6a09_e667_f3bc_c908);
+    let mut pick = |n: u64| (next() % n) as i64;
+    let mut probes = Vec::new();
+    for level in 0..6u32 {
+        let count = if level < 2 { 680 } else { 340 };
+        let mut taken = std::collections::BTreeSet::new();
+        while taken.len() < count {
+            taken.insert(glam::I64Vec3::new(pick(24), pick(24), pick(24)).to_array());
+        }
+        probes.extend(
+            taken
+                .into_iter()
+                .map(|at| probe_place(eye, level, glam::I64Vec3::from_array(at))),
+        );
+    }
+    let mut unit = units(0xbb67_ae85_84ca_a73b);
+    let dirs: Vec<DVec3> = (0..probes.len() * 64).map(|_| unit()).collect();
+    let mut world = ray_world(gpu, &planet);
+    world.sun_occlusion = true;
+    world.settle(gpu, &planet, &view);
+    world.settle_sun_pages(gpu, &planet, &view);
+    world.chunks.take_timings();
+    let origin = |k: usize| probes[k / 64];
+    let sun = world.sun.as_dvec3();
+    let streams: Vec<(RayClass, Vec<SceneRay>)> = vec![
+        (
+            RayClass::Nearest,
+            (0..dirs.len())
+                .map(|k| common::scene_ray(eye, origin(k), dirs[k], 1e30, 0.0))
+                .collect(),
+        ),
+        (
+            RayClass::Nearest,
+            (0..dirs.len())
+                .map(|k| common::scene_ray(eye, origin(k), dirs[k], 1e-4, 0.0))
+                .collect(),
+        ),
+        (
+            RayClass::Occlusion,
+            (0..dirs.len())
+                .map(|k| common::scene_ray(eye, origin(k), sun, 1e30, 0.0))
+                .collect(),
+        ),
+    ];
+    let names = ["nearest", "entry", "occlusion"];
+    let traced: Vec<(Stream, StreamBuffers, StreamTracer)> = streams
+        .iter()
+        .zip(names)
+        .map(|((class, rays), name)| {
+            let stream = Stream::new(name, *class, rays.len() as u32);
+            let buffers = StreamBuffers::new(&gpu.device, &stream);
+            gpu.queue
+                .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
+            buffers.set_count(&gpu.queue, rays.len() as u32);
+            // A probe's 64 rays a run from it (the run path).
+            let tracer =
+                StreamTracer::new(&gpu.device, *class, TracerId(common::VOXEL_TRACER)).with_run(64);
+            tracer.write_frame(eye, |buffer, bytes| {
+                gpu.queue.write_buffer(buffer, 0, bytes)
+            });
+            (stream, buffers, tracer)
+        })
+        .collect();
+    const FRAMES: usize = 160;
+    // Nearest, its surfaces, the entry, occlusion: a begin and an end each.
+    const STAMPS: u32 = 8;
+    let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("stream ray timing"),
+        ty: wgpu::QueryType::Timestamp,
+        count: STAMPS * FRAMES as u32,
+    });
+    let resolved = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: FRAMES as u64 * 256,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let config = view.config();
+    let tan_y = f64::from((FOV_Y * 0.5).tan());
+    let tan_x = tan_y * f64::from(view.size[0]) / f64::from(view.size[1]);
+    let cone = residency::View {
+        forward: view.forward.as_dvec3(),
+        cos_half: (tan_x * tan_x + tan_y * tan_y).sqrt().atan().cos(),
+    };
+    let mut in_flight = std::collections::VecDeque::new();
+    for f in 0..FRAMES {
+        let view_proj = view.view_proj(&planet);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let mut recorder = helio_core::CommandRecorder::from_encoder(&mut encoder);
+        let before = f % 2 == 1;
+        if before {
+            record_streams(
+                gpu,
+                &world.chunks,
+                &mut recorder,
+                &traced,
+                &queries,
+                f as u32 * STAMPS,
+            );
+        }
+        world.chunks.update(
+            &mut recorder,
+            view.eye,
+            DVec3::ZERO,
+            Some(cone),
+            world.frame,
+            &config,
+        );
+        world
+            .chunks
+            .draw_sun_occlusion(&mut recorder, world.frame, view.eye, world.sun);
+        world.chunks.draw(
+            &mut recorder,
+            world.frame,
+            view.eye,
+            view_proj,
+            view_proj,
+            [glam::Vec2::ZERO; 2],
+            view.near,
+            world.sun,
+            view.size,
+            None,
+            None,
+        );
+        if !before {
+            record_streams(
+                gpu,
+                &world.chunks,
+                &mut recorder,
+                &traced,
+                &queries,
+                f as u32 * STAMPS,
+            );
+        }
+        drop(recorder);
+        encoder.resolve_query_set(
+            &queries,
+            STAMPS * f as u32..STAMPS * (f as u32 + 1),
+            &resolved,
+            f as u64 * 256,
+        );
+        in_flight.push_back(gpu.queue.submit([encoder.finish()]));
+        world.chunks.submitted();
+        world.frame += 1;
+        // Two frames in flight.
+        if in_flight.len() > 2 {
+            let index = in_flight.pop_front().unwrap();
+            gpu.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(index),
+                    timeout: None,
+                })
+                .unwrap();
+        }
+    }
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let words: Vec<u64> =
+        bytemuck::cast_slice(&common::read_buffer(gpu, &resolved, resolved.size())).to_vec();
+    let period = f64::from(gpu.queue.get_timestamp_period()) * 1e-6;
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    // The first frames warm up.
+    let stage = |n: usize, before: bool| {
+        median(
+            (16..FRAMES)
+                .filter(|f| (f % 2 == 1) == before)
+                .map(|f| (words[f * 32 + 2 * n + 1] - words[f * 32 + 2 * n]) as f64 * period)
+                .collect(),
+        )
+    };
+    eprintln!("{} rays a frame", dirs.len());
+    for (n, name) in ["nearest", "surfaces", "entry", "occlusion"]
+        .iter()
+        .enumerate()
+    {
+        eprintln!(
+            "stream {name}: {:.3} ms before the draw, {:.3} ms after it",
+            stage(n, true),
+            stage(n, false)
+        );
+    }
+}
+
+/// Ray streams at an Earth's scale from orbit: from the eye 300 km up (out
+/// of the volume, entering it), every second pixel's ray hits where the
+/// camera's own trace drew it (the same walk, from the ceiling ball in);
+/// from a kilometre (or four of the drawn level's cells) over those hits,
+/// straight down, at the drawn level's cells (kilometres: the rays start
+/// hundreds of kilometres from the eye).
+#[test]
+fn stream_rays_from_orbit() {
+    let Some(gpu) = gpu() else { return };
+    let planet = Planet::new(PlanetRecipe::default()).unwrap();
+    let grid = *planet.grid();
+    let dir = grid.direction(
+        2,
+        f64::from(grid.cells()) * 0.3,
+        f64::from(grid.cells()) * 0.7,
+    );
+    let eye = dir * (grid.radius() + 300_000.0);
+    let view = View::new(
+        eye,
+        (-dir + dir.any_orthonormal_vector() * 0.5)
+            .normalize()
+            .as_vec3(),
+        [256, 144],
+    );
+    let mut world = ray_world(gpu, &planet);
+    let drawn = world.settle(gpu, &planet, &view);
+    let view_proj = view.view_proj(&planet);
+    let frame = eye + DVec3::new(40.0, -12.5, 7.25);
+    let mut pixels = Vec::new();
+    for y in (0..view.size[1]).step_by(2) {
+        for x in (0..view.size[0]).step_by(2) {
+            if let Some(h) = drawn[(y * view.size[0] + x) as usize] {
+                pixels.push((view.pixel_dir(view_proj, x, y), h));
+            }
+        }
+    }
+    // Over the hit by a kilometre, or four of its level's cells (a coarse
+    // cell's side reaches a cell over the face it was hit on).
+    let lift = |level: u32| (4.0 * grid.voxel_size() * f64::from(1u32 << level)).max(1000.0);
+    let mut stream = Vec::new();
+    for &(d, h) in &pixels {
+        stream.push(common::scene_ray(frame, eye, d, 1e30, 0.0));
+        let at = eye + d * h.distance;
+        let up = grid.up(at);
+        stream.push(common::scene_ray(
+            frame,
+            at + up * lift(h.level),
+            -up,
+            1e30,
+            0.0,
+        ));
+    }
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &stream,
+        None,
+        0,
+    );
+    let (mut from_eye_wrong, mut down_wrong) = (0, 0);
+    for (k, &(_, h)) in pixels.iter().enumerate() {
+        let cell = grid.voxel_size() * f64::from(1u32 << h.level);
+        let eye_hit = terrain_hit(&hits[2 * k]);
+        if !eye_hit.is_some_and(|(t, inside)| {
+            !inside && (t - h.distance).abs() <= 1e-3 * cell + 1e-6 * h.distance
+        }) {
+            from_eye_wrong += 1;
+            if from_eye_wrong < 8 {
+                eprintln!(
+                    "orbit ray {k}: traced {:?}, drawn at {} (level {})",
+                    hits[2 * k],
+                    h.distance,
+                    h.level
+                );
+            }
+        }
+        let down = terrain_hit(&hits[2 * k + 1]);
+        if !down.is_some_and(|(t, inside)| !inside && (t - lift(h.level)).abs() <= 3.0 * cell) {
+            down_wrong += 1;
+            if down_wrong < 8 {
+                eprintln!(
+                    "down ray {k}: traced {:?}, level {} cells of {cell} m",
+                    hits[2 * k + 1],
+                    h.level
+                );
+            }
+        }
+    }
+    eprintln!(
+        "orbit: {} pixels, from the eye {from_eye_wrong} wrong, from a kilometre up {down_wrong} wrong",
+        pixels.len()
+    );
+    assert!(pixels.len() > 2000, "{} pixels", pixels.len());
+    assert!(
+        from_eye_wrong * 200 <= pixels.len(),
+        "{from_eye_wrong} from the eye"
+    );
+    assert!(
+        down_wrong * 100 <= pixels.len(),
+        "{down_wrong} from a kilometre up"
+    );
+}
+
+/// Level `level`'s probe `at` (0..24 an axis) of GI's probe clipmap about
+/// `eye` as GI lays it out (24 a side, each level twice as far apart as the
+/// one inside it, `PROBE_SPACING` the finest): a set of ray origins in open
+/// air and in rock, as GI's probe rays have.
+fn probe_place(eye: DVec3, level: u32, at: glam::I64Vec3) -> DVec3 {
+    let spacing = PROBE_SPACING * f64::from(1u32 << level);
+    let first = (eye / spacing).floor().as_i64vec3() - 11;
+    (first + at).as_dvec3() * spacing
 }

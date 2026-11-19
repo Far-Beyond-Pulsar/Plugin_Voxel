@@ -17,7 +17,7 @@ pub use water_shore::VoxelShoreTerrain;
 pub mod meadow;
 pub mod settings;
 
-pub use feature::{VoxelFeature, VoxelSettings};
+pub use feature::{tracer, VoxelFeature, VoxelSettings};
 
 pub use helio_voxel_world::{
     edit_store, edit_yield, edits, feature_recipe, features, flora, grid, landform, layers, noise,

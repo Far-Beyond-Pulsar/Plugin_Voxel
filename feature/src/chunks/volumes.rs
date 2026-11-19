@@ -94,6 +94,9 @@ pub(super) struct VolumeViews {
     /// volume's points (`ChunkWorld::draw`: shadows across volumes over its
     /// shadow's rectangle, GI rays, foliage probes).
     pub cross: wgpu::Buffer,
+    /// The camera's view as ray streams walk the volume (`chunks::rays`):
+    /// written with each camera draw, read until the next.
+    pub rays: wgpu::Buffer,
 }
 
 /// One placed world of a [`ChunkWorld`].
@@ -102,6 +105,9 @@ pub(super) struct Volume {
     pub tag: u64,
     pub index: u16,
     pub transform: VolumeTransform,
+    /// Whether it has moved since it was added (rays of movable casters see
+    /// it, `chunks::rays`; else those of static ones).
+    pub movable: bool,
     /// The transform each eye's last draw placed it with (its hits' motion
     /// from there), and where the eye was in its frame at the last update,
     /// with the transform then and when (its motion relative to the eye).
@@ -257,9 +263,11 @@ pub(super) struct DrawLayouts {
     pub filter: wgpu::BindGroupLayout,
     pub resolve_shadows: wgpu::BindGroupLayout,
     pub local_denoise: [wgpu::BindGroupLayout; 3],
-    pub gi: wgpu::BindGroupLayout,
     pub ground: wgpu::BindGroupLayout,
     pub feedback: wgpu::BindGroupLayout,
+    /// A ray stream's traces and its surfaces (`chunks::rays`).
+    pub rays: wgpu::BindGroupLayout,
+    pub ray_surfaces: wgpu::BindGroupLayout,
 }
 
 impl DrawLayouts {
@@ -515,26 +523,38 @@ impl DrawLayouts {
                     entries: &[hits[0], read(31), write(56)],
                 }),
             ],
-            // GI probe rays: the frame, rays, hits, the probes' cells, the
-            // sun, the sun's occlusion (frame, maps).
-            gi: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("chunk GI rays"),
-                entries: &[
-                    uniform(35, c),
-                    read(36),
-                    write(37),
-                    read(38),
-                    read(39),
-                    uniform(62, c),
-                    sun_occlusion_maps_entry(63),
-                    read(65),
-                ],
-            }),
             // Foliage ground probes: the probe frame, queries, hits, the
             // tiles.
             ground: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("chunk ground probes"),
                 entries: &[uniform(58, c), read(59), write(60), read(61)],
+            }),
+            // A ray stream: its header, rays and hits, the frame (its
+            // origin, the tracer's number), the eye of the cut drawn last
+            // and the rays' and runs' starts; for the surfaces, the surfaces
+            // instead of the starts.
+            rays: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("voxel rays"),
+                entries: &[
+                    read(67),
+                    read(68),
+                    write(69),
+                    uniform(71, c),
+                    uniform(72, c),
+                    write(73),
+                    write(74),
+                ],
+            }),
+            ray_surfaces: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("voxel ray surfaces"),
+                entries: &[
+                    read(67),
+                    read(68),
+                    write(69),
+                    write(70),
+                    uniform(71, c),
+                    uniform(72, c),
+                ],
             }),
             // Ray reports: the hits of a pixel of each 2x2, as the nodes
             // they want.
@@ -630,9 +650,7 @@ pub(super) struct DrawPipelines {
     pub local_gate: wgpu::ComputePipeline,
     pub local_temporal: wgpu::ComputePipeline,
     pub local_filter: wgpu::ComputePipeline,
-    /// The GI probes' rays and foliage ground probes (the primary
-    /// volume's, from where they are).
-    pub gi_trace: wgpu::ComputePipeline,
+    /// Foliage ground probes (the primary volume's, from where they are).
     pub ground_probe: wgpu::ComputePipeline,
     /// The draw source's module, for the passes lighting across volumes
     /// ([`CrossPipelines`]).
@@ -941,7 +959,6 @@ impl DrawPipelines {
                 "local_filter",
                 false,
             ),
-            gi_trace: compute("chunk GI rays", &layout(&layouts.gi), "gi_trace", false),
             ground_probe: compute(
                 "chunk ground probes",
                 &layout(&layouts.ground),
@@ -987,11 +1004,6 @@ impl CrossPipelines {
                 &layouts.shadow_fallback,
                 "shadow_cross",
             ),
-            gi_trace: compute(
-                "chunk GI rays across volumes",
-                &layouts.gi,
-                "gi_trace_cross",
-            ),
             ground_probe: compute(
                 "chunk ground probes across volumes",
                 &layouts.ground,
@@ -1002,11 +1014,10 @@ impl CrossPipelines {
 }
 
 /// A volume's passes lighting the other volumes' points: its sun shadow on
-/// their hits and the meshes, the GI probes' rays and foliage's probes
-/// entering it (`ChunkWorld::cross_volumes`).
+/// their hits and the meshes, and foliage's probes entering it
+/// (`ChunkWorld::cross_volumes`).
 pub(super) struct CrossPipelines {
     pub shadow: wgpu::ComputePipeline,
-    pub gi_trace: wgpu::ComputePipeline,
     pub ground_probe: wgpu::ComputePipeline,
 }
 
@@ -1188,6 +1199,7 @@ impl ChunkWorld {
             tag,
             index: index16,
             transform,
+            movable: false,
             drawn_transform: [None; 2],
             last_local_eye: None,
             grid,
@@ -1233,6 +1245,7 @@ impl ChunkWorld {
                 camera: params("chunk draw params"),
                 sun: params("chunk sun params"),
                 cross: params("chunk cross params"),
+                rays: params("chunk ray params"),
             },
             tile_data: buffer(
                 "chunk footprint columns",
@@ -1335,6 +1348,7 @@ impl ChunkWorld {
     /// since the last draw is that between them).
     pub fn set_transform(&mut self, id: VolumeId, transform: VolumeTransform) {
         if let Some(vol) = self.volume_mut(id) {
+            vol.movable |= vol.transform != transform;
             vol.transform = transform;
         }
     }

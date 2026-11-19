@@ -53,3 +53,105 @@ pub fn read_buffer(gpu: &Gpu, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
     let data = staging.slice(..).get_mapped_range().unwrap().to_vec();
     data
 }
+
+/// The terrain's tracer number in the tests' ray streams.
+pub const VOXEL_TRACER: u32 = 1;
+
+/// A ray from world point `from` along unit `dir` up to `t_max`, in the
+/// space of frame origin `frame` (every caster, a footprint `spread` wide a
+/// metre out).
+pub fn scene_ray(
+    frame: glam::DVec3,
+    from: glam::DVec3,
+    dir: glam::DVec3,
+    t_max: f32,
+    spread: f32,
+) -> helio_frame_api::rays::stream::SceneRay {
+    helio_frame_api::rays::stream::SceneRay {
+        origin: (from - frame).as_vec3().to_array(),
+        t_max,
+        dir: dir.as_vec3().to_array(),
+        cone: helio_frame_api::rays::stream::SceneRay::cone(
+            0.0,
+            spread,
+            helio_frame_api::rays::stream::MASK_ALL,
+        ),
+    }
+}
+
+/// Stream `rays` (of `class`, all but the last `past` rows in its header,
+/// relative to frame origin `frame`) traced by the terrain through the cut
+/// `world` drew last, its hits' rows `before` (none: cleared) beforehand:
+/// its hits and surfaces after (none for an occlusion stream).
+pub fn trace_stream(
+    gpu: &Gpu,
+    world: &helio_pass_voxel_planet::chunks::ChunkWorld,
+    class: helio_frame_api::rays::stream::RayClass,
+    frame: glam::DVec3,
+    rays: &[helio_frame_api::rays::stream::SceneRay],
+    before: Option<&[helio_frame_api::rays::stream::SceneHit]>,
+    past: usize,
+) -> (
+    Vec<helio_frame_api::rays::stream::SceneHit>,
+    Vec<helio_frame_api::rays::stream::SceneSurface>,
+) {
+    trace_stream_in_runs(gpu, world, class, frame, rays, before, past, 1)
+}
+
+/// [`trace_stream`] of a stream whose rays come in runs of `run` from one
+/// origin (`Stream::run`).
+#[allow(clippy::too_many_arguments)]
+pub fn trace_stream_in_runs(
+    gpu: &Gpu,
+    world: &helio_pass_voxel_planet::chunks::ChunkWorld,
+    class: helio_frame_api::rays::stream::RayClass,
+    frame: glam::DVec3,
+    rays: &[helio_frame_api::rays::stream::SceneRay],
+    before: Option<&[helio_frame_api::rays::stream::SceneHit]>,
+    past: usize,
+    run: u32,
+) -> (
+    Vec<helio_frame_api::rays::stream::SceneHit>,
+    Vec<helio_frame_api::rays::stream::SceneSurface>,
+) {
+    use helio_frame_api::rays::stream::{SceneHit, SceneSurface, Stream, StreamBuffers, TracerId};
+    use helio_pass_voxel_planet::chunks::rays::{StreamBindings, StreamTracer};
+    let stream = Stream::new("voxel_test", class, rays.len() as u32);
+    let buffers = StreamBuffers::new(&gpu.device, &stream);
+    gpu.queue
+        .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
+    buffers.set_count(&gpu.queue, (rays.len() - past) as u32);
+    let cleared = vec![SceneHit::default(); rays.len()];
+    gpu.queue.write_buffer(
+        &buffers.hits,
+        0,
+        bytemuck::cast_slice(before.unwrap_or(&cleared)),
+    );
+    let tracer = StreamTracer::new(&gpu.device, class, TracerId(VOXEL_TRACER)).with_run(run);
+    tracer.write_frame(frame, |buffer, bytes| {
+        gpu.queue.write_buffer(buffer, 0, bytes)
+    });
+    let cut = world.ray_cut().expect("a cut drawn for ray streams");
+    assert!(cut.ready(), "the ray kernels compiled");
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut recorder = helio_core::CommandRecorder::from_encoder(&mut encoder);
+        let bindings = StreamBindings {
+            header: &buffers.header,
+            rays: &buffers.rays,
+            hits: &buffers.hits,
+            surfaces: buffers.surfaces.as_ref(),
+        };
+        tracer.trace(&gpu.device, &mut recorder, &cut, bindings, None);
+        tracer.surface(&gpu.device, &mut recorder, &cut, bindings, None);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    let hits: Vec<SceneHit> =
+        bytemuck::cast_slice(&read_buffer(gpu, &buffers.hits, buffers.hits.size())).to_vec();
+    let surfaces: Vec<SceneSurface> = buffers
+        .surfaces
+        .as_ref()
+        .map(|s| bytemuck::cast_slice(&read_buffer(gpu, s, s.size())).to_vec())
+        .unwrap_or_default();
+    (hits, surfaces)
+}

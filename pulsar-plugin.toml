@@ -11,7 +11,6 @@ enabled_by_default = true
 # one, a world simply has no such instance.
 requires = [
   { id = "pulsar.foliage.api", optional = true },
-  { id = "pulsar.gi.api", optional = true },
   { id = "pulsar.lights.rows", optional = true },
   { id = "pulsar.lights.api", optional = true },
   { id = "pulsar.materials.table", optional = true },

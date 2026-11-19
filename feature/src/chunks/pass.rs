@@ -81,9 +81,8 @@ pub struct ChunkPass {
     )>,
     /// Every hit walks its own sun ray (`set_steady_shadows`).
     steady_shadows: bool,
-    /// The eye's world position this frame (`helio_gi_api::eye`), where
-    /// the GI clipmap the terrain traces rays of is centred.
-    gi_eye: Option<DVec3>,
+    /// How far each pixel's sky rays walk (`set_sky_reach`).
+    sky_reach: Option<f32>,
     /// The last frame's projection jitter (NDC).
     last_jitter: [Vec2; 2],
     xr_mode: bool,
@@ -91,6 +90,9 @@ pub struct ChunkPass {
     /// foliage placement pass ([`Self::foliage_ground`]), its tiling and its answers.
     planet_ground: std::sync::Arc<super::ground::PlanetGround>,
     foliage_ground: std::sync::Arc<helio_foliage_api::GroundLink>,
+    /// Where the cut each draw leaves for ray streams goes, for the
+    /// terrain's tracer passes of the graph (`chunks::rays`).
+    rays: Arc<super::rays::RayLink>,
 }
 
 impl ChunkPass {
@@ -118,12 +120,19 @@ impl ChunkPass {
             cpu_ms: [0.0; 2],
             scene: None,
             steady_shadows: false,
-            gi_eye: None,
+            sky_reach: None,
             last_jitter: [Vec2::ZERO; 2],
             xr_mode: false,
             planet_ground,
             foliage_ground,
+            rays: Arc::default(),
         }
+    }
+
+    /// The graph's ray link (`chunks::rays::SharedRayLink`): each draw's cut
+    /// is published there for the terrain's tracer passes.
+    pub fn set_ray_link(&mut self, link: Arc<super::rays::RayLink>) {
+        self.rays = link;
     }
 
     /// The terrain as the ground foliage grows on: give it to a foliage placement pass
@@ -152,6 +161,20 @@ impl ChunkPass {
     /// shadows).
     pub fn set_steady_shadows(&mut self, on: bool) {
         self.steady_shadows = on;
+    }
+
+    /// How far each pixel's sky rays walk (metres): the distance at which
+    /// the frame's indirect diffuse resolves occlusion
+    /// (`helio_frame_api::lighting::indirect_occlusion`), so the two do not
+    /// darken the same occluder twice; none: the terrain's own reach
+    /// (`SKY_RANGE_CELLS` cells, `chunk_draw.wgsl`).
+    pub fn set_sky_reach(&mut self, reach: Option<f32>) {
+        self.sky_reach = reach;
+    }
+
+    /// How far each pixel's sky rays walk ([`Self::set_sky_reach`]).
+    pub fn sky_reach(&self) -> Option<f32> {
+        self.sky_reach
     }
 
     /// Override the position used for residency/prefetch, without changing the
@@ -206,9 +229,12 @@ impl ChunkPass {
         self.world.as_ref()
     }
 
-    /// Whether nothing is left to generate for the current eye.
+    /// Whether nothing is left to generate for the current eye. Ray streams
+    /// traced through the terrain see it in full too: its cut is drawn and
+    /// its ray kernels compiled (`chunks::rays::RayLink::complete`).
     pub fn settled(&self) -> bool {
         self.world.as_ref().is_some_and(ChunkWorld::settled)
+            && (!self.rays.wanted() || self.rays.complete())
     }
 
     /// What the sun's occlusion pages did last frame (`ChunkWorld::sun_page_stats`).
@@ -302,10 +328,6 @@ const READS: &[&str] = &[
     "water_shore_params",
     helio_light_api::TILE_LIGHT_LISTS,
     helio_light_api::TILE_LIGHT_COUNTS,
-    helio_gi_api::GI_FRAME,
-    helio_gi_api::GI_RAYS,
-    helio_gi_api::GI_SUN,
-    helio_gi_api::GI_CLIPMAP,
     SKY_FRAME,
 ];
 const WRITES: &[&str] = &[
@@ -318,7 +340,6 @@ const WRITES: &[&str] = &[
     "local_visibility",
     // helio-pass-tsr's STOCHASTIC_MASK.
     helio_pass_tsr::STOCHASTIC_MASK,
-    helio_gi_api::GI_HITS,
     helio_light_api::SUN_OCCLUSION_MAPS,
     helio_light_api::SUN_OCCLUSION_PAGES,
     helio_light_api::SUN_OCCLUSION_FRAME,
@@ -383,7 +404,6 @@ impl RenderPass for ChunkPass {
     }
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
         let started = std::time::Instant::now();
-        self.gi_eye = Some(helio_gi_api::eye(ctx));
         let result = self.prepare_frame(ctx);
         self.cpu_ms[0] = started.elapsed().as_secs_f64() * 1e3;
         result
@@ -498,8 +518,11 @@ impl ChunkPass {
             self.shown = None;
             self.world = None;
             self.held.clear();
+            self.rays.publish(None);
+            self.rays.set_volumes(false);
             return Ok(());
         };
+        self.rays.set_volumes(!frame.volumes.is_empty());
         let world = self.world.get_or_insert_with(|| {
             let mut world = ChunkWorld::new(ctx.device, ctx.queue);
             world.set_plain_colour(false);
@@ -685,26 +708,12 @@ impl ChunkPass {
                 helio_light_api::TILE_LIGHT_COUNTS,
             ))
             .map(|b| (*b).clone());
-        // The GI probes' rays, when a GI pass runs before this one.
         let binding = |name: &str| ctx.registry.buffer_binding(name).cloned();
-        let clipmap = ctx
-            .registry
-            .get::<helio_gi_api::Clipmap>(helio_core::ResourceKey::new(helio_gi_api::GI_CLIPMAP));
-        let gi = match (
-            binding(helio_gi_api::GI_FRAME),
-            binding(helio_gi_api::GI_RAYS),
-            binding(helio_gi_api::GI_HITS),
-            binding(helio_gi_api::GI_SUN),
-            clipmap,
-            self.gi_eye,
-        ) {
-            (Some(frame_gi), Some(rays), Some(hits), Some(sun), Some(clipmap), Some(world_eye)) => {
-                helio_core::cpu_scope!("VoxelChunks: follow GI");
-                world.follow_gi(clipmap, world_eye, trace_eye);
-                Some((frame_gi, rays, hits, sun))
-            }
-            _ => None,
-        };
+        // The graph traces ray streams through the terrain: its draws keep
+        // a cut for them and their kernels compile.
+        if self.rays.wanted() {
+            world.want_rays();
+        }
         let mut cmds = ctx.graphics_cmds();
         let encoder = &mut cmds;
         // The frame's length: the setting when it gives one, else the host's
@@ -754,6 +763,7 @@ impl ChunkPass {
             world.set_material_map(map);
         }
         world.set_steady_shadows(self.steady_shadows);
+        world.set_sky_reach(self.sky_reach);
         // The atmosphere's sun disk sizes the shadows' penumbrae.
         world.set_atmosphere_frame(
             ctx.registry
@@ -789,16 +799,9 @@ impl ChunkPass {
                 _ => None,
             }
             .as_ref(),
-            gi.as_ref()
-                .map(|(frame, rays, hits, sun)| super::GiRays {
-                    frame,
-                    rays,
-                    hits,
-                    sun,
-                })
-                .as_ref(),
             eye_index,
         );
+        self.rays.publish(world.ray_cut());
         drop(draw_scope);
         let ground_scope = helio_core::CpuScope::new("VoxelChunks: foliage ground");
         // Foliage's ground: where the drawn terrain changed, and this frame's

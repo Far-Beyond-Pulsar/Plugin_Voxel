@@ -239,16 +239,24 @@ fn chunk_pass_builds_settles_and_resizes_in_the_deferred_graph() {
             0.05,
             40_000_000.0,
         );
-        for _ in 0..600 {
+        // Until it settles: no frame count, as the world's pipelines compile
+        // off the frame first (a debug build's frames outrun them: the world
+        // keeps asking for frames until it can draw, and then has nothing to
+        // stream).
+        let started = std::time::Instant::now();
+        while started.elapsed().as_secs() < 300 {
             renderer.render(&centre, &view).unwrap();
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             if !renderer.find_pass::<ChunkPass>().unwrap().needs_frame() {
                 break;
             }
         }
+        let pass = renderer.find_pass::<ChunkPass>().unwrap();
         assert!(
-            !renderer.find_pass::<ChunkPass>().unwrap().needs_frame(),
-            "the centre never settled"
+            !pass.needs_frame(),
+            "the centre never settled: {}; sun pages {:?}",
+            pass.stats_line(),
+            pass.sun_page_stats()
         );
 
         // Moved to the surface, it streams the planet around the eye until
@@ -401,6 +409,37 @@ fn publish(renderer: &mut helio::Renderer, frame: Option<PlanetFrame>) {
     }
 }
 
+/// The deferred preset over the meshes' features and `features`, its nodes
+/// of the kinds `bypass` bypassed.
+fn deferred_graph(
+    features: &helio_feature_api::FeatureSet,
+    bypass: &[&str],
+) -> Box<dyn helio::IntoGraph> {
+    let preset = helio_mesh_host::presets::with(Preset::Deferred, features);
+    if bypass.is_empty() {
+        return Box::new(preset);
+    }
+    let registry = preset.registry().clone();
+    let mut asset = Preset::Deferred.asset(&registry);
+    let mut bypassed = 0;
+    for node in &mut asset.nodes {
+        if bypass.contains(&node.kind.as_str()) {
+            node.params
+                .insert("enabled".into(), serde_json::Value::Bool(false));
+            bypassed += 1;
+        }
+    }
+    assert_eq!(
+        bypassed,
+        bypass.len(),
+        "the preset holds every kind bypassed"
+    );
+    Box::new(
+        helio_graph_asset::GraphAssetPipeline::new(Arc::new(asset), registry)
+            .with_views(Preset::Deferred.views()),
+    )
+}
+
 struct Editor {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -412,6 +451,18 @@ struct Editor {
 }
 
 fn editor(width: u32, height: u32) -> Option<Editor> {
+    editor_with(width, height, voxel_features(), None, &[])
+}
+
+/// [`editor`] with `features`, GI's settings `gi` (none: its defaults) and
+/// the preset's nodes of the kinds `bypass` bypassed (`enabled: false`).
+fn editor_with(
+    width: u32,
+    height: u32,
+    features: helio_feature_api::FeatureSet,
+    gi: Option<helio_pass_gi::GiSettings>,
+    bypass: &[&str],
+) -> Option<Editor> {
     let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         eprintln!("GPU_VALIDATION_SKIPPED_NO_ADAPTER: editor overlays");
@@ -459,17 +510,17 @@ fn editor(width: u32, height: u32) -> Option<Editor> {
         .features
         .edit::<helio_pass_foliage_place::FoliageSettings>()
         .enabled = false;
-    let config = config.with_feature(helio_pass_voxel_planet::VoxelSettings::default());
+    let mut config = config.with_feature(helio_pass_voxel_planet::VoxelSettings::default());
+    if let Some(gi) = gi {
+        config = config.with_feature(gi);
+    }
     let mut renderer = RendererBuilder::new(config.clone(), mirror)
         .with_feature(helio::AmbientLight {
             color: [0.5, 0.5, 0.6],
             intensity: 1.0,
         })
         .with_external_device()
-        .with_graph(helio_mesh_host::presets::with(
-            helio_presets::Preset::Deferred,
-            &voxel_features(),
-        ))
+        .with_boxed_graph(deferred_graph(&features, bypass))
         .build(
             Arc::clone(&device),
             Arc::clone(&queue),
@@ -1451,4 +1502,512 @@ fn saved_edited_chunks_come_back_through_the_frame() {
         .kept_loaded()
         .is_some_and(|r| r.is_err()));
     assert!(pollster::block_on(validation.pop()).is_none());
+}
+
+/// The pixels' sky rays stop where the frame's indirect diffuse resolves
+/// occlusion (`helio_frame_api::lighting::indirect_occlusion`): GI's offer,
+/// twice its finest probes' spacing, whatever that spacing is; without GI
+/// building in the graph, the terrain's own reach (none set).
+#[test]
+fn the_sky_rays_reach_follows_the_indirect_diffuse() {
+    let _gpu = gpu_serial();
+    let reach = |features, gi, bypass: &[&str]| {
+        let editor = editor_with(64, 64, features, gi, bypass)?;
+        Some(
+            editor
+                .renderer
+                .find_pass::<ChunkPass>()
+                .unwrap()
+                .sky_reach(),
+        )
+    };
+    let Some(default) = reach(voxel_features(), None, &[]) else {
+        return;
+    };
+    assert_eq!(
+        default,
+        Some(2.0 * helio_pass_gi::DEFAULT_FINEST_SPACING as f32)
+    );
+    let open_ground = helio_pass_gi::GiSettings {
+        probe_spacing: Some(1.0),
+    };
+    assert_eq!(
+        reach(voxel_features(), Some(open_ground), &[]).unwrap(),
+        Some(2.0)
+    );
+    // GI absent; GI's probe update bypassed in the graph: no indirect
+    // diffuse, the terrain's own reach.
+    let without_gi = helio_feature_api::FeatureSet::new()
+        .with(helio_pass_voxel_planet::VoxelFeature)
+        .with(helio_pass_sky::SkyFeature);
+    assert_eq!(reach(without_gi, None, &[]).unwrap(), None);
+    assert_eq!(
+        reach(voxel_features(), Some(open_ground), &["helio.pass.gi"]).unwrap(),
+        None
+    );
+}
+
+// ---- GI over the voxel terrain ----
+//
+// GI's probes traced through the frame's ray streams by the voxel terrain's
+// tracer (and the meshes', where the scene has meshes), in the deferred
+// graph as the engine builds it.
+
+/// The flat test world: a 5 km plane of 10 cm voxels, its ground 1.25 m
+/// under the plane's height, with `wall` (a box of solid brick, centre and
+/// half size) when given.
+fn flat_world(wall: Option<(glam::DVec3, f64)>) -> Arc<Planet> {
+    use helio_pass_voxel_planet::layers::TerrainLayers;
+    let mut planet = Planet::new(PlanetRecipe {
+        shape: helio_pass_voxel_planet::grid::Shape::Plane,
+        voxel_size_m: 0.1,
+        plane_size_m: 5_000.0,
+        terrain: TerrainLayers::flat_at(-1.25).source(7),
+        ..Default::default()
+    })
+    .unwrap();
+    if let Some((centre, half)) = wall {
+        planet
+            .apply(helio_pass_voxel_planet::Brush {
+                center: centre.to_array(),
+                radius: half,
+                shape: helio_pass_voxel_planet::BrushShape::Cube,
+                op: helio_pass_voxel_planet::BrushOp::Add,
+                material: helio_pass_voxel_planet::terrain::material::BRICK,
+                height: 0.0,
+            })
+            .unwrap();
+    }
+    Arc::new(planet)
+}
+
+impl Editor {
+    /// Renders `camera` until the terrain settles, then `frames` more (the
+    /// probes' updates); `each` runs before every frame (a host's per-frame
+    /// work: publishing the TLAS).
+    fn settle_gi(&mut self, camera: &Camera, frames: usize, mut each: impl FnMut(&mut Self)) {
+        let started = std::time::Instant::now();
+        loop {
+            each(self);
+            self.render(camera);
+            // Settled: generated, and traced by ray streams in full (its
+            // ray kernels compile off the frame).
+            let pass = self.renderer.find_pass::<ChunkPass>().unwrap();
+            if pass.settled() || started.elapsed().as_secs() > 600 {
+                eprintln!(
+                    "settled {} after {:.1} s",
+                    pass.settled(),
+                    started.elapsed().as_secs_f64()
+                );
+                break;
+            }
+        }
+        for _ in 0..frames {
+            each(self);
+            self.render(camera);
+        }
+    }
+
+    /// GI's clipmap and its probes' records.
+    fn gi_probes(&self) -> (helio_pass_gi::Clipmap, Vec<u32>) {
+        let pass = self
+            .renderer
+            .find_pass::<helio_pass_gi::GiPass>()
+            .expect("GI runs: the terrain traces its rays");
+        let clipmap = pass.clipmap().expect("placed");
+        let buffer = pass.probes();
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: buffer.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
+        self.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let words: Vec<u32> =
+            bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
+        let updated = (0..helio_pass_gi::PROBES)
+            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] >> 8 > 0)
+            .count();
+        let active = (0..helio_pass_gi::PROBES)
+            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] & 1 == 1)
+            .count();
+        eprintln!(
+            "GI probes: {updated} updated, {active} active; level 0 around {:?} (spacing {})",
+            clipmap.first[0], clipmap.finest
+        );
+        (clipmap, words)
+    }
+}
+
+fn half(h: u32) -> f32 {
+    let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
+    let v = if e == 0 {
+        m as f32 * 2f32.powi(-24)
+    } else {
+        (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
+    };
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// A probe's irradiance / pi toward unit `n` (luminance of its L1
+/// harmonics), whether it was updated and whether it is active.
+fn gi_probe(words: &[u32], index: u32, n: glam::DVec3) -> (f32, bool, bool) {
+    let at = (index * helio_pass_gi::PROBE_WORDS) as usize;
+    let h: Vec<[f32; 2]> = (0..6)
+        .map(|w| [half(words[at + w] & 0xffff), half(words[at + w] >> 16)])
+        .collect();
+    let channels = [
+        [h[0][0], h[1][1], h[3][0], h[4][1]],
+        [h[0][1], h[2][0], h[3][1], h[5][0]],
+        [h[1][0], h[2][1], h[4][0], h[5][1]],
+    ];
+    let n = n.as_vec3();
+    let basis = [0.282095, 0.488603 * n.y, 0.488603 * n.z, 0.488603 * n.x];
+    let e = channels.map(|c| (0..4).map(|k| c[k] * basis[k]).sum::<f32>().max(0.0));
+    let state = words[at + 6];
+    (
+        0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2],
+        state >> 8 > 0,
+        state & 1 == 1,
+    )
+}
+
+/// The finest level's probes of `clipmap` (storage index, world position).
+fn finest_probes(
+    clipmap: &helio_pass_gi::Clipmap,
+) -> impl Iterator<Item = (u32, glam::DVec3)> + '_ {
+    (0..helio_pass_gi::LEVEL_PROBES).map(|index| (index, clipmap.position(index)))
+}
+
+/// GI over an Earth's terrain under a high sun: the voxel tracer answers
+/// every probe ray, so the finest probes over the ground take the sunlit
+/// ground's bounce from below, and those under it meet rock on their rays
+/// (insides): inactive.
+#[test]
+fn gi_probes_over_voxel_terrain_take_its_light() {
+    let _gpu = gpu_serial();
+    let Some(mut editor) = editor(320, 180) else {
+        return;
+    };
+    editor.renderer.set_editor_mode(false);
+    let planet = Arc::new(Planet::new(PlanetRecipe::default()).unwrap());
+    let radius = planet.grid().radius();
+    let dir = glam::DVec3::new(0.2, 1.0, 0.3);
+    let up = planet.surface_point(dir, 0.0).normalize();
+    let sun = (up + up.any_orthonormal_vector() * 0.3)
+        .normalize()
+        .as_vec3();
+    editor.set_sky(
+        sun,
+        Some(AtmosphereComponent::from(
+            helio_pass_sky::AtmosphereRow::earth().around_planet([0.0; 3], radius),
+        )),
+    );
+    let eye = planet.surface_point(dir, 2.0);
+    editor.show(Some(PlanetFrame::single(planet.clone(), sun)));
+    let camera = Camera::perspective_look_to(
+        eye,
+        up.any_orthonormal_vector().as_vec3(),
+        up.as_vec3(),
+        std::f32::consts::FRAC_PI_4,
+        16.0 / 9.0,
+        0.05,
+        40_000_000.0,
+    );
+    editor.settle_gi(&camera, 120, |_| {});
+    let (clipmap, words) = editor.gi_probes();
+    let height = |p: glam::DVec3| p.length() - planet.surface_point(p.normalize(), 0.0).length();
+    let (mut over, mut over_lit, mut under, mut under_inactive) = (0, 0, 0, 0);
+    for (index, p) in finest_probes(&clipmap) {
+        let (down, updated, active) = gi_probe(&words, index, -p.normalize());
+        if !updated {
+            continue;
+        }
+        let h = height(p);
+        if (0.5..4.0).contains(&h) && active {
+            over += 1;
+            over_lit += usize::from(down > 0.01);
+        } else if h < -1.0 {
+            under += 1;
+            under_inactive += usize::from(!active);
+        }
+    }
+    eprintln!("GI over terrain: {over_lit} of {over} over it lit from below, {under_inactive} of {under} under it inactive");
+    assert!(
+        over > 500 && over_lit * 10 >= over * 9,
+        "{over_lit} of {over}"
+    );
+    assert!(
+        under > 500 && under_inactive * 20 >= under * 19,
+        "{under_inactive} of {under}"
+    );
+}
+
+/// A local light's shadow ray sees the terrain: a point light 2 m over flat
+/// ground, and probes 8 m away beyond a brick wall (4 m high) between them.
+/// Without the wall the light lights the ground the probes see; with it,
+/// what reaches them (the light's gain: lit minus unlit) is a small
+/// fraction (light bounced over the wall's top).
+#[test]
+fn a_terrain_wall_shadows_a_local_light_from_the_probes() {
+    let _gpu = gpu_serial();
+    let Some(mut editor) = editor(320, 180) else {
+        return;
+    };
+    editor.renderer.set_editor_mode(false);
+    let open = flat_world(None);
+    let ground = open.surface_point(glam::DVec3::Y, 0.0);
+    let up = open.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let wall = (ground + side * 4.0 + up * 1.0, 2.5);
+    let light_at = ground + up * 2.0;
+    let eye = ground + side * 10.0 + up * 1.7;
+    let camera = Camera::perspective_look_to(
+        eye,
+        (-side).as_vec3(),
+        up.as_vec3(),
+        std::f32::consts::FRAC_PI_4,
+        16.0 / 9.0,
+        0.05,
+        10_000.0,
+    );
+    let light = editor.scene.world.spawn();
+    // The probes past the wall, 1 to 3 m up: their light from below.
+    let gain = |editor: &mut Editor, planet: Arc<Planet>| -> f32 {
+        let mut levels = [0.0f32; 2];
+        for (k, intensity) in [0.0f32, 400.0].into_iter().enumerate() {
+            editor.scene.world.insert(
+                light,
+                LightComponent::from(helio_light_api::LightRow::from(helio_light_api::GpuLight {
+                    position_range: [
+                        light_at.x as f32,
+                        light_at.y as f32,
+                        light_at.z as f32,
+                        60.0,
+                    ],
+                    color_intensity: [1.0, 1.0, 1.0, intensity],
+                    shadow_index: u32::MAX,
+                    light_type: helio_light_api::LightType::Point as u32,
+                    ..Default::default()
+                })),
+            );
+            editor.scene.world.flush_gpu_mirror(&editor.queue);
+            editor.show(Some(PlanetFrame::single(planet.clone(), Vec3::Y)));
+            editor.settle_gi(&camera, 120, |_| {});
+            let (clipmap, words) = editor.gi_probes();
+            let (mut sum, mut n) = (0.0, 0);
+            for (index, p) in finest_probes(&clipmap) {
+                let along = (p - ground).dot(side);
+                let h = (p - ground).dot(up);
+                if !(7.0..9.0).contains(&along) || !(1.0..3.0).contains(&h) {
+                    continue;
+                }
+                let (down, updated, active) = gi_probe(&words, index, -up);
+                if updated && active {
+                    sum += down;
+                    n += 1;
+                }
+            }
+            assert!(n > 20, "{n} probes past the wall");
+            levels[k] = sum / n as f32;
+        }
+        levels[1] - levels[0]
+    };
+    let without = gain(&mut editor, open);
+    let with = gain(&mut editor, flat_world(Some(wall)));
+    eprintln!("local light's gain past the wall: {with} with it, {without} without");
+    assert!(
+        without > 0.02,
+        "the light lights the open ground: {without}"
+    );
+    assert!(
+        with < 0.15 * without,
+        "{with} with the wall, {without} without"
+    );
+}
+
+/// A mesh on the terrain: a slab 6 m square, 3 m over flat ground, under a
+/// high sun. The probes under it meet the slab above (the meshes' nearest
+/// hit, nearer than the sky), and the ground they see is in the slab's
+/// shadow (the terrain's hits' shadow rays stopped by the meshes): both
+/// darker than probes in the open, which see the sky above and sunlit
+/// ground below. Needs hardware ray queries (the meshes' tracer).
+///
+/// How much darker, for probes holding irradiance in L1 harmonics: an L1
+/// probe's irradiance toward `n` is its rays' mean radiance plus a dipole,
+/// `mean ± (1/2π)∫L cos`, and under a slab 6 m across a probe 1-2 m up sees
+/// the horizon (sunlit ground and sky past the slab's edges) over about 40%
+/// of the sphere's solid angle, though only a sixth of the upper
+/// hemisphere's cosine weight and under a third of the lower's. That horizon lifts both of its values: integrated from
+/// this world's rays (the open ground's radiance 0.26, the shaded ground's
+/// 0.06, the slab's underside 0.13, the sky 0.5), L1 gives the probes under
+/// the slab 0.45 of the open probes' irradiance from above and 0.64 from
+/// below, where the exact cosine-weighted irradiance is 0.35 and 0.40. A
+/// slab the rays did not see would leave above at 1; a shadow they did not
+/// see would put below at about 1.3 (sunlit ground under the probe, the
+/// horizon's light on top). The bounds sit between: 0.6 and 0.8. (Probes
+/// that took rays before the terrain's tracer answered, the meshes'
+/// answering alone, kept a world without ground for many updates: the
+/// open probes' below at 0.18 instead of 0.26, under / open 0.84.)
+#[test]
+fn a_mesh_slab_on_terrain_shades_the_probes_under_it() {
+    let _gpu = gpu_serial();
+    let Some(mut editor) = editor(320, 180) else {
+        return;
+    };
+    if !helio_pass_mesh_rays::mesh_rays_supported(&editor.device) {
+        eprintln!("no ray queries: skipped");
+        return;
+    }
+    editor.renderer.set_editor_mode(false);
+    let planet = flat_world(None);
+    let ground = planet.surface_point(glam::DVec3::Y, 0.0);
+    let up = planet.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let fwd = up.cross(side);
+    let sun = (up + side * 0.2).normalize().as_vec3();
+    editor.set_sky(sun, None);
+    let slab = ground + up * 3.0;
+    spawn_box(
+        &mut editor.scene.world,
+        slab.as_vec3(),
+        (side.abs() * 3.0 + up.abs() * 0.2 + fwd.abs() * 3.0).as_vec3(),
+        [0.6; 3],
+    );
+    editor.scene.world.flush_gpu_mirror(&editor.queue);
+    editor.show(Some(PlanetFrame::single(planet.clone(), sun)));
+    // The finest level (12 m across) holds both regions measured.
+    let eye = ground + side * 4.0 + up * 1.7;
+    let camera = Camera::perspective_look_to(
+        eye,
+        (-side).as_vec3(),
+        up.as_vec3(),
+        std::f32::consts::FRAC_PI_4,
+        16.0 / 9.0,
+        0.05,
+        10_000.0,
+    );
+    let mut rays = helio_mesh_host::ray_tracing::SceneDbRayTracing::partial(
+        editor.device.clone(),
+        editor.queue.clone(),
+    );
+    editor.settle_gi(&camera, 160, |editor| {
+        editor.scene.world.flush_gpu_mirror(&editor.queue);
+        rays.prepare(&editor.scene.world).unwrap();
+        rays.publish(&mut editor.renderer);
+    });
+    let (clipmap, words) = editor.gi_probes();
+    // Under the slab (its middle 3 m) and in the open (8 m off), 1 to 2 m
+    // up: their light from above and below.
+    let mut means = [[0.0f32; 2]; 2];
+    let mut counts = [0usize; 2];
+    for (index, p) in finest_probes(&clipmap) {
+        let d = p - ground;
+        let h = d.dot(up);
+        if !(1.0..2.0).contains(&h) {
+            continue;
+        }
+        let (x, z) = (d.dot(side), d.dot(fwd));
+        let at = if x.abs() < 1.5 && z.abs() < 1.5 {
+            0
+        } else if x > 8.0 && x < 10.0 && z.abs() < 1.5 {
+            1
+        } else {
+            continue;
+        };
+        let (above, updated, active) = gi_probe(&words, index, up);
+        let (below, _, _) = gi_probe(&words, index, -up);
+        if updated && active {
+            means[at][0] += above;
+            means[at][1] += below;
+            counts[at] += 1;
+        }
+    }
+    assert!(counts[0] > 10 && counts[1] > 10, "{counts:?}");
+    let [under, open] = [0, 1].map(|k| means[k].map(|m| m / counts[k] as f32));
+    eprintln!(
+        "probes under the slab: above {}, below {}; in the open: above {}, below {}",
+        under[0], under[1], open[0], open[1]
+    );
+    assert!(
+        under[0] < 0.6 * open[0],
+        "the slab is nearer than the sky: {under:?} {open:?}"
+    );
+    assert!(
+        under[1] < 0.8 * open[1],
+        "the ground under it is in its shadow: {under:?} {open:?}"
+    );
+}
+
+/// An axis-aligned box of half extent `half` at `centre` in `colour`.
+fn spawn_box(world: &mut pulsar_scenedb::World, centre: Vec3, half: Vec3, colour: [f32; 3]) {
+    use helio_mats::host_rows::MaterialComponent;
+    use helio_mesh_host::{MeshComponent, StaticObjectComponent};
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for axis in 0..3 {
+        for sign in [-1.0f32, 1.0] {
+            let n = Vec3::from_array(std::array::from_fn(|k| if k == axis { sign } else { 0.0 }));
+            let (u, v) = (
+                Vec3::from_array(std::array::from_fn(|k| f32::from(k == (axis + 1) % 3))),
+                Vec3::from_array(std::array::from_fn(|k| f32::from(k == (axis + 2) % 3))),
+            );
+            let (u, v) = if sign > 0.0 { (u, v) } else { (v, u) };
+            let base = vertices.len() as u32;
+            for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let p = (n + u * a + v * b) * half;
+                vertices.push(helio_mesh_api::PackedVertex::from_components(
+                    p.to_array(),
+                    n.to_array(),
+                    [0.0; 2],
+                    u.to_array(),
+                    1.0,
+                ));
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    let mesh = world.spawn();
+    world.insert(mesh, MeshComponent { vertices, indices });
+    let material = world.spawn();
+    let row = MaterialComponent::from(helio_mats::MaterialRow::new(
+        [colour[0], colour[1], colour[2], 1.0],
+        0.8,
+        0.0,
+        [0.0; 3],
+        0.0,
+    ));
+    world.insert(material, row);
+    let store = world.gpu_mirror().cloned().unwrap();
+    let vertex_range = MeshComponent::vertices_gpu_handle(store.store(), mesh.index()).unwrap();
+    let index_range = MeshComponent::indices_gpu_handle(store.store(), mesh.index()).unwrap();
+    let transform = glam::Mat4::from_translation(centre);
+    let object = StaticObjectComponent::from(helio_mesh_api::StaticObjectRow::new(
+        mesh.index(),
+        mesh.generation().wrapping_add(1),
+        material.index(),
+        material.generation().wrapping_add(1),
+        transform,
+        [centre.x, centre.y, centre.z, half.length()],
+        index_range.count,
+        index_range.offset,
+        vertex_range.offset as i32,
+        row.material_class,
+        0,
+        0,
+    ));
+    let entity = world.spawn();
+    world.insert(entity, object);
 }

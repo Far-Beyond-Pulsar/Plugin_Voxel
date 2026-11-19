@@ -19,6 +19,7 @@ mod volumes;
 pub use sun_pages::SunPageStats;
 pub mod ground;
 pub mod pass;
+pub mod rays;
 pub mod residency;
 pub mod scene;
 
@@ -314,6 +315,14 @@ struct ChunkStatic {
 const RECORD_VEC4S: usize = 2 + std::mem::size_of::<ChunkStatic>() / 16;
 const RECORD_BYTES: usize = RECORD_VEC4S * 16;
 
+/// A volume's eye column (face, i, j), first exact level and form, as
+/// its anchor was placed for (`ChunkWorld::place_anchors`).
+type AnchorColumn = ((u8, i32, i32), u32, bool);
+
+/// `RAY_VOLUME_MOVABLE` of chunk_draw.wgsl: a volume's ray parameters'
+/// `volume.w` when it has moved since it was added.
+const RAY_VOLUME_MOVABLE: u32 = 16;
+
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
     let hi = v.as_vec3();
@@ -522,7 +531,6 @@ struct ViewInput {
     sun: Vec3,
     drawn: u32,
     light_eye: Option<Vec3>,
-    gi: bool,
     ortho: Option<(Vec3, f32)>,
 }
 
@@ -828,16 +836,6 @@ pub struct SceneLights<'a> {
     pub tile_lists: &'a wgpu::Buffer,
     pub tile_counts: &'a wgpu::Buffer,
     pub eye: Vec3,
-}
-
-/// The GI probes' rays the terrain traces (`helio_pass_gi`: `gi_frame`,
-/// `gi_rays`, `gi_hits`, `gi_sun`), from the probes' places
-/// ([`ChunkWorld::follow_gi`]).
-pub struct GiRays<'a> {
-    pub frame: &'a wgpu::Buffer,
-    pub rays: &'a wgpu::Buffer,
-    pub hits: &'a wgpu::Buffer,
-    pub sun: &'a wgpu::Buffer,
 }
 
 /// `VoxelMaterials` of chunk_draw.wgsl: each voxel material id's material
@@ -1768,8 +1766,8 @@ pub struct FrameTimings {
     pub seed: f64,
     pub shadow: f64,
     /// The shadows' parts: sun samples, sky samples, every hit's sun (and
-    /// the fallbacks' walks), local lights, the GI probes' rays.
-    pub shadow_stages: [f64; 5],
+    /// the fallbacks' walks), local lights.
+    pub shadow_stages: [f64; 4],
     /// Of every hit's sun: the fallbacks' walks.
     pub fallbacks: f64,
     /// The sun's occlusion clipmap's level drawn this frame.
@@ -1794,10 +1792,10 @@ pub struct FrameTimings {
 /// and end, trace end, chunk columns end, chunk builds end, shadows end,
 /// tile nodes end, tile columns end, tile features end, the shadows'
 /// denoiser end; the shadows' parts: sun samples end, sky samples end,
-/// every hit's sun end, local lights end (the GI rays end at shadows end);
-/// the sun's occlusion start and end; every hit's own sun end (before the
-/// fallbacks' walks).
-const QUERIES: u32 = 19;
+/// every hit's sun end (local lights end at shadows end); the sun's
+/// occlusion start and end; every hit's own sun end (before the fallbacks'
+/// walks).
+const QUERIES: u32 = 18;
 
 /// `Buried`'s size: a count and 4095 keys.
 const BURIED_BYTES: u64 = 16 * 4096;
@@ -2123,6 +2121,13 @@ pub struct ChunkWorld {
     /// Each form's passes lighting other volumes' points, compiled once the
     /// world holds more than one volume ([`Self::pipelines_ready`]).
     cross: [Option<helio_core::compile::Compiling<volumes::CrossPipelines>>; 2],
+    /// Each form's ray stream kernels, compiled once a stream is traced
+    /// ([`Self::want_rays`]); the eye of the last camera draw (world, high
+    /// and low parts) and the cut it left for ray streams (`rays`).
+    ray_pipelines: [Option<std::sync::Arc<helio_core::compile::Compiling<rays::RayPipelines>>>; 2],
+    rays_wanted: bool,
+    ray_eye: wgpu::Buffer,
+    ray_cut: Option<std::sync::Arc<rays::RayCut>>,
     /// The world's own pipelines (chunk table, records, leaf pool).
     base: helio_core::compile::Compiling<BasePipelines>,
     /// Whether every pipeline the volumes held need is ready: the world
@@ -2152,17 +2157,13 @@ pub struct ChunkWorld {
     /// CPU time of the last update's occluder boxes (ms; `SunPageStats`).
     occluder_ms: f64,
     ground_later: Vec<(u64, NodeKey)>,
-    /// The GI probes' rays (`gi_trace`), from each probe's base cell
-    /// (`gi_cells`, and its CPU copy) in the clipmap they were located for,
-    /// in the primary volume.
-    gi_cells: wgpu::Buffer,
-    gi_cell_data: Vec<[i32; 4]>,
-    gi_clipmap: Option<helio_gi_api::Clipmap>,
     /// The publish with the host's scene materials (devices with texture
     /// binding arrays).
     scene: Option<SceneState>,
     /// Whether every hit walks its own sun ray (`set_steady_shadows`).
     steady_shadows: bool,
+    /// How far each pixel's sky rays walk (metres; `set_sky_reach`).
+    sky_reach: Option<f32>,
     /// The sun's angular radius (radians), and the host's atmosphere frame
     /// (helio-pass-sky's `atmosphere_frame`) whose sun disk wins when given.
     sun_angular_radius: f32,
@@ -2321,8 +2322,10 @@ pub struct ChunkWorld {
     /// removed ones still drawn.
     volumes: Vec<Option<volumes::Volume>>,
     primary: Option<u16>,
-    /// Each volume's anchor this draw (`place_anchors`), by index.
+    /// Each volume's anchor this draw (`place_anchors`), by index, and the
+    /// drawn set's version and eye columns they were placed for.
     anchors: Vec<u32>,
+    anchors_for: Option<(u64, Vec<Option<AnchorColumn>>)>,
     /// Where each volume but the primary was at the last update (foliage's
     /// ground changes where one near the eye moves).
     ground_placed: FxHashMap<u16, crate::volume::VolumeTransform>,
@@ -2385,13 +2388,12 @@ struct DrawGroups {
 /// A volume that lights the other volumes' points in a draw
 /// (`ChunkWorld::cross_volumes`): its bind group (the camera's view, over
 /// `shadow`'s rectangle), the rectangle its sun shadow can fall on another
-/// volume's hits in (none: it falls on none), whether the GI probes' rays
-/// reach it and foliage's probes may meet it.
+/// volume's hits in (none: it falls on none), whether foliage's probes may
+/// meet it.
 struct CrossVolume {
     index: u16,
     group: wgpu::BindGroup,
     shadow: Option<[u32; 4]>,
-    gi: bool,
     ground: bool,
 }
 
@@ -3042,7 +3044,7 @@ fn draw_source(plane: bool, counting: bool) -> String {
     let source = |rel: &str, embedded: &'static str| {
         helio_core::shader::hot::source_text(env!("CARGO_MANIFEST_DIR"), rel, embedded)
     };
-    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_gi_api::GI_COMMON_SNIPPET.source + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
+    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
         .replace("COUNTERS", if counting { "@group(0) @binding(9) var<storage, read_write> counters: array<atomic<u32>, 256>;" } else { "" })
         .replace("WCOUNT(1)", &wcount(1))
         .replace("WCOUNT(3)", &wcount(3))
@@ -3404,6 +3406,14 @@ impl ChunkWorld {
             layouts,
             pipelines: [None, None],
             cross: [None, None],
+            ray_pipelines: [None, None],
+            rays_wanted: false,
+            ray_eye: buffer(
+                "chunk ray eye",
+                32,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            ray_cut: None,
             base,
             drawable: false,
             uv_grid_view,
@@ -3417,13 +3427,7 @@ impl ChunkWorld {
             occluder_refined: Vec::new(),
             occluder_ms: 0.0,
             ground_later: Vec::new(),
-            gi_cells: buffer(
-                "chunk GI probe cells",
-                u64::from(helio_gi_api::PROBES) * 16,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            ),
-            gi_cell_data: vec![[0; 4]; helio_gi_api::PROBES as usize],
-            gi_clipmap: None,
+            sky_reach: None,
             scene,
             steady_shadows: false,
             sun_angular_radius: EARTH_SUN_ANGULAR_RADIUS,
@@ -3642,6 +3646,7 @@ impl ChunkWorld {
             volumes: Vec::new(),
             primary: None,
             anchors: Vec::new(),
+            anchors_for: None,
             ground_placed: FxHashMap::default(),
             unplanned: Vec::new(),
             removed_drawn: Vec::new(),
@@ -4711,13 +4716,12 @@ impl ChunkWorld {
         self.frame_now = frame;
         let mut stats = UpdateStats::default();
         // The primary volume follows the eye (`follow_eye`): in a new one,
-        // foliage near the eye and every GI probe are placed again.
+        // foliage near the eye is placed again.
         let before = self.primary;
         self.follow_eye(eye);
         if before.is_some() && self.primary != before {
             let near = DVec3::splat(FOLIAGE_REACH);
             self.ground_changes.push([eye - near, eye + near]);
-            self.gi_clipmap = None;
         }
         // The other volumes near the eye that moved change foliage's ground
         // where they were and are (`ground_probe_cross`).
@@ -6248,8 +6252,7 @@ impl ChunkWorld {
                         ms(t[4], t[12]),
                         ms(t[12], t[13]),
                         ms(t[13], t[14]),
-                        ms(t[14], t[15]),
-                        ms(t[15], t[7]),
+                        ms(t[14], t[7]),
                     ];
                     let timing = FrameTimings {
                         frame,
@@ -6257,8 +6260,8 @@ impl ChunkWorld {
                         seed: ms(t[2], t[3]),
                         shadow: ms(t[4], t[7]),
                         shadow_stages,
-                        fallbacks: ms(t[18], t[14]),
-                        occlusion: ms(t[16], t[17]),
+                        fallbacks: ms(t[17], t[14]),
+                        occlusion: ms(t[15], t[16]),
                         denoise: ms(t[7], t[11]),
                         generate: ms(t[0], t[6]),
                         tiles,
@@ -6324,7 +6327,10 @@ impl ChunkWorld {
             && self.residency_settled()
             && self.sun_occlusion.as_ref().is_none_or(|o| {
                 let s = o.pages.stats;
-                (s.missing == 0 && s.stale == 0 && s.coarse == 0)
+                // The stats of a plan made for the settled residency (the
+                // planner runs a frame or more behind): an earlier plan's
+                // have not queued the coarse pages a settled cut retraces.
+                (o.pages.stats_current() && s.missing == 0 && s.stale == 0 && s.coarse == 0)
                     || s.out_of_pages
                     || o.settled_since
                         .is_some_and(|f| o.drawn_frame + 1 >= f + PAGES_SETTLE_FRAMES)
@@ -6695,12 +6701,9 @@ impl ChunkWorld {
                     .unwrap_or(u32::MAX),
             ],
             light_eye: v.light_eye.map_or([0.0; 4], |e| e.extend(1.0).to_array()),
-            // Two of the finest probes' spacings: the probes' visibility
-            // holds the occlusion past them.
+            // A camera's pixels' sky rays (`set_sky_reach`).
             sky: [
-                self.gi_clipmap
-                    .filter(|_| v.gi)
-                    .map_or(0.0, |c| 2.0 * c.finest as f32),
+                self.sky_reach.filter(|_| v.ortho.is_none()).unwrap_or(0.0),
                 self.sun_angular_radius,
                 0.0,
                 0.0,
@@ -6874,6 +6877,26 @@ impl ChunkWorld {
                 ));
             }
         }
+        if self.rays_wanted {
+            for form in 0..2 {
+                if !forms[form] || self.ray_pipelines[form].is_some() {
+                    continue;
+                }
+                let Some(draw) = self.pipelines[form]
+                    .as_ref()
+                    .and_then(helio_core::compile::Compiling::ready)
+                else {
+                    continue;
+                };
+                let (layouts, module) = (self.layouts.clone(), draw.module.clone());
+                self.ray_pipelines[form] =
+                    Some(std::sync::Arc::new(helio_core::compile::Compiling::start(
+                        &self.device,
+                        "voxel ray stream pipelines",
+                        move |device| rays::RayPipelines::new(device, &layouts, &module),
+                    )));
+            }
+        }
         fn built<T: Send + Sync + 'static>(c: &Option<helio_core::compile::Compiling<T>>) -> bool {
             c.as_ref().is_some_and(|c| c.ready().is_some())
         }
@@ -6901,17 +6924,34 @@ impl ChunkWorld {
             for c in self.pipelines.iter().flatten() {
                 c.wait()?;
             }
-            // Starts the passes lighting across volumes, once.
-            if self.pipelines_ready() {
+            // Starts the passes lighting across volumes and the ray
+            // streams' kernels, once.
+            if self.pipelines_ready() && self.ray_pipelines_ready() {
                 return Ok(());
             }
             for c in self.cross.iter().flatten() {
                 c.wait()?;
             }
-            if self.pipelines_ready() {
+            for c in self.ray_pipelines.iter().flatten() {
+                c.wait()?;
+            }
+            if self.pipelines_ready() && self.ray_pipelines_ready() {
                 return Ok(());
             }
         }
+    }
+
+    /// Whether every held form's ray kernels are compiled, when ray streams
+    /// are wanted (drawing never waits for them).
+    fn ray_pipelines_ready(&self) -> bool {
+        let (forms, _) = self.forms_held();
+        !self.rays_wanted
+            || (0..2).all(|form| {
+                !forms[form]
+                    || self.ray_pipelines[form]
+                        .as_ref()
+                        .is_some_and(|c| c.ready().is_some())
+            })
     }
 
     /// The volumes with chunks in the drawn cut.
@@ -6931,17 +6971,17 @@ impl ChunkWorld {
     /// (`enter_volume`), for an eye at `eye` (world): the finest drawn chunk
     /// finer than its exact levels over the eye's column (a sphere's frames
     /// hold near their chunks), else a plane's coarsest drawn chunk (its
-    /// frames are one affine map); none with a single volume.
+    /// frames are one affine map); none with a single volume and no ray
+    /// stream traced. Placed again only when the drawn set or an eye's
+    /// column changes.
     fn place_anchors(&mut self, eye: DVec3) {
-        self.anchors.clear();
-        self.anchors.resize(self.volumes.len(), u32::MAX);
-        if self.volumes.iter().flatten().count() < 2 {
+        if self.volumes.iter().flatten().count() < 2 && !self.rays_wanted {
+            self.anchors.clear();
+            self.anchors_for = None;
             return;
         }
-        // Each volume's eye column (face, i, j), exact level and form; its
-        // best chunk: over the column, its level, slot.
-        type Column = ((u8, i32, i32), u32, bool);
-        let columns: Vec<Option<Column>> = self
+        // Each volume's eye column (face, i, j), exact level and form.
+        let columns: Vec<Option<AnchorColumn>> = self
             .volumes
             .iter()
             .map(|v| {
@@ -6955,6 +6995,17 @@ impl ChunkWorld {
                 })
             })
             .collect();
+        let version = self.drawn_set.version();
+        if self
+            .anchors_for
+            .as_ref()
+            .is_some_and(|(v, c)| *v == version && *c == columns)
+        {
+            return;
+        }
+        self.anchors.clear();
+        self.anchors.resize(self.volumes.len(), u32::MAX);
+        // Each volume's best chunk: over the column, its level, slot.
         let mut best: Vec<Option<(bool, u32, u32)>> = vec![None; self.volumes.len()];
         for c in &self.drawn_set.list {
             let key = self.slot_keys[c.slot as usize];
@@ -6984,22 +7035,83 @@ impl ChunkWorld {
                 *anchor = slot;
             }
         }
+        self.anchors_for = Some((version, columns));
+    }
+
+    /// Ray streams will be traced through this world (`chunks::rays`): its
+    /// draws keep a cut for them ([`Self::ray_cut`]) and its forms' ray
+    /// kernels compile off the frame.
+    pub fn want_rays(&mut self) {
+        self.rays_wanted = true;
+    }
+
+    /// The cut the last camera draw left for ray streams (none before one,
+    /// or with no stream wanted).
+    pub fn ray_cut(&self) -> Option<std::sync::Arc<rays::RayCut>> {
+        self.ray_cut.clone()
+    }
+
+    /// The cut of camera view `v` for ray streams, after its draw: the eye
+    /// and each volume with drawn chunks' parameters (its pass for the
+    /// camera, `prev` its last transforms; no seed chunk at the eye;
+    /// movable volumes flagged), written in command order, and their bind
+    /// groups.
+    fn keep_ray_cut(
+        &mut self,
+        encoder: &mut helio_core::CommandRecorder<'_>,
+        v: &ViewInput,
+        prev: &[(u16, crate::volume::VolumeTransform)],
+        drawn_in: &FxHashSet<u16>,
+    ) {
+        if !self.rays_wanted {
+            self.ray_cut = None;
+            return;
+        }
+        let (hi, lo) = split(v.eye);
+        self.uploads
+            .write(encoder, &self.ray_eye, 0, bytemuck::cast_slice(&[hi, lo]));
+        let count = self.volumes.iter().flatten().count() as u32;
+        let mut volumes = Vec::new();
+        for vol in self
+            .volumes
+            .iter()
+            .flatten()
+            .filter(|w| drawn_in.contains(&w.index))
+        {
+            let last = prev
+                .iter()
+                .find(|(i, _)| *i == vol.index)
+                .map_or(vol.transform, |(_, t)| *t);
+            let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
+            params.cut[2] = u32::MAX;
+            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 };
+            self.uploads
+                .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
+            volumes.push(rays::RayVolume {
+                plane: vol.grid.is_plane(),
+                group: self.draw_group(&vol.views.rays, vol, self.camera_view(vol)),
+            });
+        }
+        self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
+            volumes,
+            pipelines: self.ray_pipelines.clone(),
+            layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
+            eye: self.ray_eye.clone(),
+        }));
     }
 
     /// The volumes that light the other volumes' points in view `v` (those
     /// with drawn chunks, `drawn_in`, when more than one is held): those
     /// whose sun shadow can fall on another traced volume (`order`,
     /// `shadow_reaches`), over the rectangle it can fall in (`shadow_rect`);
-    /// those the GI probes' rays reach (`gi`: they trace this view) and
-    /// foliage's probes may meet, but the primary (whose own passes walk
-    /// them); with their parameters for it (the camera's, placed by `prev`
+    /// those foliage's probes may meet, but the primary (whose own passes
+    /// walk them); with their parameters for it (the camera's, placed by `prev`
     /// a frame ago, over the shadow's rectangle) and bind group.
     fn cross_volumes(
         &self,
         v: &ViewInput,
         order: &[u16],
         drawn_in: &FxHashSet<u16>,
-        gi: bool,
         prev: &[(u16, crate::volume::VolumeTransform)],
     ) -> Vec<CrossVolume> {
         let mut out = Vec::new();
@@ -7007,12 +7119,6 @@ impl ChunkWorld {
             return out;
         }
         let sun = v.sun.as_dvec3().normalize_or_zero();
-        // The GI clipmap's coarsest level's side from the eye: its probes
-        // and their rays.
-        let gi_reach = self
-            .gi_clipmap
-            .filter(|_| gi)
-            .map(|c| c.spacing(helio_gi_api::LEVELS - 1) * helio_gi_api::SIDE as f64);
         for vol in self
             .volumes
             .iter()
@@ -7031,9 +7137,8 @@ impl ChunkWorld {
                             .is_some_and(|rv| shadow_reaches(vol, rv, sun))
                 });
             let others = Some(vol.index) != self.primary;
-            let gi = others && gi_reach.is_some_and(within);
             let ground = others && within(FOLIAGE_REACH);
-            if !(casts || gi || ground) {
+            if !(casts || ground) {
                 continue;
             }
             // Its pass in the view (past the traced where it is not one).
@@ -7056,7 +7161,6 @@ impl ChunkWorld {
                 index: vol.index,
                 group: self.draw_group(&vol.views.cross, vol, self.camera_view(vol)),
                 shadow: casts.then_some(params.rect),
-                gi,
                 ground,
             });
         }
@@ -7145,7 +7249,7 @@ impl ChunkWorld {
                 }));
             }
         };
-        stamp(self, encoder, 16);
+        stamp(self, encoder, 15);
         let clock = std::time::Instant::now();
         let changes = std::mem::take(&mut self.occluder_changes);
         let refined = std::mem::take(&mut self.occluder_refined);
@@ -7282,7 +7386,7 @@ impl ChunkWorld {
         {
             eprintln!("SUNPAGES frame {frame}: {stats:?}, planner parts {parts:?}");
         }
-        stamp(self, encoder, 17);
+        stamp(self, encoder, 16);
     }
 
     /// The world distances along the current epoch's sun of the near plane
@@ -7438,7 +7542,6 @@ impl ChunkWorld {
             sun: e.sun.as_vec3(),
             drawn,
             light_eye: None,
-            gi: false,
             ortho: Some((forward.as_vec3(), rel.dot(forward.as_vec3()))),
         };
         let rects: Vec<[u32; 4]> = window
@@ -7900,7 +8003,6 @@ impl ChunkWorld {
         size: [u32; 2],
         scene_depth: Option<&wgpu::TextureView>,
         lights: Option<&SceneLights<'_>>,
-        gi: Option<&GiRays<'_>>,
     ) {
         self.draw_for_eye(
             encoder,
@@ -7914,7 +8016,6 @@ impl ChunkWorld {
             size,
             scene_depth,
             lights,
-            gi,
             0,
         );
     }
@@ -7935,7 +8036,6 @@ impl ChunkWorld {
         size: [u32; 2],
         scene_depth: Option<&wgpu::TextureView>,
         lights: Option<&SceneLights<'_>>,
-        gi: Option<&GiRays<'_>>,
         eye_index: usize,
     ) {
         if !self.drawable {
@@ -7953,7 +8053,6 @@ impl ChunkWorld {
             size,
             scene_depth,
             lights,
-            gi,
             eye_index,
         );
         helio_core::cpu_scope!("VoxelChunks: draw: upload flush");
@@ -7974,7 +8073,6 @@ impl ChunkWorld {
         size: [u32; 2],
         scene_depth: Option<&wgpu::TextureView>,
         lights: Option<&SceneLights<'_>>,
-        gi: Option<&GiRays<'_>>,
         eye_index: usize,
     ) {
         let Some(primary) = self.primary else {
@@ -8034,7 +8132,6 @@ impl ChunkWorld {
             sun,
             drawn,
             light_eye: lights.map(|l| l.eye),
-            gi: gi.is_some(),
             ortho: None,
         };
         self.place_anchors(eye);
@@ -8107,11 +8204,11 @@ impl ChunkWorld {
         drop(trace_scope);
         let cross = {
             helio_core::cpu_scope!("VoxelChunks: draw: cross volumes");
-            self.cross_volumes(&input, &order, &drawn_in, gi.is_some(), &prev)
+            self.cross_volumes(&input, &order, &drawn_in, &prev)
         };
         let targets = self.targets.as_ref().unwrap();
         {
-            let lighting_scope = helio_core::CpuScope::new("VoxelChunks: draw: shadows and GI");
+            let lighting_scope = helio_core::CpuScope::new("VoxelChunks: draw: shadows");
             // 4. Sun shadows: samples, then every hit, and meshes before
             // their hits; each volume's hits by its own pass.
             let occlusion = self.sun_occlusion.as_ref().unwrap();
@@ -8239,7 +8336,7 @@ impl ChunkWorld {
             }
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chunk shadow"),
-                timestamp_writes: end(18),
+                timestamp_writes: end(17),
             });
             pass.set_bind_group(1, &shadow_group, &[]);
             for (index, group, rect) in &groups {
@@ -8271,7 +8368,7 @@ impl ChunkWorld {
             drop(pass);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chunk local shadows"),
-                timestamp_writes: end(15),
+                timestamp_writes: end(7),
             });
             // 4b. Local lights' terrain shadows, with the hits' normals.
             let local_group = self.gpu_cache.bind_group(
@@ -8309,48 +8406,6 @@ impl ChunkWorld {
                     pass.set_pipeline(pipeline);
                     let (x, y) = rect_groups(*rect, 8);
                     pass.dispatch_workgroups(x, y, 1);
-                }
-            }
-            drop(pass);
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("chunk GI rays"),
-                timestamp_writes: end(7),
-            });
-            // 6. The GI probes' rays (a thread a ray, past the frame's
-            // count none), through the primary volume, then each other
-            // volume they reach (the nearer hit kept).
-            if let (Some(gi), true, Some(occlusion), Some((_, group, _))) = (
-                gi,
-                self.gi_clipmap.is_some(),
-                &self.sun_occlusion,
-                groups.iter().find(|(i, ..)| *i == primary),
-            ) {
-                // Hits see the sun by its occlusion maps (none drawn: lit).
-                let gi_group = self.gpu_cache.bind_group(
-                    &self.device,
-                    &wgpu::BindGroupDescriptor {
-                        label: Some("chunk GI rays"),
-                        layout: &self.layouts.gi,
-                        entries: &[
-                            entry(35, gi.frame),
-                            entry(36, gi.rays),
-                            entry(37, gi.hits),
-                            entry(38, &self.gi_cells),
-                            entry(39, gi.sun),
-                            entry(62, &occlusion.frame),
-                            view_entry(63, &occlusion.atlas_view),
-                            entry(65, &occlusion.pages_buffer),
-                        ],
-                    },
-                );
-                pass.set_bind_group(0, group, &[]);
-                pass.set_bind_group(1, &gi_group, &[]);
-                pass.set_pipeline(&self.pipelines_of(primary).gi_trace);
-                pass.dispatch_workgroups(helio_gi_api::MAX_RAYS.div_ceil(64), 1, 1);
-                for c in cross.iter().filter(|c| c.gi) {
-                    pass.set_bind_group(0, &c.group, &[]);
-                    pass.set_pipeline(&self.cross_pipelines(c.index).gi_trace);
-                    pass.dispatch_workgroups(helio_gi_api::MAX_RAYS.div_ceil(64), 1, 1);
                 }
             }
             drop(pass);
@@ -8462,6 +8517,12 @@ impl ChunkWorld {
                 .map(|c| (c.index, c.group))
                 .collect(),
         });
+        // The cut ray streams walk until the next draw: the camera's
+        // (a stereo pair's left eye).
+        if eye_index == 0 {
+            helio_core::cpu_scope!("VoxelChunks: draw: ray cut");
+            self.keep_ray_cut(encoder, &input, &prev, &drawn_in);
+        }
     }
 
     /// The traces' counts since the last call (with
@@ -8657,43 +8718,6 @@ impl ChunkWorld {
             pass.set_bind_group(0, group, &[]);
             pass.set_pipeline(&self.cross_pipelines(*index).ground_probe);
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
-        }
-    }
-
-    pub fn follow_gi(&mut self, clipmap: helio_gi_api::Clipmap, world_eye: DVec3, eye: DVec3) {
-        let Some(vol) = self
-            .primary
-            .and_then(|p| self.volumes[usize::from(p)].as_ref())
-        else {
-            return;
-        };
-        // Probes are located in the primary volume's frame; a volume that
-        // moves relocates them all.
-        let (grid, transform) = (vol.grid, vol.transform);
-        let moved = vol.drawn_transform[0].is_some_and(|t| t != transform);
-        if self.gi_clipmap == Some(clipmap) && !moved {
-            return;
-        }
-        let entered = if moved {
-            (0..helio_gi_api::PROBES).collect()
-        } else {
-            clipmap.entered(self.gi_clipmap.as_ref())
-        };
-        self.gi_clipmap = Some(clipmap);
-        let (mut lo, mut hi) = (usize::MAX, 0);
-        for &index in &entered {
-            let (cell, _) =
-                grid.locate(transform.to_local(eye + (clipmap.position(index) - world_eye)));
-            self.gi_cell_data[index as usize] = [cell.i, cell.j, cell.k, i32::from(cell.face) | 8];
-            lo = lo.min(index as usize);
-            hi = hi.max(index as usize + 1);
-        }
-        if lo < hi {
-            self.queue.write_buffer(
-                &self.gi_cells,
-                lo as u64 * 16,
-                bytemuck::cast_slice(&self.gi_cell_data[lo..hi]),
-            );
         }
     }
 
@@ -9010,6 +9034,13 @@ impl ChunkWorld {
     /// samples that move each frame; the denoiser passes the walks' own on.
     pub fn set_steady_shadows(&mut self, on: bool) {
         self.steady_shadows = on;
+    }
+
+    /// How far each pixel's sky rays walk (metres: where the frame's
+    /// indirect diffuse resolves occlusion, `ChunkPass::set_sky_reach`;
+    /// none: `SKY_RANGE_CELLS` cells).
+    pub fn set_sky_reach(&mut self, reach: Option<f32>) {
+        self.sky_reach = reach;
     }
 
     /// [`Self::publish`], textured by the host's scene materials where
