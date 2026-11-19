@@ -2244,7 +2244,7 @@ fn voxel_surface(slot: u32, cell: vec3<i32>, axis: u32, sign: u32, material: u32
     // Materials that let light through are two-sided foliage: the light
     // behind comes through tinted by their colour, their share of it (what
     // lies between the light and the leaf is the light's visibility).
-    return surface_with_transmission(surface, albedo * clamp(material_transmission(row), 0.0, 1.0));
+    return surface_with_transmission(surface, material_transmitted(row, albedo));
 }
 
 // `GBufferDepthOutput`: the frame's G-buffer targets and the depth
@@ -5264,7 +5264,7 @@ fn diffuse_surface(f: StreamFace) -> SurfaceData {
     let emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
     var surface = surface_data(albedo, to_world(f.shading), clamp(row.roughness_metallic.x, 0.04, 1.0), 0.0, emissive);
     surface.specular_f0 = vec3<f32>(0.03);
-    return surface_with_transmission(surface, albedo * clamp(material_transmission(row), 0.0, 1.0));
+    return surface_with_transmission(surface, material_transmitted(row, albedo));
 }
 
 // Whether `hit` is this tracer's, in this volume.
