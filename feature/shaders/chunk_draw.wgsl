@@ -5110,12 +5110,6 @@ const RAY_PAGES_MIXED: u32 = 0x1ffu;
 // near plane, half the width.
 const PAGE_DRIFT: f32 = 0.5;
 
-// The sine of the angle within which a ray asks for the current epoch's
-// pages: four times the sun's turn that starts a new epoch
-// (`sun_pages::TURN`), so a ray along the scene's sun asks for them
-// whichever way the epoch lags it.
-const PAGE_ASK_SINE: f32 = 0.008;
-
 // How far (in texels of the level read) an occlusion ray answered by the
 // pages walks first: its own surface, and every occluder nearer than this
 // along the sun, are the walk's (exact); the pages answer from a texel short
@@ -5139,10 +5133,11 @@ const PAGE_WALK_TEXELS: f32 = 2.0;
 // near plane, for a ray that sees every caster and every volume the pages
 // hold (`RAY_VOLUME_PAGES_SHIFT`); read at camera-relative `p`, the origin,
 // lifted a texel short of the walked band. x: the share, y: the level's
-// texel (0: no answer, the ray walks all of it). Every ray that could be
-// answered so asks for its page (`ask_sun_pages`), as the pixels do:
-// decided by the ray's footprint and the pages' residency, never by who
-// sent it.
+// texel (0: no answer, the ray walks all of it). Decided by the ray's
+// footprint and the pages' residency, never by who sent it. Rays ask for
+// no pages: the pixels' and the always-resident ones about the eye answer
+// them (asked for at GI's footprints, the page tracer took 0.19 ms a frame
+// on voxel_craft where it took 0.01).
 fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
     let none = vec2<f32>(1.0, 0.0);
     let every = RAY_MASK_STATIC | RAY_MASK_MOVABLE;
@@ -5153,10 +5148,6 @@ fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
     if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
     if space != SCENE_SPACE_ANY && space != held { return none; }
     let want = sun_occlusion_level(width);
-    // The current epoch's pages at the footprint's level come for the rays
-    // that could read them.
-    let ask = sun_occlusion_frame.epochs[0].right.w != 0.0 && length(cross(ray.dir, -sun_occlusion_frame.epochs[0].forward.xyz)) <= PAGE_ASK_SINE;
-    if ask { ask_sun_pages(p, width); }
     // The finest level resident at the origin up to the footprint's: its
     // walked band is the shortest, and its texels resolve the most.
     for (var level = 0u; level <= want; level++) {

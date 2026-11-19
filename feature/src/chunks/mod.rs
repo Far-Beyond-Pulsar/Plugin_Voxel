@@ -7120,7 +7120,7 @@ impl ChunkWorld {
             });
         }
         // The sun's occlusion pages: occlusion rays along the sun read them
-        // past their first texels, and ask for those they lack.
+        // past their first texels.
         let o = self
             .sun_occlusion
             .as_ref()
@@ -7138,7 +7138,6 @@ impl ChunkWorld {
                 frame: o.frame.clone(),
                 atlas: o.atlas_view.clone(),
                 pages: o.pages_buffer.clone(),
-                requests: o.requests.clone(),
             },
         }));
     }
@@ -7362,22 +7361,7 @@ impl ChunkWorld {
             .try_take()
             .map_or_else(Default::default, |p| (p.windows, p.rows, Some(p.parts)));
         laps[2] = clock.elapsed().as_secs_f64() * 1e3;
-        // The pages the last frame asked for (its pixels', and those of the
-        // ray streams traced after its draw), back without waiting (when a
-        // slot is free), against what that frame asked by; then this
-        // frame's. (No epoch before the first plan: nothing is read against
-        // one.)
-        if let Some(asking) = o.asking.take() {
-            if let Some(r) = o
-                .request_slots
-                .iter_mut()
-                .find(|r| matches!(r.slot.state, ReachState::Free))
-            {
-                encoder.copy_buffer_to_buffer(&o.requests, 0, &r.slot.buffer, 0, SUN_REQUEST_BYTES);
-                r.slot.state = ReachState::Copied;
-                r.asking = Some(asking);
-            }
-        }
+        // (No epoch before the first plan: nothing is read against one.)
         o.asking = o.pages.current().map(|current| sun_pages::Asking {
             epoch: current.id,
             frame,
@@ -8480,6 +8464,27 @@ impl ChunkWorld {
             );
         }
         helio_core::cpu_scope!("VoxelChunks: draw: reports");
+        // The sun's occlusion pages this frame's pixels asked for, back
+        // without waiting (when a slot is free).
+        if let Some(o) = &mut self.sun_occlusion {
+            if let Some(asking) = o.asking.take() {
+                if let Some(r) = o
+                    .request_slots
+                    .iter_mut()
+                    .find(|r| matches!(r.slot.state, ReachState::Free))
+                {
+                    encoder.copy_buffer_to_buffer(
+                        &o.requests,
+                        0,
+                        &r.slot.buffer,
+                        0,
+                        SUN_REQUEST_BYTES,
+                    );
+                    r.slot.state = ReachState::Copied;
+                    r.asking = Some(asking);
+                }
+            }
+        }
         // Ray reports, back without waiting (a frame's copy when a slot is
         // free): the nodes the sampled hits want, and the Buried nodes rays
         // met.

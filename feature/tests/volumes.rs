@@ -1077,7 +1077,8 @@ fn stream_rays_cross_every_volume() {
 /// world's rays go through both blocks to the ground, space 2's and 3's
 /// meet their own block and never the ground or the other block; a direct
 /// ray (every space, an unrestricted camera's) meets the nearest of all
-/// three. Every hit names its volume.
+/// three (where both blocks meet it at one distance, either). Every hit
+/// names its volume.
 #[test]
 fn stream_rays_see_only_volumes_of_their_space() {
     use helio_frame_api::rays::stream::{space_of_slot, RayClass, SceneRay, SPACE_ANY};
@@ -1185,9 +1186,19 @@ fn stream_rays_see_only_volumes_of_their_space() {
             let index = seen[cpu.index];
             compared += 1;
             by_volume[index] += 1;
+            // The two blocks share their slab and cabin: where both are seen
+            // and meet the ray at one distance, either volume's hit is it.
+            let tie = |traced: usize| {
+                traced != index
+                    && seen.contains(&traced)
+                    && Volumes::new(vec![all[traced].clone()])
+                        .raycast(o, d, 30.0, Matter::All)
+                        .is_some_and(|other| (other.hit.distance - cpu.hit.distance).abs() <= 2e-3)
+            };
+            let traced = scene.ids.iter().position(|id| u32::from(id.0) == h.c >> 18);
             let exact = h.t > 0.0
                 && !h.inside()
-                && (h.c >> 18) == u32::from(scene.ids[index].0)
+                && traced.is_some_and(|t| t == index || tie(t))
                 && (f64::from(h.t) - cpu.hit.distance).abs() <= 2e-3 + cpu.hit.distance * 1e-5;
             if !exact {
                 wrong += 1;
@@ -1200,9 +1211,14 @@ fn stream_rays_see_only_volumes_of_their_space() {
             }
         }
         eprintln!("space {space}: compared {compared} by volume {by_volume:?}, wrong {wrong}");
-        for i in seen {
-            assert!(by_volume[i] > 200, "space {space}: {by_volume:?}");
-        }
+        // (The blocks' common surfaces count as the CPU's nearer one.)
+        assert!(
+            seen.iter()
+                .all(|&i| i == 0 || seen.len() > 1 || by_volume[i] > 200)
+                && (!seen.contains(&0) || by_volume[0] > 200)
+                && (seen == [0] || by_volume[1] + by_volume[2] > 200),
+            "space {space}: {by_volume:?}"
+        );
         assert!(
             wrong * 100 <= compared,
             "space {space}: {wrong} of {compared}"

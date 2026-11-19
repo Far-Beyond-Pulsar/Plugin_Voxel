@@ -28,9 +28,13 @@
 //!   origin once (`ray_enter_runs`, a thread a run) and its rays read that
 //!   row; rays whose origin is outside the volume, or a stream of single
 //!   rays, enter one by one (`ray_enter_nearest`). An occlusion stream's
-//!   short walks keep their entry in their kernel (`ray_occlusion`). The
-//!   surfaces (`ray_surface`) are written once
-//!   every tracer traced, only for the hits that stayed the terrain's.
+//!   short walks keep their entry in their kernel (`ray_occlusion`); one
+//!   along the sun as wide as a page texel walks only its first two texels
+//!   and takes the sun's occlusion pages past that (`paged_occlusion`). The
+//!   surfaces are written once every tracer traced, only for the hits that
+//!   stayed the terrain's, by the stream's detail: `Full` shades a hit as
+//!   the G-buffer's publish shades the face (`ray_surface_full`,
+//!   `voxel_surface`), `Diffuse` takes the cheaper kernel (`ray_surface`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -135,14 +139,12 @@ pub struct RayCut {
 }
 
 /// What occlusion rays read of the sun's occlusion pages
-/// (`helio_light_api::sun_occlusion`) and where they ask for those they
-/// lack.
+/// (`helio_light_api::sun_occlusion`).
 #[derive(Clone)]
 pub(super) struct SunPages {
     pub frame: wgpu::Buffer,
     pub atlas: wgpu::TextureView,
     pub pages: wgpu::Buffer,
-    pub requests: wgpu::Buffer,
 }
 
 impl RayCut {
@@ -384,7 +386,6 @@ impl StreamTracer {
                         resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
                     },
                     entry(65, &cut.sun.pages),
-                    entry(66, &cut.sun.requests),
                 ]);
                 1
             }
