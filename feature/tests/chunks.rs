@@ -5989,8 +5989,10 @@ fn record_streams(
 /// four coarser: 2720 probes, 64 rays each, 174 080 rays) about a ball on
 /// the ground, traced every frame by the stream kernels: the nearest hits,
 /// their surfaces, the entry alone (the same rays a ten-thousandth of a
-/// metre long), each a probe's 64 rays a run from it (`Stream::run`), and
-/// occlusion toward the sun. Frames are pipelined (two in
+/// metre long), each a probe's 64 rays a run from it (`Stream::run`: the
+/// run path, as a stream whose rays share an origin takes it; GI's probe
+/// rays no longer do, each starting behind its probe), and occlusion toward
+/// the sun. Frames are pipelined (two in
 /// flight, none waited for alone: a synchronised harness downclocks), the
 /// streams recorded before the draw on odd frames and after it on even
 /// ones; GPU timestamps, medians in milliseconds. A report: ignored.
@@ -6063,7 +6065,7 @@ fn stream_rays_cost() {
             gpu.queue
                 .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
             buffers.set_count(&gpu.queue, rays.len() as u32);
-            // A probe's 64 rays a run from it, as GI's stream says.
+            // A probe's 64 rays a run from it (the run path).
             let tracer =
                 StreamTracer::new(&gpu.device, *class, TracerId(common::VOXEL_TRACER)).with_run(64);
             tracer.write_frame(eye, |buffer, bytes| {

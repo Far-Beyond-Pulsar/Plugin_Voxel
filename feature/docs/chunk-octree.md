@@ -741,8 +741,9 @@ offers that to its graph (`stream::offer`).
   goes (`on_solid_face`: far past the frames' rounding, so the answer never
   depends on it; as GI's probes on a mesh's surface count as inside).
   Consumers start rays off the surfaces they leave.
-- **Runs from one origin** (`Stream::run`: GI's probe stream, 64 rays a
-  probe). Where a ray starts depends on its direction only when its origin
+- **Runs from one origin** (`Stream::run`: a stream whose rays share an
+  origin, r2's camera rays first; GI's probe rays are not runs, each starts
+  behind its probe along its own direction). Where a ray starts depends on its direction only when its origin
   is outside the volume; inside, placing the origin (`enter_volume`,
   `placing_chunk`, `point_start`, the in-solid and on-face checks) is the
   run's, so `ray_enter_runs` does it once a run, a thread a run (its first
