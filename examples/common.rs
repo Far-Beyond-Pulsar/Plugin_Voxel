@@ -383,7 +383,10 @@ pub fn spawn_light(world: &mut World, light: GpuLight) -> Entity {
 /// buffers hold (the reference path tracer's sum) would restart every frame.
 pub fn update_light(world: &mut World, entity: Entity, light: GpuLight) {
     let row = LightComponent::from(helio_light_api::LightRow::from(light));
-    if world.get::<LightComponent>(entity).is_some_and(|existing| *existing == row) {
+    if world
+        .get::<LightComponent>(entity)
+        .is_some_and(|existing| *existing == row)
+    {
         return;
     }
     if let Some(mut existing) = world.get_mut::<LightComponent>(entity) {
