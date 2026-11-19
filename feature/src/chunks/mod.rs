@@ -325,6 +325,15 @@ const RAY_VOLUME_MOVABLE: u32 = 16;
 /// `RAY_VOLUME_SPACE_SHIFT` of chunk_draw.wgsl: where in `volume.w` a
 /// volume's ray parameters hold its coordinate space slot (8 bits).
 const RAY_VOLUME_SPACE_SHIFT: u32 = 8;
+/// `RAY_VOLUME_FIRST` of chunk_draw.wgsl: the cut's first volume, whose
+/// rays' dispatch multiplies in what the sun's occlusion pages let through
+/// for every volume.
+const RAY_VOLUME_FIRST: u32 = 32;
+/// `RAY_VOLUME_PAGES_SHIFT` of chunk_draw.wgsl: where in the first volume's
+/// `volume.w` the coordinate space of every volume the pages hold is (as a
+/// ray encodes it), or `RAY_PAGES_MIXED`.
+const RAY_VOLUME_PAGES_SHIFT: u32 = 16;
+const RAY_PAGES_MIXED: u32 = 0x1ff;
 
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
@@ -7074,6 +7083,15 @@ impl ChunkWorld {
         self.uploads
             .write(encoder, &self.ray_eye, 0, bytemuck::cast_slice(&[hi, lo]));
         let count = self.volumes.iter().flatten().count() as u32;
+        // The space every volume is in (the pages hold them all), as a ray
+        // encodes it, or mixed.
+        let mut spaces = self.volumes.iter().flatten().map(|v| v.space);
+        let first_space = spaces.next().unwrap_or(0);
+        let pages_space = if spaces.all(|s| s == first_space) {
+            helio_frame_api::rays::stream::space_of_slot(first_space)
+        } else {
+            RAY_PAGES_MIXED
+        };
         let mut volumes = Vec::new();
         for vol in self
             .volumes
@@ -7088,7 +7106,12 @@ impl ChunkWorld {
             let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
             params.cut[2] = u32::MAX;
             params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 }
-                | ((vol.space & 0xff) << RAY_VOLUME_SPACE_SHIFT);
+                | ((vol.space & 0xff) << RAY_VOLUME_SPACE_SHIFT)
+                | if volumes.is_empty() {
+                    RAY_VOLUME_FIRST | (pages_space << RAY_VOLUME_PAGES_SHIFT)
+                } else {
+                    0
+                };
             self.uploads
                 .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
             volumes.push(rays::RayVolume {
@@ -7096,11 +7119,23 @@ impl ChunkWorld {
                 group: self.draw_group(&vol.views.rays, vol, self.camera_view(vol)),
             });
         }
+        // The sun's occlusion pages: occlusion rays along the sun read them
+        // past their first texels, and ask for those they lack.
+        let o = self
+            .sun_occlusion
+            .as_ref()
+            .expect("a camera draw has the sun's occlusion pages");
         self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
             volumes,
             pipelines: self.ray_pipelines.clone(),
             layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
             eye: self.ray_eye.clone(),
+            sun: rays::SunPages {
+                frame: o.frame.clone(),
+                atlas: o.atlas_view.clone(),
+                pages: o.pages_buffer.clone(),
+                requests: o.requests.clone(),
+            },
         }));
     }
 
@@ -7323,7 +7358,22 @@ impl ChunkWorld {
             .try_take()
             .map_or_else(Default::default, |p| (p.windows, p.rows, Some(p.parts)));
         laps[2] = clock.elapsed().as_secs_f64() * 1e3;
-        // (No epoch before the first plan: nothing is read against one.)
+        // The pages the last frame asked for (its pixels', and those of the
+        // ray streams traced after its draw), back without waiting (when a
+        // slot is free), against what that frame asked by; then this
+        // frame's. (No epoch before the first plan: nothing is read against
+        // one.)
+        if let Some(asking) = o.asking.take() {
+            if let Some(r) = o
+                .request_slots
+                .iter_mut()
+                .find(|r| matches!(r.slot.state, ReachState::Free))
+            {
+                encoder.copy_buffer_to_buffer(&o.requests, 0, &r.slot.buffer, 0, SUN_REQUEST_BYTES);
+                r.slot.state = ReachState::Copied;
+                r.asking = Some(asking);
+            }
+        }
         o.asking = o.pages.current().map(|current| sun_pages::Asking {
             epoch: current.id,
             frame,
@@ -8426,27 +8476,6 @@ impl ChunkWorld {
             );
         }
         helio_core::cpu_scope!("VoxelChunks: draw: reports");
-        // The sun's occlusion pages this frame's pixels asked for, back
-        // without waiting (when a slot is free).
-        if let Some(o) = &mut self.sun_occlusion {
-            if let Some(asking) = o.asking.take() {
-                if let Some(r) = o
-                    .request_slots
-                    .iter_mut()
-                    .find(|r| matches!(r.slot.state, ReachState::Free))
-                {
-                    encoder.copy_buffer_to_buffer(
-                        &o.requests,
-                        0,
-                        &r.slot.buffer,
-                        0,
-                        SUN_REQUEST_BYTES,
-                    );
-                    r.slot.state = ReachState::Copied;
-                    r.asking = Some(asking);
-                }
-            }
-        }
         // Ray reports, back without waiting (a frame's copy when a slot is
         // free): the nodes the sampled hits want, and the Buried nodes rays
         // met.

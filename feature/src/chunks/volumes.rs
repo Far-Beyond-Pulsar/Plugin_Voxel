@@ -533,9 +533,10 @@ impl DrawLayouts {
                 entries: &[uniform(58, c), read(59), write(60), read(61)],
             }),
             // A ray stream: its header, rays and hits, the frame (its
-            // origin, the tracer's number), the eye of the cut drawn last
-            // and the rays' and runs' starts; for the surfaces, the surfaces
-            // instead of the starts.
+            // origin, the tracer's number), the eye of the cut drawn last,
+            // the rays' and runs' starts and the sun's occlusion pages (their
+            // frame, atlas, tables and requests); for the surfaces, the
+            // surfaces instead of the starts and pages.
             rays: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("voxel rays"),
                 entries: &[
@@ -546,6 +547,10 @@ impl DrawLayouts {
                     uniform(72, c),
                     write(73),
                     write(74),
+                    uniform(62, c),
+                    super::sun_occlusion_maps_entry(63),
+                    read(65),
+                    write(66),
                 ],
             }),
             ray_surfaces: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

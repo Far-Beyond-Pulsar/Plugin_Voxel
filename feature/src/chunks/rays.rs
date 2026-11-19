@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use glam::DVec3;
 use helio_core::compile::Compiling;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
-use helio_frame_api::rays::stream::{Answers, RayClass, Stream, TracerId};
+use helio_frame_api::rays::stream::{Answers, RayClass, Stream, SurfaceDetail, TracerId};
 
 use super::volumes::DrawLayouts;
 use super::{entry, split};
@@ -53,7 +53,9 @@ pub(super) struct RayPipelines {
     /// A stream in runs from one origin: each run's start.
     enter_runs: wgpu::ComputePipeline,
     occlusion: wgpu::ComputePipeline,
-    surface: wgpu::ComputePipeline,
+    /// The surfaces of a stream's hits, by the detail it asks
+    /// (`SurfaceDetail`): `Diffuse`'s, then `Full`'s.
+    surface: [wgpu::ComputePipeline; 2],
 }
 
 impl RayPipelines {
@@ -88,7 +90,18 @@ impl RayPipelines {
             nearest: compute("voxel nearest rays", &layouts.rays, "ray_nearest"),
             occlusion: compute("voxel occlusion rays", &layouts.rays, "ray_occlusion"),
             enter_runs: compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"),
-            surface: compute("voxel ray surfaces", &layouts.ray_surfaces, "ray_surface"),
+            surface: [
+                compute(
+                    "voxel ray surfaces (diffuse)",
+                    &layouts.ray_surfaces,
+                    "ray_surface",
+                ),
+                compute(
+                    "voxel ray surfaces (full)",
+                    &layouts.ray_surfaces,
+                    "ray_surface_full",
+                ),
+            ],
         }
     }
 }
@@ -111,6 +124,20 @@ pub struct RayCut {
     /// The stream's layouts: the traces' and the surfaces'.
     pub(super) layouts: [wgpu::BindGroupLayout; 2],
     pub(super) eye: wgpu::Buffer,
+    /// The sun's occlusion pages, which answer occlusion rays along the sun
+    /// past their first texels (chunk_draw.wgsl `paged_occlusion`).
+    pub(super) sun: SunPages,
+}
+
+/// What occlusion rays read of the sun's occlusion pages
+/// (`helio_light_api::sun_occlusion`) and where they ask for those they
+/// lack.
+#[derive(Clone)]
+pub(super) struct SunPages {
+    pub frame: wgpu::Buffer,
+    pub atlas: wgpu::TextureView,
+    pub pages: wgpu::Buffer,
+    pub requests: wgpu::Buffer,
 }
 
 impl RayCut {
@@ -226,6 +253,9 @@ struct GpuRayFrame {
 /// when the stream's buffers or the cut's change).
 pub struct StreamTracer {
     class: RayClass,
+    /// The surface detail a nearest-hit stream asks (`Stream::detail`):
+    /// which surface kernel its hits take.
+    detail: SurfaceDetail,
     tracer: TracerId,
     /// The stream's rays a run from one origin (`Stream::run`; 1: none).
     run: u32,
@@ -244,6 +274,7 @@ impl StreamTracer {
     pub fn new(device: &wgpu::Device, class: RayClass, tracer: TracerId) -> Self {
         Self {
             class,
+            detail: SurfaceDetail::Full,
             tracer,
             run: 1,
             frame: device.create_buffer(&wgpu::BufferDescriptor {
@@ -263,6 +294,14 @@ impl StreamTracer {
     /// enter in their walk's kernel and ignore it.
     pub fn with_run(mut self, run: u32) -> Self {
         self.run = run.max(1);
+        self
+    }
+
+    /// A stream whose hits need `detail` of their surface
+    /// (`Stream::detail`): `Diffuse` takes the cheaper kernel, `Full` shades
+    /// a hit as the G-buffer's publish does (chunk_draw.wgsl 8).
+    pub fn with_detail(mut self, detail: SurfaceDetail) -> Self {
+        self.detail = detail;
         self
     }
 
@@ -321,7 +360,17 @@ impl StreamTracer {
         ];
         entries.extend(surfaces.map(|s| entry(70, s)));
         if let Some([starts, runs]) = &starts {
-            entries.extend([entry(73, starts), entry(74, runs)]);
+            entries.extend([
+                entry(73, starts),
+                entry(74, runs),
+                entry(62, &cut.sun.frame),
+                wgpu::BindGroupEntry {
+                    binding: 63,
+                    resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
+                },
+                entry(65, &cut.sun.pages),
+                entry(66, &cut.sun.requests),
+            ]);
         }
         self.cache.bind_group(
             device,
@@ -399,7 +448,7 @@ impl StreamTracer {
             let Some(kernels) = cut.kernels(v.plane) else {
                 continue;
             };
-            pass.set_pipeline(&kernels.surface);
+            pass.set_pipeline(&kernels.surface[usize::from(self.detail == SurfaceDetail::Full)]);
             pass.set_bind_group(0, &v.group, &[]);
             pass.dispatch_workgroups_indirect(stream.header, 0);
         }
@@ -445,7 +494,9 @@ impl VoxelRayPass {
         Self {
             link,
             answers,
-            tracer: StreamTracer::new(device, stream.class, id).with_run(stream.run),
+            tracer: StreamTracer::new(device, stream.class, id)
+                .with_run(stream.run)
+                .with_detail(stream.detail),
             surface,
             name: helio_frame_api::static_name(&name),
             reads: helio_frame_api::static_names(&[stream.header, stream.rays, stream.hits]),

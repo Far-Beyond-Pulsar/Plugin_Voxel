@@ -82,7 +82,8 @@ pub fn scene_ray(
 /// Stream `rays` (of `class`, all but the last `past` rows in its header,
 /// relative to frame origin `frame`) traced by the terrain through the cut
 /// `world` drew last, its hits' rows `before` (none: cleared) beforehand:
-/// its hits and surfaces after (none for an occlusion stream).
+/// its hits and surfaces after (none for an occlusion stream), the
+/// surfaces at `SurfaceDetail::Diffuse` (GI's probes').
 pub fn trace_stream(
     gpu: &Gpu,
     world: &helio_pass_voxel_planet::chunks::ChunkWorld,
@@ -98,6 +99,30 @@ pub fn trace_stream(
     trace_stream_in_runs(gpu, world, class, frame, rays, before, past, 1)
 }
 
+/// [`trace_stream`] of a nearest-hit stream asking its hits' surfaces in
+/// full (`SurfaceDetail::Full`).
+pub fn trace_stream_full(
+    gpu: &Gpu,
+    world: &helio_pass_voxel_planet::chunks::ChunkWorld,
+    frame: glam::DVec3,
+    rays: &[helio_frame_api::rays::stream::SceneRay],
+) -> (
+    Vec<helio_frame_api::rays::stream::SceneHit>,
+    Vec<helio_frame_api::rays::stream::SceneSurface>,
+) {
+    trace_stream_detailed(
+        gpu,
+        world,
+        helio_frame_api::rays::stream::RayClass::Nearest,
+        helio_frame_api::rays::stream::SurfaceDetail::Full,
+        frame,
+        rays,
+        None,
+        0,
+        1,
+    )
+}
+
 /// [`trace_stream`] of a stream whose rays come in runs of `run` from one
 /// origin (`Stream::run`).
 #[allow(clippy::too_many_arguments)]
@@ -105,6 +130,35 @@ pub fn trace_stream_in_runs(
     gpu: &Gpu,
     world: &helio_pass_voxel_planet::chunks::ChunkWorld,
     class: helio_frame_api::rays::stream::RayClass,
+    frame: glam::DVec3,
+    rays: &[helio_frame_api::rays::stream::SceneRay],
+    before: Option<&[helio_frame_api::rays::stream::SceneHit]>,
+    past: usize,
+    run: u32,
+) -> (
+    Vec<helio_frame_api::rays::stream::SceneHit>,
+    Vec<helio_frame_api::rays::stream::SceneSurface>,
+) {
+    trace_stream_detailed(
+        gpu,
+        world,
+        class,
+        helio_frame_api::rays::stream::SurfaceDetail::Diffuse,
+        frame,
+        rays,
+        before,
+        past,
+        run,
+    )
+}
+
+/// [`trace_stream_in_runs`] with the surfaces at `detail`.
+#[allow(clippy::too_many_arguments)]
+pub fn trace_stream_detailed(
+    gpu: &Gpu,
+    world: &helio_pass_voxel_planet::chunks::ChunkWorld,
+    class: helio_frame_api::rays::stream::RayClass,
+    detail: helio_frame_api::rays::stream::SurfaceDetail,
     frame: glam::DVec3,
     rays: &[helio_frame_api::rays::stream::SceneRay],
     before: Option<&[helio_frame_api::rays::stream::SceneHit]>,
@@ -127,7 +181,9 @@ pub fn trace_stream_in_runs(
         0,
         bytemuck::cast_slice(before.unwrap_or(&cleared)),
     );
-    let tracer = StreamTracer::new(&gpu.device, class, TracerId(VOXEL_TRACER)).with_run(run);
+    let tracer = StreamTracer::new(&gpu.device, class, TracerId(VOXEL_TRACER))
+        .with_run(run)
+        .with_detail(detail);
     tracer.write_frame(frame, |buffer, bytes| {
         gpu.queue.write_buffer(buffer, 0, bytes)
     });

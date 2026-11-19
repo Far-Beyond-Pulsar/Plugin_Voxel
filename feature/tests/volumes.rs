@@ -1069,6 +1069,143 @@ fn stream_rays_cross_every_volume() {
     assert!(wrong * 100 <= compared, "{wrong} of {compared}");
 }
 
+/// Coordinate spaces in ray streams (the skill's rules): two blocks placed
+/// at the same place in authored spaces 2 and 3 (a pocket's content and
+/// another's: one cabin, then the same block with a second cabin beside
+/// it), over the ground in the world's space (0). A ray in a space sees only
+/// that space's volumes, the CPU's casts over them alone deciding: the
+/// world's rays go through both blocks to the ground, space 2's and 3's
+/// meet their own block and never the ground or the other block; a direct
+/// ray (every space, an unrestricted camera's) meets the nearest of all
+/// three. Every hit names its volume.
+#[test]
+fn stream_rays_see_only_volumes_of_their_space() {
+    use helio_frame_api::rays::stream::{space_of_slot, RayClass, SceneRay, SPACE_ANY};
+    let Some(gpu) = gpu() else { return };
+    let (earth, at, ground, up, side) = wall_and_block();
+    let mut second = block();
+    second
+        .apply(Brush {
+            center: [3.5, 2.0, 1.0],
+            radius: 0.8,
+            shape: BrushShape::Cube,
+            op: BrushOp::Add,
+            material: material::BRICK,
+            height: 0.0,
+        })
+        .unwrap();
+    let all = [
+        VoxelVolume::new(1, earth, VolumeTransform::IDENTITY),
+        VoxelVolume::new(5, Arc::new(block()), at).in_space(2),
+        VoxelVolume::new(7, Arc::new(second), at).in_space(3),
+    ];
+    let volumes = Volumes::new(all.to_vec());
+    let fwd = up.cross(side);
+    let eye = ground - fwd * 9.0 + up * 2.0 - side * 3.0;
+    let camera = Camera {
+        eye,
+        forward: (at.position - eye).normalize().as_vec3(),
+        up: up.as_vec3(),
+        size: [320, 180],
+    };
+    let mut scene = Scene::new(gpu, &volumes);
+    scene.world.want_rays();
+    scene
+        .world
+        .wait_for_pipelines()
+        .expect("the ray kernels compile");
+    scene.settle(gpu, &camera);
+    let origins: Vec<DVec3> = (0..24 * 24 * 24)
+        .map(|n| probe_place(eye, 0, glam::I64Vec3::new(n % 24, (n / 24) % 24, n / 576)))
+        .filter(|&o| o.distance(at.position) < 8.0 && !volumes.solid(o, Matter::All))
+        .take(300)
+        .collect();
+    let mut next = xorshift(0x51ed_270b_2c1b_3c6d);
+    let mut unit = || loop {
+        let v =
+            DVec3::new(next() as f64, next() as f64, next() as f64) / u64::MAX as f64 * 2.0 - 1.0;
+        if v.length_squared() > 1e-4 && v.length_squared() <= 1.0 {
+            return v.normalize();
+        }
+    };
+    let rays: Vec<(DVec3, DVec3)> = origins
+        .iter()
+        .flat_map(|&o| std::iter::repeat_n(o, 32))
+        .map(|o| (o, unit()))
+        .collect();
+    let frame = eye + DVec3::new(-3.0, 1.25, 0.5);
+    let view_proj = camera.view_proj();
+    let near = 0.7 * 0.1 / camera.pixel_angle();
+    // (ray space, the volumes it sees by index into `all`).
+    let cases = [
+        (space_of_slot(0), vec![0usize]),
+        (space_of_slot(2), vec![1]),
+        (space_of_slot(3), vec![2]),
+        (SPACE_ANY, vec![0, 1, 2]),
+    ];
+    for (space, seen) in cases {
+        let visible = Volumes::new(seen.iter().map(|&i| all[i].clone()).collect());
+        let stream: Vec<SceneRay> = rays
+            .iter()
+            .map(|&(o, d)| common::scene_ray(frame, o, d, 1e30, 0.0).in_space(space))
+            .collect();
+        let (hits, _) = common::trace_stream(
+            gpu,
+            &scene.world,
+            RayClass::Nearest,
+            frame,
+            &stream,
+            None,
+            0,
+        );
+        let (mut compared, mut wrong, mut by_volume) = (0, 0, [0usize; 3]);
+        for (k, &(o, d)) in rays.iter().enumerate() {
+            let h = &hits[k];
+            let Some(cpu) = visible.raycast(o, d, 30.0, Matter::All) else {
+                // Nothing of its space within 30 m: no hit nearer.
+                if h.t > 0.0 && f64::from(h.t) < 29.0 {
+                    wrong += 1;
+                }
+                continue;
+            };
+            let hit_at = o + d * cpu.hit.distance;
+            let clip = view_proj * (hit_at - eye).as_vec3().extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            if clip.w <= 0.0
+                || ndc.x.abs() > 0.95
+                || ndc.y.abs() > 0.95
+                || (hit_at - eye).length() > near
+            {
+                continue;
+            }
+            let index = seen[cpu.index];
+            compared += 1;
+            by_volume[index] += 1;
+            let exact = h.t > 0.0
+                && !h.inside()
+                && (h.c >> 18) == u32::from(scene.ids[index].0)
+                && (f64::from(h.t) - cpu.hit.distance).abs() <= 2e-3 + cpu.hit.distance * 1e-5;
+            if !exact {
+                wrong += 1;
+                if wrong < 6 {
+                    eprintln!(
+                        "space {space} ray {k}: traced {h:?}, cpu volume {} at {}",
+                        cpu.id, cpu.hit.distance
+                    );
+                }
+            }
+        }
+        eprintln!("space {space}: compared {compared} by volume {by_volume:?}, wrong {wrong}");
+        for i in seen {
+            assert!(by_volume[i] > 200, "space {space}: {by_volume:?}");
+        }
+        assert!(
+            wrong * 100 <= compared,
+            "space {space}: {wrong} of {compared}"
+        );
+    }
+}
+
 /// Level `level`'s probe `at` (0..24 an axis) of GI's probe clipmap about
 /// `eye` as GI lays it out (24 a side, each level twice as far apart as the
 /// one inside it, `PROBE_SPACING` the finest): a set of ray origins in open
