@@ -6234,13 +6234,28 @@ fn a_plane_traces_stream_rays() {
 /// step to the next pixel's ray), decodes to the surface the publish wrote
 /// there, field by field within the two encodings' precision: base colour,
 /// metalness, roughness, reflectance, emission, flags, what it lets
-/// through, the shading normal. The texel's occlusion is the hit's times
+/// through (on the ball's and a block of leaves' two-sided cells, their
+/// transmission share of their colour, in the texel as in the hit, not
+/// their whole colour), the shading normal. A block of leaves stands
+/// beside the ball. The texel's occlusion is the hit's times
 /// the screen's sky samples (a hit has none): at most the hit's.
 #[test]
 fn full_stream_surfaces_are_the_gbuffer_texels() {
     use helio_frame_api::rays::stream::{unpack_radiance, unpack_unit};
     let Some(gpu) = gpu() else { return };
-    let (planet, eye, view, _, _) = ball_ground();
+    let (mut planet, eye, view, up, ground) = ball_ground();
+    // And a block of leaves beside the ball (thin two-sided foliage).
+    let side = up.any_orthonormal_vector();
+    planet
+        .apply(Brush {
+            center: (ground + up.cross(side) * 1.5 - side * 1.6 + up * 0.6).to_array(),
+            radius: 0.6,
+            shape: BrushShape::Cube,
+            op: BrushOp::Add,
+            material: material::LEAVES,
+            height: 0.0,
+        })
+        .unwrap();
     let mut appearance = planet.field().appearance();
     appearance.materials[material::BRICK as usize].emission = 3.0;
     appearance.materials[material::BRICK as usize].transmission = 0.4;
@@ -6302,7 +6317,7 @@ fn full_stream_surfaces_are_the_gbuffer_texels() {
             }
             let d = view.pixel_dir(view_proj, x, y);
             let spread = (view.pixel_dir(view_proj, x + 1, y) - d).length();
-            pixels.push((at, hit.distance));
+            pixels.push((at, hit.distance, hit.material));
             rays.push(common::scene_ray(eye, eye, d, 1e30, spread as f32));
         }
     }
@@ -6310,7 +6325,8 @@ fn full_stream_surfaces_are_the_gbuffer_texels() {
     let unorm = |b: u8| f32::from(b) / 255.0;
     let (mut compared, mut balls, mut wrong) = (0usize, 0usize, Vec::<&str>::new());
     let mut worst_normal = 1.0f32;
-    for (k, &(at, distance)) in pixels.iter().enumerate() {
+    let mut leaves = 0usize;
+    for (k, &(at, distance, m)) in pixels.iter().enumerate() {
         // The same hit (a pixel along an edge may meet the next cell).
         if !terrain_hit(&traced[k]).is_some_and(|(t, _)| (t - distance).abs() < 1e-3) {
             continue;
@@ -6345,6 +6361,18 @@ fn full_stream_surfaces_are_the_gbuffer_texels() {
         if (0..3).any(|c| !near(through[c], sss[c][at], sss[c][at] / 128.0 + 2e-3)) {
             bad.push("let through");
         }
+        // A two-sided cell lets through its share of its colour, the
+        // texel's as the hit's (not its whole colour).
+        let share = appearance.materials[m as usize]
+            .transmission
+            .clamp(0.0, 1.0);
+        if share > 0.0
+            && (s.flags() == 0
+                || (0..3).any(|c| !near(sss[c][at], share * unorm(albedo[at][c]), 2.0 / 255.0)))
+        {
+            bad.push("share let through");
+        }
+        leaves += usize::from(m == material::LEAVES);
         let n = unpack_unit(s.normal);
         let texel_n = glam::Vec3::new(normal[0][at], normal[1][at], normal[2][at]).normalize();
         let cos = glam::Vec3::from_array(n).dot(texel_n);
@@ -6368,9 +6396,10 @@ fn full_stream_surfaces_are_the_gbuffer_texels() {
         wrong.len(),
         wrong.iter().take(16).collect::<Vec<_>>()
     );
+    eprintln!("{leaves} on the leaves");
     assert!(
-        compared > 2000 && balls > 100,
-        "{compared} compared, {balls} on the ball"
+        compared > 2000 && balls > 100 && leaves > 50,
+        "{compared} compared, {balls} two-sided, {leaves} leaves"
     );
     assert!(
         wrong.len() * 200 <= compared,
