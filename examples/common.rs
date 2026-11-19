@@ -341,7 +341,7 @@ pub fn update_object_transform(
     entity: Entity,
     transform: Mat4,
 ) -> SceneResult<()> {
-    let Some(mut object) = world.get_mut::<StaticObjectComponent>(entity) else {
+    let Some(object) = world.get::<StaticObjectComponent>(entity).map(|o| *o) else {
         return Err("object entity has no StaticObjectComponent");
     };
     let bounds = [
@@ -350,7 +350,14 @@ pub fn update_object_transform(
         transform.w_axis.z,
         object.bounds[3],
     ];
-    *object = object.with_transform(transform, bounds).into();
+    let moved: StaticObjectComponent = object.with_transform(transform, bounds).into();
+    // An object already there is left alone (a write marks the row changed
+    // even when equal: see `update_light`).
+    if moved != object {
+        if let Some(mut row) = world.get_mut::<StaticObjectComponent>(entity) {
+            *row = moved;
+        }
+    }
     Ok(())
 }
 
@@ -370,9 +377,20 @@ pub fn spawn_light(world: &mut World, light: GpuLight) -> Entity {
 /// Replace a previously spawned light's parameters in the World. SceneDB's
 /// insert-time GPU mirroring uploads the change automatically; no per-frame
 /// resubmission step exists to call anymore.
+///
+/// A light whose row is already `light` is left alone: a write marks the
+/// row changed even when equal, and what keeps results while the scene's
+/// buffers hold (the reference path tracer's sum) would restart every frame.
 pub fn update_light(world: &mut World, entity: Entity, light: GpuLight) {
+    let row = LightComponent::from(helio_light_api::LightRow::from(light));
+    if world
+        .get::<LightComponent>(entity)
+        .is_some_and(|existing| *existing == row)
+    {
+        return;
+    }
     if let Some(mut existing) = world.get_mut::<LightComponent>(entity) {
-        *existing = LightComponent::from(helio_light_api::LightRow::from(light));
+        *existing = row;
     }
 }
 
