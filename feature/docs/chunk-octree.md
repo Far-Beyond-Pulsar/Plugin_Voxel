@@ -830,7 +830,7 @@ offers that to its graph (`stream::offer`).
     2,573 receivers differ, every level within 0.02.
   - Cost: GI's 45,466 sun rays from its probe rays' hits, walked whole 0.60
     ms, answered so 0.14 to 0.15 (`stream_rays_cost`); in voxel_craft
-    VoxelRays gi_shadow COSTCRAFT.
+    VoxelRays gi_shadow 0.20-0.23 ms against 0.41-0.42 walked (r1).
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
   they came, or a form's ray kernels still compiling: `RayLink::complete`;
