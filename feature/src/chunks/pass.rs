@@ -543,6 +543,7 @@ impl ChunkPass {
             if let Some(sync) = synced {
                 let mut h = self.held.swap_remove(at.unwrap());
                 world.set_transform(h.volume, v.volume.transform);
+                world.set_space(h.volume, v.volume.space);
                 let look = (v.appearance, clean_smoothing(v.smoothing));
                 if h.look != look {
                     world.set_appearance(
@@ -566,6 +567,7 @@ impl ChunkPass {
                 world.remove_volume(self.held.swap_remove(n).volume);
             }
             let volume = world.add_volume(v.volume.id, planet, v.volume.transform);
+            world.set_space(volume, v.volume.space);
             let look = (v.appearance, clean_smoothing(v.smoothing));
             if look.0.is_some() || look.1 != 0.0 {
                 world.set_appearance(

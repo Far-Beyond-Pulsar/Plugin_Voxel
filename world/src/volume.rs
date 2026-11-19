@@ -88,15 +88,26 @@ pub struct VoxelVolume {
     pub id: u64,
     pub planet: Arc<Planet>,
     pub transform: VolumeTransform,
+    /// The authored coordinate space slot it is in (0: the world): what a
+    /// ray of another space does not see.
+    pub space: u32,
 }
 
 impl VoxelVolume {
+    /// A volume in the world's space.
     pub fn new(id: u64, planet: Arc<Planet>, transform: VolumeTransform) -> Self {
         Self {
             id,
             planet,
             transform,
+            space: 0,
         }
+    }
+
+    /// The volume in coordinate space slot `space`.
+    pub fn in_space(mut self, space: u32) -> Self {
+        self.space = space;
+        self
     }
 }
 

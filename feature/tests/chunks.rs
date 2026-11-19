@@ -5295,8 +5295,12 @@ fn surface_errors(
     if (f64::from(s.roughness()) - roughness).abs() > 1.0 / 255.0 {
         out.push("roughness");
     }
-    let through = (m.transmission.clamp(0.0, 1.0) * 255.0).round() / 255.0;
-    if (s.transmission() - through).abs() > 0.5 / 255.0 {
+    // The share let through from behind, tinted by its colour (the frame's
+    // two-sided surface: `SURFACE_FLAG_TWO_SIDED`).
+    let share = m.transmission.clamp(0.0, 1.0);
+    let through = s.transmission();
+    if (0..3).any(|c| (through[c] - base[c] * share).abs() > 1.0 / 255.0 + base[c] * share / 256.0)
+    {
         out.push("transmission");
     }
     let emitted = unpack_radiance(s.emissive);
@@ -5881,6 +5885,59 @@ fn terrain_traces_occlusion_streams() {
     );
     assert!(wrong * 50 <= compared, "{wrong} of {compared}");
     assert_eq!(lost, 0);
+}
+
+/// A volume authored in coordinate space 3 answers the rays of every space
+/// and of its own, row for row the same, and no ray of another space (the
+/// world's, or one with nothing in it), nearest-hit or occlusion: the same
+/// place in another space holds nothing of it.
+#[test]
+fn a_volume_answers_only_rays_of_its_space() {
+    use helio_frame_api::rays::stream::{space_of_slot, SPACE_ANY};
+    let Some(gpu) = gpu() else { return };
+    let (planet, eye, view, _, _) = ball_ground();
+    let mut world = ray_world(gpu, &planet);
+    let volume = world.chunks.primary().expect("one volume");
+    world.chunks.set_space(volume, 3);
+    world.settle(gpu, &planet, &view);
+    let frame = eye - DVec3::new(1.25, 0.5, -2.0);
+    let view_proj = view.view_proj(&planet);
+    let mut base = Vec::new();
+    for y in (0..180).step_by(6) {
+        for x in (0..320).step_by(6) {
+            let d = view.pixel_dir(view_proj, x, y);
+            if planet.raycast(eye, d, 15.0).is_some() {
+                base.push(common::scene_ray(frame, eye, d, 15.0, 0.0));
+            }
+        }
+    }
+    assert!(base.len() > 200, "{} rays meet the ground", base.len());
+    let in_space =
+        |space: u32| -> Vec<SceneRay> { base.iter().map(|r| r.in_space(space)).collect() };
+    for class in [RayClass::Nearest, RayClass::Occlusion] {
+        let trace = |rays: &[SceneRay]| {
+            common::trace_stream(gpu, &world.chunks, class, frame, rays, None, 0).0
+        };
+        let any = trace(&in_space(SPACE_ANY));
+        let own = trace(&in_space(space_of_slot(3)));
+        let met = any.iter().filter(|h| h.t > 0.0).count();
+        assert!(
+            met * 10 >= base.len() * 9,
+            "{class:?}: {met} of {}",
+            base.len()
+        );
+        assert_eq!(
+            any, own,
+            "{class:?}: its own space sees what every space does"
+        );
+        for other in [space_of_slot(0), space_of_slot(5)] {
+            let hits = trace(&in_space(other));
+            assert!(
+                hits.iter().all(|h| *h == SceneHit::default()),
+                "{class:?}: space {other} sees the volume of space 3"
+            );
+        }
+    }
 }
 
 /// A plane (one affine frame: rays are placed by its anchor) traces ray

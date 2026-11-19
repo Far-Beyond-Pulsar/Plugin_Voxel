@@ -322,6 +322,9 @@ type AnchorColumn = ((u8, i32, i32), u32, bool);
 /// `RAY_VOLUME_MOVABLE` of chunk_draw.wgsl: a volume's ray parameters'
 /// `volume.w` when it has moved since it was added.
 const RAY_VOLUME_MOVABLE: u32 = 16;
+/// `RAY_VOLUME_SPACE_SHIFT` of chunk_draw.wgsl: where in `volume.w` a
+/// volume's ray parameters hold its coordinate space slot (8 bits).
+const RAY_VOLUME_SPACE_SHIFT: u32 = 8;
 
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
@@ -3044,7 +3047,7 @@ fn draw_source(plane: bool, counting: bool) -> String {
     let source = |rel: &str, embedded: &'static str| {
         helio_core::shader::hot::source_text(env!("CARGO_MANIFEST_DIR"), rel, embedded)
     };
-    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
+    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_frame_api::rays::stream::SURFACE_SNIPPET.source + helio_frame_api::gbuffer::SURFACE_SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
         .replace("COUNTERS", if counting { "@group(0) @binding(9) var<storage, read_write> counters: array<atomic<u32>, 256>;" } else { "" })
         .replace("WCOUNT(1)", &wcount(1))
         .replace("WCOUNT(3)", &wcount(3))
@@ -7084,7 +7087,8 @@ impl ChunkWorld {
                 .map_or(vol.transform, |(_, t)| *t);
             let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
             params.cut[2] = u32::MAX;
-            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 };
+            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 }
+                | ((vol.space & 0xff) << RAY_VOLUME_SPACE_SHIFT);
             self.uploads
                 .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
             volumes.push(rays::RayVolume {

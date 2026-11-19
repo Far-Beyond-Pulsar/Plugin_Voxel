@@ -108,6 +108,9 @@ pub(super) struct Volume {
     /// Whether it has moved since it was added (rays of movable casters see
     /// it, `chunks::rays`; else those of static ones).
     pub movable: bool,
+    /// The authored coordinate space slot it is in (0: the world): rays of
+    /// another space do not see it (`chunks::rays`).
+    pub space: u32,
     /// The transform each eye's last draw placed it with (its hits' motion
     /// from there), and where the eye was in its frame at the last update,
     /// with the transform then and when (its motion relative to the eye).
@@ -1200,6 +1203,7 @@ impl ChunkWorld {
             index: index16,
             transform,
             movable: false,
+            space: 0,
             drawn_transform: [None; 2],
             last_local_eye: None,
             grid,
@@ -1350,6 +1354,15 @@ impl ChunkWorld {
         if let Some(vol) = self.volume_mut(id) {
             vol.movable |= vol.transform != transform;
             vol.transform = transform;
+        }
+    }
+
+    /// Volume `id` is authored in coordinate space slot `space` (0: the
+    /// world; `pulsar_scene_model::frames::space_of`): a ray stream's rays
+    /// of another space do not see it.
+    pub fn set_space(&mut self, id: VolumeId, space: u32) {
+        if let Some(vol) = self.volume_mut(id) {
+            vol.space = space;
         }
     }
 

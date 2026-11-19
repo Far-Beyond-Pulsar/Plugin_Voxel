@@ -689,7 +689,8 @@ fn publish_frame(world: &World, problems: &mut Vec<String>) -> Option<Arc<Planet
                 entity.bits(),
                 built.planet.clone(),
                 VolumeTransform::IDENTITY,
-            ),
+            )
+            .in_space(pulsar_scene_model::frames::space_of(world, owner)),
             kept: built.kept.clone(),
             appearance,
             smoothing: terrain.smoothness,

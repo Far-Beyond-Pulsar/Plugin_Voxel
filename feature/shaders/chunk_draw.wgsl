@@ -2222,7 +2222,6 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
     let pixel_m = pixel_width(vec2<u32>(pixel.xy), size, t);
     let look = surface_look(v.x, cell, axis, sign, material, position, pixel_m, vec2<u32>(pixel.xy));
     let f0 = 0.03;
-    var out: GBufferDepthOutput;
     var albedo = look.albedo;
     let row = slot_material(material);
     var roughness = row.roughness_metallic.x;
@@ -2254,31 +2253,30 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
         albedo = mix(albedo, vec3<f32>(0.78, 0.84, 0.84), edge_foam * 0.72);
         roughness = mix(roughness, 0.09, max(film, wetness * 0.8));
     }
-    out.albedo = vec4<f32>(albedo, 1.0);
     if debug_mode() == 32u {
         let h = f32((v.y >> 26u) & 63u) * 3.0 / 64.0;
-        let cost = clamp(vec3<f32>(h, h - 1.0, h - 2.0), vec3<f32>(0.0), vec3<f32>(1.0));
-        out.albedo = vec4<f32>(cost, 1.0);
+        albedo = clamp(vec3<f32>(h, h - 1.0, h - 2.0), vec3<f32>(0.0), vec3<f32>(1.0));
     }
     if debug_mode() == 1u {
         let uv = voxel_face_uv(c, cell, axis, position);
-        out.albedo = vec4<f32>(textureSample(uv_reference_texture, uv_reference_sampler, uv).rgb, 1.0);
+        albedo = textureSample(uv_reference_texture, uv_reference_sampler, uv).rgb;
     }
     // Environment-only level diagnostics (`HELIO_VOXEL_CHUNKS_LEVELS`).
     if voxel_levels_debug() && (!voxel_levels_half_debug() || p.x < i32(size.x / 2u)) {
-        out.albedo = vec4<f32>(level_colour(u32(key_level(chunk_keys[v.x].x)) & 31u), 1.0);
+        albedo = level_colour(u32(key_level(chunk_keys[v.x].x)) & 31u);
     }
-    out.normal = vec4<f32>(to_world(normal), f0);
-    out.orm = vec4<f32>(look.ao * textureLoad(hit_sky, p, 0).r * occlusion, clamp(roughness, 0.04, 1.0), 0.0, f0);
-    out.emissive = vec4<f32>(emissive, f0);
-    // Terrain tag consumed by deferred lighting (skips screen-space AO).
-    out.surface = GBUFFER_TAG_TRACED;
+    // The frame's surface (`//!use frame_surface`): not metallic, a
+    // dielectric's reflectance, the cell's occlusion (its own, the sky's
+    // share and the scene material's).
+    var surface = surface_data(albedo, to_world(normal), clamp(roughness, 0.04, 1.0), 0.0, emissive);
+    surface.specular_f0 = vec3<f32>(f0);
+    surface.ao = look.ao * textureLoad(hit_sky, p, 0).r * occlusion;
     // Materials that let light through are two-sided foliage: the sun from
     // behind comes through tinted by their colour (its share through the
     // leaf and those past it is the sun's visibility: `shadow_fallback`).
-    let through = material_transmission(slot_material(material));
-    out.sss = vec4<f32>(select(vec3<f32>(0.0), albedo, through > 0.0), 0.0);
-    out.extra = vec4<f32>(0.0, 0.0, 0.0, select(0.0, f32(SURFACE_FLAG_TWO_SIDED), through > 0.0));
+    if material_transmission(slot_material(material)) > 0.0 {
+        surface = surface_with_transmission(surface, albedo);
+    }
     // A still volume: w 0 (helio-pass-tsr MOTION_VECTORS) leaves its
     // motion, the camera's, to TSR, which derives it from depth at full
     // precision. These eye-relative matrices are f32 products that cancel
@@ -2291,9 +2289,9 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
         let ndc = previous.xy / previous.w;
         velocity = pixel.xy - (vec2<f32>(ndc.x, -ndc.y) * 0.5 + 0.5) * vec2<f32>(size);
     }
-    out.velocity = vec4<f32>(velocity, 0.0, select(0.0, 1.0, (params.volume.w & 2u) != 0u));
-    out.depth = clip.z / clip.w;
-    return out;
+    // Terrain tag consumed by deferred lighting (skips screen-space AO).
+    return gbuffer_depth_output(surface, GBUFFER_TAG_TRACED,
+        vec4<f32>(velocity, 0.0, select(0.0, 1.0, (params.volume.w & 2u) != 0u)), clip.z / clip.w);
 }
 
 // ---- 4. Sun shadows ----
@@ -4839,15 +4837,21 @@ struct RayEye {
 @group(1) @binding(72) var<uniform> ray_eye: RayEye;
 
 // `params.volume.w` of a volume's ray parameters: it has moved since it was
-// added (rays of `RAY_MASK_MOVABLE` see it; else `RAY_MASK_STATIC`).
+// added (rays of `RAY_MASK_MOVABLE` see it; else `RAY_MASK_STATIC`); and,
+// in bits 8..16 (`RAY_VOLUME_SPACE_SHIFT`), the authored coordinate space
+// slot it is in (0: the world).
 const RAY_VOLUME_MOVABLE: u32 = 16u;
+const RAY_VOLUME_SPACE_SHIFT: u32 = 8u;
 
 // Whether ray `ray` is one this volume answers: a ray in its row, of a
-// caster mask this volume is in.
+// caster mask this volume is in, in a coordinate space that sees the
+// volume's (`scene_ray_sees_space`): a volume at the same place in another
+// space is not there for it.
 fn stream_sees(ray: SceneRay) -> bool {
     let movable = (params.volume.w & RAY_VOLUME_MOVABLE) != 0u;
     let mask = select(RAY_MASK_STATIC, RAY_MASK_MOVABLE, movable);
-    return ray.t_max > 0.0 && (scene_ray_mask(ray) & mask) != 0u;
+    let space = (params.volume.w >> RAY_VOLUME_SPACE_SHIFT) & 0xffu;
+    return ray.t_max > 0.0 && (scene_ray_mask(ray) & mask) != 0u && scene_ray_sees_space(ray, space);
 }
 
 // Ray `ray`'s origin eye-relative in the volume's frame.
@@ -5128,5 +5132,11 @@ fn ray_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     // colour is (the publish's).
     let base = row.base_color.rgb;
     let emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
-    stream_surfaces[id.x] = scene_surface(to_world(shading), to_world(normal), albedo, 0.0, clamp(row.roughness_metallic.x, 0.04, 1.0), material_transmission(row), emissive);
+    // The frame's surface (`//!use frame_surface`) as the publish fills it:
+    // a dielectric's reflectance, not metallic; a leaf lets its share of
+    // the light behind it through, tinted by its colour.
+    var surface = surface_data(albedo, to_world(shading), clamp(row.roughness_metallic.x, 0.04, 1.0), 0.0, emissive);
+    surface.specular_f0 = vec3<f32>(0.03);
+    surface = surface_with_transmission(surface, albedo * material_transmission(row));
+    stream_surfaces[id.x] = scene_surface_pack(surface, to_world(normal));
 }

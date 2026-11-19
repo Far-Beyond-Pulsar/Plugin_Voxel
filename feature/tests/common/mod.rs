@@ -67,16 +67,16 @@ pub fn scene_ray(
     t_max: f32,
     spread: f32,
 ) -> helio_frame_api::rays::stream::SceneRay {
-    helio_frame_api::rays::stream::SceneRay {
-        origin: (from - frame).as_vec3().to_array(),
+    helio_frame_api::rays::stream::SceneRay::new(
+        (from - frame).as_vec3().to_array(),
         t_max,
-        dir: dir.as_vec3().to_array(),
-        cone: helio_frame_api::rays::stream::SceneRay::cone(
+        dir.as_vec3().to_array(),
+        helio_frame_api::rays::stream::SceneRay::cone(
             0.0,
             spread,
             helio_frame_api::rays::stream::MASK_ALL,
         ),
-    }
+    )
 }
 
 /// Stream `rays` (of `class`, all but the last `past` rows in its header,
