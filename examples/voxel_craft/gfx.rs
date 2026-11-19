@@ -693,12 +693,25 @@ impl Gfx {
             view.time,
             hand,
         );
+        // The feet move the grass only when they move (a write marks the row
+        // changed even when equal: see `update_light`).
         if let Some(mut feet) = self
             .scene
             .world
-            .get_mut::<FoliageInteractorComponent>(self.feet)
+            .get::<FoliageInteractorComponent>(self.feet)
+            .map(|f| *f)
         {
+            let before = feet;
             feet.set_motion(view.player.position, view.player.velocity.as_vec3());
+            if feet != before {
+                if let Some(mut row) = self
+                    .scene
+                    .world
+                    .get_mut::<FoliageInteractorComponent>(self.feet)
+                {
+                    *row = feet;
+                }
+            }
         }
         self.renderer.debug_clear();
         for (a, b) in view.outline {
