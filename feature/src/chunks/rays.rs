@@ -88,7 +88,11 @@ impl RayPipelines {
                 "ray_enter_nearest",
             ),
             nearest: compute("voxel nearest rays", &layouts.rays, "ray_nearest"),
-            occlusion: compute("voxel occlusion rays", &layouts.rays, "ray_occlusion"),
+            occlusion: compute(
+                "voxel occlusion rays",
+                &layouts.ray_occlusion,
+                "ray_occlusion",
+            ),
             enter_runs: compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"),
             surface: [
                 compute(
@@ -121,8 +125,9 @@ pub(super) struct RayVolume {
 pub struct RayCut {
     pub(super) volumes: Vec<RayVolume>,
     pub(super) pipelines: [Option<Arc<Compiling<RayPipelines>>>; 2],
-    /// The stream's layouts: the traces' and the surfaces'.
-    pub(super) layouts: [wgpu::BindGroupLayout; 2],
+    /// The stream's layouts: a nearest-hit stream's trace, an occlusion
+    /// stream's, the surfaces'.
+    pub(super) layouts: [wgpu::BindGroupLayout; 3],
     pub(super) eye: wgpu::Buffer,
     /// The sun's occlusion pages, which answer occlusion rays along the sun
     /// past their first texels (chunk_draw.wgsl `paged_occlusion`).
@@ -343,14 +348,17 @@ impl StreamTracer {
         write(&self.frame, bytemuck::bytes_of(&frame));
     }
 
+    /// The bind group of `stream`'s trace (`surface` false) or its surfaces'
+    /// pass, through `cut`.
     fn group(
         &self,
         device: &wgpu::Device,
         cut: &RayCut,
         stream: StreamBindings<'_>,
-        surfaces: Option<&wgpu::Buffer>,
+        surface: bool,
     ) -> wgpu::BindGroup {
-        let starts = surfaces.is_none().then(|| self.starts(device, stream.rays));
+        let starts =
+            (self.class == RayClass::Nearest && !surface).then(|| self.starts(device, stream.rays));
         let mut entries = vec![
             entry(67, stream.header),
             entry(68, stream.rays),
@@ -358,25 +366,34 @@ impl StreamTracer {
             entry(71, &self.frame),
             entry(72, &cut.eye),
         ];
-        entries.extend(surfaces.map(|s| entry(70, s)));
-        if let Some([starts, runs]) = &starts {
-            entries.extend([
-                entry(73, starts),
-                entry(74, runs),
-                entry(62, &cut.sun.frame),
-                wgpu::BindGroupEntry {
-                    binding: 63,
-                    resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
-                },
-                entry(65, &cut.sun.pages),
-                entry(66, &cut.sun.requests),
-            ]);
-        }
+        let layout = match (self.class, stream.surfaces) {
+            (RayClass::Nearest, Some(surfaces)) if surface => {
+                entries.push(entry(70, surfaces));
+                2
+            }
+            (RayClass::Nearest, _) => {
+                let [starts, runs] = starts.as_ref().expect("a trace's starts");
+                entries.extend([entry(73, starts), entry(74, runs)]);
+                0
+            }
+            _ => {
+                entries.extend([
+                    entry(62, &cut.sun.frame),
+                    wgpu::BindGroupEntry {
+                        binding: 63,
+                        resource: wgpu::BindingResource::TextureView(&cut.sun.atlas),
+                    },
+                    entry(65, &cut.sun.pages),
+                    entry(66, &cut.sun.requests),
+                ]);
+                1
+            }
+        };
         self.cache.bind_group(
             device,
             &wgpu::BindGroupDescriptor {
                 label: Some("voxel rays"),
-                layout: &cut.layouts[usize::from(surfaces.is_some())],
+                layout: &cut.layouts[layout],
                 entries: &entries,
             },
         )
@@ -393,7 +410,7 @@ impl StreamTracer {
         stream: StreamBindings<'_>,
         timing: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
-        let group = self.group(device, cut, stream, None);
+        let group = self.group(device, cut, stream, false);
         // The runs' starts: a thread a run, over as many as the rays' rows
         // hold (those past the header's count return at once).
         let rows = stream.rays.size() / helio_frame_api::rays::stream::SceneRay::BYTES;
@@ -435,10 +452,10 @@ impl StreamTracer {
         stream: StreamBindings<'_>,
         timing: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) {
-        let (RayClass::Nearest, Some(surfaces)) = (self.class, stream.surfaces) else {
+        if self.class != RayClass::Nearest || stream.surfaces.is_none() {
             return;
-        };
-        let group = self.group(device, cut, stream, Some(surfaces));
+        }
+        let group = self.group(device, cut, stream, true);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("voxel ray surfaces"),
             timestamp_writes: timing,

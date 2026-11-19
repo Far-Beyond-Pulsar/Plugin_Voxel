@@ -7128,7 +7128,11 @@ impl ChunkWorld {
         self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
             volumes,
             pipelines: self.ray_pipelines.clone(),
-            layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
+            layouts: [
+                self.layouts.rays.clone(),
+                self.layouts.ray_occlusion.clone(),
+                self.layouts.ray_surfaces.clone(),
+            ],
             eye: self.ray_eye.clone(),
             sun: rays::SunPages {
                 frame: o.frame.clone(),

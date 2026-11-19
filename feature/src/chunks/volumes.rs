@@ -270,6 +270,7 @@ pub(super) struct DrawLayouts {
     pub feedback: wgpu::BindGroupLayout,
     /// A ray stream's traces and its surfaces (`chunks::rays`).
     pub rays: wgpu::BindGroupLayout,
+    pub ray_occlusion: wgpu::BindGroupLayout,
     pub ray_surfaces: wgpu::BindGroupLayout,
 }
 
@@ -532,11 +533,12 @@ impl DrawLayouts {
                 label: Some("chunk ground probes"),
                 entries: &[uniform(58, c), read(59), write(60), read(61)],
             }),
-            // A ray stream: its header, rays and hits, the frame (its
-            // origin, the tracer's number), the eye of the cut drawn last,
-            // the rays' and runs' starts and the sun's occlusion pages (their
-            // frame, atlas, tables and requests); for the surfaces, the
-            // surfaces instead of the starts and pages.
+            // A nearest-hit stream's trace: its header, rays and hits, the
+            // frame (its origin, the tracer's number), the eye
+            // of the cut drawn last and the rays' and runs' starts; an
+            // occlusion stream's: no surfaces, the sun's occlusion pages
+            // instead (their frame, atlas, tables and requests); the
+            // surfaces' passes: no starts.
             rays: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("voxel rays"),
                 entries: &[
@@ -547,6 +549,16 @@ impl DrawLayouts {
                     uniform(72, c),
                     write(73),
                     write(74),
+                ],
+            }),
+            ray_occlusion: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("voxel occlusion rays"),
+                entries: &[
+                    read(67),
+                    read(68),
+                    write(69),
+                    uniform(71, c),
+                    uniform(72, c),
                     uniform(62, c),
                     super::sun_occlusion_maps_entry(63),
                     read(65),

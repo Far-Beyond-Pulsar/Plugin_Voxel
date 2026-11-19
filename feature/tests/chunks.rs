@@ -6379,64 +6379,74 @@ fn full_stream_surfaces_are_the_gbuffer_texels() {
     );
 }
 
-/// The streams of `traced` through `world`'s last cut, each pass timed into
-/// `queries` from `first`: the nearest hits, their surfaces, the entry,
-/// occlusion (`stream_rays_cost`).
+/// One timed pass of `stream_rays_cost`: a stream's trace or its surfaces.
+struct TimedPass {
+    name: &'static str,
+    stream: usize,
+    surface: bool,
+}
+
+/// The passes of `timed` over the streams of `traced` through `world`'s
+/// last cut, pass `n` timed into `queries` at `first + 2 n`
+/// (`stream_rays_cost`). Each stream's hits are cleared before its first
+/// pass.
 fn record_streams(
     gpu: &Gpu,
     world: &ChunkWorld,
     recorder: &mut helio_core::CommandRecorder<'_>,
     traced: &[(
-        helio_frame_api::rays::stream::Stream,
         helio_frame_api::rays::stream::StreamBuffers,
         helio_pass_voxel_planet::chunks::rays::StreamTracer,
     )],
+    timed: &[TimedPass],
     queries: &wgpu::QuerySet,
     first: u32,
 ) {
     let cut = world.ray_cut().expect("a cut");
-    let at = |n: u32| wgpu::ComputePassTimestampWrites {
-        query_set: queries,
-        beginning_of_pass_write_index: Some(first + 2 * n),
-        end_of_pass_write_index: Some(first + 2 * n + 1),
-    };
-    for (n, (_, buffers, tracer)) in traced.iter().enumerate() {
-        buffers.clear(recorder);
+    let mut cleared = vec![false; traced.len()];
+    for (n, pass) in timed.iter().enumerate() {
+        let (buffers, tracer) = &traced[pass.stream];
+        if !std::mem::replace(&mut cleared[pass.stream], true) {
+            buffers.clear(recorder);
+        }
         let bindings = helio_pass_voxel_planet::chunks::rays::StreamBindings {
             header: &buffers.header,
             rays: &buffers.rays,
             hits: &buffers.hits,
             surfaces: buffers.surfaces.as_ref(),
         };
-        tracer.trace(
-            &gpu.device,
-            recorder,
-            &cut,
-            bindings,
-            Some(at([0, 2, 3][n])),
-        );
-        if n == 0 {
-            tracer.surface(&gpu.device, recorder, &cut, bindings, Some(at(1)));
+        let at = wgpu::ComputePassTimestampWrites {
+            query_set: queries,
+            beginning_of_pass_write_index: Some(first + 2 * n as u32),
+            end_of_pass_write_index: Some(first + 2 * n as u32 + 1),
+        };
+        if pass.surface {
+            tracer.surface(&gpu.device, recorder, &cut, bindings, Some(at));
+        } else {
+            tracer.trace(&gpu.device, recorder, &cut, bindings, Some(at));
         }
     }
 }
 
-/// What the terrain's ray stream kernels cost: a frame of GI's probe
-/// updates (680 probes on each of the two finest levels, 340 on each of the
-/// four coarser: 2720 probes, 64 rays each, 174 080 rays) about a ball on
-/// the ground, traced every frame by the stream kernels: the nearest hits,
-/// their surfaces, the entry alone (the same rays a ten-thousandth of a
-/// metre long), each a probe's 64 rays a run from it (`Stream::run`: the
-/// run path, as a stream whose rays share an origin takes it; GI's probe
-/// rays no longer do, each starting behind its probe), and occlusion toward
-/// the sun. Frames are pipelined (two in
+/// What the terrain's ray stream kernels cost on GI's rays: a frame of
+/// probe updates (680 probes on each of the two finest levels, 340 on each
+/// of the four coarser: 2720 probes, 64 rays each, 174 080 rays, each
+/// started behind its probe as GI starts them, not in runs) about a ball on
+/// the ground, and the shadow rays toward the sun from their hits (a
+/// millimetre off the face, as GI's): the nearest walk with its entry, the
+/// entry alone (the same rays a ten-thousandth of a metre long), the
+/// `Diffuse` and the `Full` surfaces, and the sun's rays walked whole (no width) and answered at
+/// their footprint (as wide as the probe ray's footprint at the hit:
+/// walked two texels, the pages past that). Frames are pipelined (two in
 /// flight, none waited for alone: a synchronised harness downclocks), the
 /// streams recorded before the draw on odd frames and after it on even
 /// ones; GPU timestamps, medians in milliseconds. A report: ignored.
 #[test]
 #[ignore]
 fn stream_rays_cost() {
-    use helio_frame_api::rays::stream::{Stream, StreamBuffers, TracerId};
+    use helio_frame_api::rays::stream::{
+        unpack_unit, Stream, StreamBuffers, SurfaceDetail, TracerId, MASK_ALL,
+    };
     use helio_pass_voxel_planet::chunks::rays::StreamTracer;
     let Some(gpu) = gpu() else { return };
     if !gpu
@@ -6470,58 +6480,117 @@ fn stream_rays_cost() {
     world.settle(gpu, &planet, &view);
     world.settle_sun_pages(gpu, &planet, &view);
     world.chunks.take_timings();
-    let origin = |k: usize| probes[k / 64];
+    // GI's offset behind the probe (`gi_ray_offset` near the origin).
+    let behind = 0.002;
+    let probe_rays: Vec<SceneRay> = (0..dirs.len())
+        .map(|k| common::scene_ray(eye, probes[k / 64] - dirs[k] * behind, dirs[k], 1e30, 0.0))
+        .collect();
+    // The shadow rays: from the probe rays' hits toward the sun.
+    let (hits, surfaces) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        eye,
+        &probe_rays,
+        None,
+        0,
+    );
     let sun = world.sun.as_dvec3();
-    let streams: Vec<(RayClass, Vec<SceneRay>)> = vec![
-        (
-            RayClass::Nearest,
-            (0..dirs.len())
-                .map(|k| common::scene_ray(eye, origin(k), dirs[k], 1e30, 0.0))
-                .collect(),
-        ),
-        (
-            RayClass::Nearest,
-            (0..dirs.len())
-                .map(|k| common::scene_ray(eye, origin(k), dirs[k], 1e-4, 0.0))
-                .collect(),
-        ),
-        (
-            RayClass::Occlusion,
-            (0..dirs.len())
-                .map(|k| common::scene_ray(eye, origin(k), sun, 1e30, 0.0))
-                .collect(),
-        ),
-    ];
-    let names = ["nearest", "entry", "occlusion"];
-    let traced: Vec<(Stream, StreamBuffers, StreamTracer)> = streams
+    let mut shadow = Vec::new();
+    let mut wide = Vec::new();
+    for (k, ray) in probe_rays.iter().enumerate() {
+        let Some((t, false)) = terrain_hit(&hits[k]) else {
+            continue;
+        };
+        let face = DVec3::from_array(unpack_unit(surfaces[k].face).map(f64::from));
+        if face.dot(sun) <= 0.0 {
+            continue;
+        }
+        let at = eye + DVec3::from_array(ray.origin.map(f64::from)) + dirs[k] * t;
+        let from = at + face * behind;
+        shadow.push(common::scene_ray(eye, from, sun, 1e30, 0.0));
+        let mut w = common::scene_ray(eye, from, sun, 1e30, 0.0);
+        w.cone = SceneRay::cone((0.443 * t) as f32, 0.0, MASK_ALL);
+        wide.push(w);
+    }
+    let entry: Vec<SceneRay> = probe_rays
         .iter()
-        .zip(names)
-        .map(|((class, rays), name)| {
-            let stream = Stream::new(name, *class, rays.len() as u32);
+        .map(|r| SceneRay { t_max: 1e-4, ..*r })
+        .collect();
+    // (rays, class, detail).
+    let streams: Vec<(&[SceneRay], RayClass, SurfaceDetail)> = vec![
+        (&probe_rays, RayClass::Nearest, SurfaceDetail::Diffuse),
+        (&probe_rays, RayClass::Nearest, SurfaceDetail::Full),
+        (&entry, RayClass::Nearest, SurfaceDetail::Diffuse),
+        (&shadow, RayClass::Occlusion, SurfaceDetail::Full),
+        (&wide, RayClass::Occlusion, SurfaceDetail::Full),
+    ];
+    let timed = [
+        TimedPass {
+            name: "nearest (walk and entry)",
+            stream: 0,
+            surface: false,
+        },
+        TimedPass {
+            name: "diffuse surfaces pass",
+            stream: 0,
+            surface: true,
+        },
+        TimedPass {
+            name: "nearest (a full stream's)",
+            stream: 1,
+            surface: false,
+        },
+        TimedPass {
+            name: "full surfaces pass",
+            stream: 1,
+            surface: true,
+        },
+        TimedPass {
+            name: "entry",
+            stream: 2,
+            surface: false,
+        },
+        TimedPass {
+            name: "sun rays walked",
+            stream: 3,
+            surface: false,
+        },
+        TimedPass {
+            name: "sun rays at their footprint",
+            stream: 4,
+            surface: false,
+        },
+    ];
+    let traced: Vec<(StreamBuffers, StreamTracer)> = streams
+        .iter()
+        .enumerate()
+        .map(|(n, &(rays, class, detail))| {
+            let name: &'static str = Box::leak(format!("cost{n}").into_boxed_str());
+            let stream = Stream::new(name, class, rays.len() as u32);
             let buffers = StreamBuffers::new(&gpu.device, &stream);
             gpu.queue
                 .write_buffer(&buffers.rays, 0, bytemuck::cast_slice(rays));
             buffers.set_count(&gpu.queue, rays.len() as u32);
-            // A probe's 64 rays a run from it (the run path).
-            let tracer =
-                StreamTracer::new(&gpu.device, *class, TracerId(common::VOXEL_TRACER)).with_run(64);
+            let tracer = StreamTracer::new(&gpu.device, class, TracerId(common::VOXEL_TRACER))
+                .with_detail(detail);
             tracer.write_frame(eye, |buffer, bytes| {
                 gpu.queue.write_buffer(buffer, 0, bytes)
             });
-            (stream, buffers, tracer)
+            (buffers, tracer)
         })
         .collect();
     const FRAMES: usize = 160;
-    // Nearest, its surfaces, the entry, occlusion: a begin and an end each.
-    const STAMPS: u32 = 8;
+    let stamps = 2 * timed.len() as u32;
     let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("stream ray timing"),
         ty: wgpu::QueryType::Timestamp,
-        count: STAMPS * FRAMES as u32,
+        count: stamps * FRAMES as u32,
     });
+    let stride = (u64::from(stamps) * 8).next_multiple_of(256);
     let resolved = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: FRAMES as u64 * 256,
+        size: FRAMES as u64 * stride,
         usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -6538,14 +6607,16 @@ fn stream_rays_cost() {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let mut recorder = helio_core::CommandRecorder::from_encoder(&mut encoder);
         let before = f % 2 == 1;
+        let first = f as u32 * stamps;
         if before {
             record_streams(
                 gpu,
                 &world.chunks,
                 &mut recorder,
                 &traced,
+                &timed,
                 &queries,
-                f as u32 * STAMPS,
+                first,
             );
         }
         world.chunks.update(
@@ -6578,16 +6649,17 @@ fn stream_rays_cost() {
                 &world.chunks,
                 &mut recorder,
                 &traced,
+                &timed,
                 &queries,
-                f as u32 * STAMPS,
+                first,
             );
         }
         drop(recorder);
         encoder.resolve_query_set(
             &queries,
-            STAMPS * f as u32..STAMPS * (f as u32 + 1),
+            first..first + stamps,
             &resolved,
-            f as u64 * 256,
+            f as u64 * stride,
         );
         in_flight.push_back(gpu.queue.submit([encoder.finish()]));
         world.chunks.submitted();
@@ -6613,22 +6685,28 @@ fn stream_rays_cost() {
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
     };
+    let per_frame = (stride / 8) as usize;
     // The first frames warm up.
     let stage = |n: usize, before: bool| {
         median(
             (16..FRAMES)
                 .filter(|f| (f % 2 == 1) == before)
-                .map(|f| (words[f * 32 + 2 * n + 1] - words[f * 32 + 2 * n]) as f64 * period)
+                .map(|f| {
+                    let at = f * per_frame + 2 * n;
+                    (words[at + 1] - words[at]) as f64 * period
+                })
                 .collect(),
         )
     };
-    eprintln!("{} rays a frame", dirs.len());
-    for (n, name) in ["nearest", "surfaces", "entry", "occlusion"]
-        .iter()
-        .enumerate()
-    {
+    eprintln!(
+        "{} probe rays a frame, {} sun rays from their hits",
+        probe_rays.len(),
+        shadow.len()
+    );
+    for (n, pass) in timed.iter().enumerate() {
         eprintln!(
-            "stream {name}: {:.3} ms before the draw, {:.3} ms after it",
+            "stream {}: {:.3} ms before the draw, {:.3} ms after it",
+            pass.name,
             stage(n, true),
             stage(n, false)
         );

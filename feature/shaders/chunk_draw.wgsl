@@ -5132,9 +5132,9 @@ const PAGE_ASK_SINE: f32 = 0.008;
 const PAGE_WALK_TEXELS: f32 = 2.0;
 
 // What the sun's pages let through of an occlusion ray past its first
-// PAGE_WALK_TEXELS texels, if they answer it: the level whose texel is the
-// largest no wider than the ray's width (at least the finest), its pages
-// resident under the read's taps, of an epoch whose sun is the ray's
+// PAGE_WALK_TEXELS texels, if they answer it: the finest level resident
+// under the read's taps up to the one whose texel is the largest no wider
+// than the ray's width (at least the finest), of an epoch whose sun is the ray's
 // direction within PAGE_DRIFT of its width over its length to the pages'
 // near plane, for a ray that sees every caster and every volume the pages
 // hold (`RAY_VOLUME_PAGES_SHIFT`); read at camera-relative `p`, the origin,
@@ -5152,25 +5152,32 @@ fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
     let space = scene_ray_space(ray);
     if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
     if space != SCENE_SPACE_ANY && space != held { return none; }
-    let level = sun_occlusion_level(width);
-    let texel = finest * exp2(f32(level));
-    let lifted = p + ray.dir * ((PAGE_WALK_TEXELS - 1.0) * texel);
-    for (var e = 0u; e < SUN_OCCLUSION_EPOCH_COUNT; e++) {
-        if sun_occlusion_frame.epochs[e].right.w == 0.0 { continue; }
-        let forward = sun_occlusion_frame.epochs[e].forward.xyz;
-        if dot(ray.dir, -forward) <= 0.0 { continue; }
-        let sine = length(cross(ray.dir, -forward));
-        if e == 0u && sine <= PAGE_ASK_SINE { ask_sun_pages(lifted, width); }
-        let at = sun_occlusion_texel(p, e, level);
-        let eye = sun_occlusion_frame.epochs[e].levels[level].texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT);
-        let slot = u32(sun_occlusion_frame.epochs[e].right.w) - 1u;
-        let physical = sun_occlusion_physical(slot, level, at.texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT), eye);
-        if physical == SUN_OCCLUSION_NONE { continue; }
-        let near = bitcast<f32>(sun_occlusion_pages[sun_occlusion_frame.atlas.y + physical]);
-        let length_to_near = max(dot(p, forward) - near, 0.0);
-        if length_to_near > ray.t_max || sine * length_to_near > PAGE_DRIFT * width { continue; }
-        let r = sun_occlusion_read_level(lifted, vec3<f32>(0.0), e, level);
-        if r.y > 0.0 { return vec2<f32>(r.x, texel); }
+    let want = sun_occlusion_level(width);
+    // The current epoch's pages at the footprint's level come for the rays
+    // that could read them.
+    let ask = sun_occlusion_frame.epochs[0].right.w != 0.0 && length(cross(ray.dir, -sun_occlusion_frame.epochs[0].forward.xyz)) <= PAGE_ASK_SINE;
+    if ask { ask_sun_pages(p, width); }
+    // The finest level resident at the origin up to the footprint's: its
+    // walked band is the shortest, and its texels resolve the most.
+    for (var level = 0u; level <= want; level++) {
+        let texel = finest * exp2(f32(level));
+        let lifted = p + ray.dir * ((PAGE_WALK_TEXELS - 1.0) * texel);
+        for (var e = 0u; e < SUN_OCCLUSION_EPOCH_COUNT; e++) {
+            if sun_occlusion_frame.epochs[e].right.w == 0.0 { continue; }
+            let forward = sun_occlusion_frame.epochs[e].forward.xyz;
+            if dot(ray.dir, -forward) <= 0.0 { continue; }
+            let at = sun_occlusion_texel(p, e, level);
+            let eye = sun_occlusion_frame.epochs[e].levels[level].texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT);
+            let slot = u32(sun_occlusion_frame.epochs[e].right.w) - 1u;
+            let physical = sun_occlusion_physical(slot, level, at.texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT), eye);
+            if physical == SUN_OCCLUSION_NONE { continue; }
+            let near = bitcast<f32>(sun_occlusion_pages[sun_occlusion_frame.atlas.y + physical]);
+            let length_to_near = max(dot(p, forward) - near, 0.0);
+            let sine = length(cross(ray.dir, -forward));
+            if length_to_near > ray.t_max || sine * length_to_near > PAGE_DRIFT * width { continue; }
+            let r = sun_occlusion_read_level(lifted, vec3<f32>(0.0), e, level);
+            if r.y > 0.0 { return vec2<f32>(r.x, texel); }
+        }
     }
     return none;
 }
@@ -5203,15 +5210,6 @@ fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// The surfaces of the hits this volume found (its tracer's, its index):
-// the face's normal and the one it is lit with (`face_rule` at the ray's
-// footprint there, `scene_ray_footprint`: its width at the origin and its
-// spread times the distance), facing where the
-// ray came from (a ray that starts in rock: back along it); the cell's
-// material (`shown_material`: its own where it has one) shaded as the
-// G-buffer's publish shades it (patches and clumps at the footprint, no
-// voxel pigment; not metallic), the share of light it lets through and
-// what it emits.
 // A terrain hit of a stream as its surface kernels find it again: the
 // face (`axis`, `sign`) of cell `cell` of chunk `slot` (NONE: rock, a ray
 // that starts in it), the material shown there, where it lies

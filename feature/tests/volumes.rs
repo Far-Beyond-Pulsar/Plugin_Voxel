@@ -1109,6 +1109,10 @@ fn stream_rays_see_only_volumes_of_their_space() {
         size: [320, 180],
     };
     let mut scene = Scene::new(gpu, &volumes);
+    // Each volume's space, as the chunk pass sets it from its component.
+    for (id, v) in scene.ids.clone().into_iter().zip(&all) {
+        scene.world.set_space(id, v.space);
+    }
     scene.world.want_rays();
     scene
         .world
