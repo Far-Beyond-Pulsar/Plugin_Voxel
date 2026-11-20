@@ -5148,11 +5148,9 @@ fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
     if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
     if space != SCENE_SPACE_ANY && space != held { return none; }
     // A level whose texels are half the ray's width at most: the read's 2x2
-    // filter then spans the ray's width, so it answers the share of the ray
-    // the occluders cover. Read at the width's own texels, the filter's
-    // taps fell up to a width outside the ray and a canopy's gaps there let
-    // a ray under the canopy through (wide_occlusion_rays_leave_the_ground
-    // in tests/chunks.rs: 9 of 87 covered points lit by metre-wide rays).
+    // filter then spans the ray's width rather than twice it, so its taps
+    // stay on the ray (wide_occlusion_rays_leave_the_ground in
+    // tests/chunks.rs).
     let want = sun_occlusion_level(0.5 * width);
     // The finest level resident at the origin up to the footprint's: its
     // walked band is the shortest, and its texels resolve the most.

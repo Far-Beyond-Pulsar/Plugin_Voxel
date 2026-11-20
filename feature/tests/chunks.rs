@@ -6867,10 +6867,9 @@ fn probe_place(eye: DVec3, level: u32, at: glam::I64Vec3) -> DVec3 {
 /// solid roof's shadow, the canopies' solid parts) they are stopped.
 /// Walked rays (narrower than the sun pages' finest texel) answer exactly;
 /// wider ones the pages answer past a walked band (`paged_occlusion`), with
-/// at most one in fifty off (a page texel is a point sample). Read at the
-/// width's own texels, the pages' 2x2 filter reached a width outside a
-/// metre-wide ray and let 9 of 87 points under the canopies through; read
-/// at half the width's, 3 of 159 under the roof and the canopies.
+/// at most one in fifty off (a page texel is a point sample): 0 at 10 cm, 1
+/// of 164 open and 3 of 159 covered at 1 m (read at the width's own texels,
+/// before half-width reads, 10 cm rays had 1 and 1 off).
 #[test]
 fn wide_occlusion_rays_leave_the_ground() {
     use helio_frame_api::rays::stream::{unpack_unit, RayClass, MASK_ALL};
