@@ -324,6 +324,7 @@ impl Showcase {
                 .with_feature(terrain)
                 .with_feature(helio_pass_gi::GiSettings {
                     probe_spacing: Some(1.0),
+                    ..Default::default()
                 });
         let mut renderer = RendererBuilder::new(renderer_config.clone(), mirror)
             .with_external_device()
