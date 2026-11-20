@@ -793,6 +793,20 @@ impl Gfx {
         };
         flush_scene_db(&self.scene, &self.queue);
         self.rays.publish(&self.scene.world, &mut self.renderer);
+        // `HELIO_REFERENCE_DUMP=<prefix>`: the reference path tracer traces
+        // while no view shows it, the real-time scene colour (whatever debug
+        // view is shown) is snapshotted every frame, and each shot writes
+        // both (`<prefix>_<shot>_*.f32`, `scripts/r2/reference_compare.py`).
+        let dump = std::env::var("HELIO_REFERENCE_DUMP").ok();
+        if dump.is_some() {
+            if let Some(display) = self
+                .renderer
+                .find_pass::<helio_pass_reference::ReferenceDisplay>()
+            {
+                display.keep_tracing(true);
+                display.request_snapshot();
+            }
+        }
         let cycles = thread_cycles();
         if let Some(output) = &output {
             let target = output.texture.create_view(&Default::default());
@@ -818,6 +832,19 @@ impl Gfx {
         }
         if let (Some(path), Some(output)) = (view.screenshot, output.as_ref()) {
             self.save_screenshot(&output.texture, path);
+            let image = self
+                .renderer
+                .find_pass::<helio_pass_reference::ReferenceDisplay>()
+                .and_then(helio_pass_reference::ReferenceDisplay::image);
+            if let (Some(prefix), Some(image)) = (&dump, image) {
+                let shot = std::path::Path::new(path)
+                    .file_stem()
+                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                match image.write(&self.device, &self.queue, &format!("{prefix}_{shot}")) {
+                    Ok(paths) => log::info!("reference: {} frames -> {paths:?}", image.frames),
+                    Err(error) => log::error!("reference dump: {error}"),
+                }
+            }
         }
         if let Some(output) = output {
             self.queue.present(output);

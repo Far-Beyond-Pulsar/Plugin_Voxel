@@ -4710,7 +4710,7 @@ fn sun_pages_under_a_canopy() {
     let answered = walk(true);
     let mut by_level = std::collections::BTreeMap::<usize, (usize, f64, f64, usize)>::new();
     for (k, &(_, _, w)) in receivers.iter().enumerate() {
-        let level = helio_light_api::sun_occlusion_level(finest, 20, w as f32);
+        let level = helio_light_api::sun_occlusion_level(finest, 20, 0.5 * w as f32);
         let lit = f64::from(answered[k].through()[0]);
         let walk = f64::from(u8::from(walk_lit[k]));
         let e = by_level.entry(level).or_default();
@@ -6855,4 +6855,158 @@ fn probe_place(eye: DVec3, level: u32, at: glam::I64Vec3) -> DVec3 {
     let spacing = PROBE_SPACING * f64::from(1u32 << level);
     let first = (eye / spacing).floor().as_i64vec3() - 11;
     (first + at).as_dvec3() * spacing
+}
+
+/// Occlusion rays leaving the ground as wide as a footprint (the ray-stream
+/// contract: a consumer's ray leaves a hit as wide as the footprint that
+/// found it, offset off its face by the consumer) answer as the exact walk
+/// of a zero-width ray: in a forest with the sun 50 degrees up, over ground
+/// points under open sky (the zero-width walk lit at the point and at eight
+/// points half a metre about it across the sun) rays of width 0, 1 cm,
+/// 10 cm and 1 m reach the sun, and under cover (all nine walks shaded: a
+/// solid roof's shadow, the canopies' solid parts) they are stopped.
+/// Walked rays (narrower than the sun pages' finest texel) answer exactly;
+/// wider ones the pages answer past a walked band (`paged_occlusion`), with
+/// at most one in fifty off (a page texel is a point sample). Read at the
+/// width's own texels, the pages' 2x2 filter reached a width outside a
+/// metre-wide ray and let 9 of 87 points under the canopies through; read
+/// at half the width's, 3 of 159 under the roof and the canopies.
+#[test]
+fn wide_occlusion_rays_leave_the_ground() {
+    use helio_frame_api::rays::stream::{unpack_unit, RayClass, MASK_ALL};
+    let Some(gpu) = gpu() else { return };
+    let (mut planet, dir) = forest_planet();
+    let eye = planet.surface_point(dir, 1.7);
+    let up = eye.normalize();
+    let side = up.any_orthonormal_vector();
+    let fwd = up.cross(side);
+    // A solid roof, 6 m across and 5 m up, toward the sun: a real occluder
+    // whose shadow's core is wider than the widest ray (the forest's
+    // canopies have gaps a metre-wide ray may rightly see light through).
+    planet
+        .apply(Brush {
+            center: (planet.surface_point(dir, 5.0) + side * 6.0).to_array(),
+            radius: 3.0,
+            shape: BrushShape::Cube,
+            op: BrushOp::Add,
+            material: material::BRICK,
+            height: 0.0,
+        })
+        .unwrap();
+    let view = View::new(eye, (fwd - up * 0.25).normalize().as_vec3(), [320, 180]);
+    let mut world = ray_world(gpu, &planet);
+    world.sun_occlusion = true;
+    let elevation = 50f64.to_radians();
+    world.sun = (up * elevation.sin() + side * elevation.cos())
+        .normalize()
+        .as_vec3();
+    world.settle(gpu, &planet, &view);
+    world.settle_sun_pages(gpu, &planet, &view);
+    let pages = world.chunks.read_sun_occlusion().expect("drawn");
+    let ep = &pages.frame.epochs[0];
+    let sun = -DVec3::new(
+        f64::from(ep.forward[0]),
+        f64::from(ep.forward[1]),
+        f64::from(ep.forward[2]),
+    );
+    // The ground under a half-metre grid 20 m about the eye: rays down.
+    let mut starts = Vec::new();
+    for a in -40..=40 {
+        for b in -40..=40 {
+            starts.push(eye + side * (f64::from(a) * 0.5) + fwd * (f64::from(b) * 0.5) + up * 1.0);
+        }
+    }
+    let down: Vec<SceneRay> = starts
+        .iter()
+        .map(|&o| common::scene_ray(eye, o, -up, 20.0, 0.0))
+        .collect();
+    let (hits, surfaces) =
+        common::trace_stream(gpu, &world.chunks, RayClass::Nearest, eye, &down, None, 0);
+    // Each ground point off its face as the reference offsets a ray leaving
+    // a hit (2 mm, f32 ulps, a hundredth of the widest footprint).
+    let mut ground = Vec::new();
+    for (k, &o) in starts.iter().enumerate() {
+        let Some((t, false)) = terrain_hit(&hits[k]) else {
+            continue;
+        };
+        let face = DVec3::from_array(unpack_unit(surfaces[k].face).map(f64::from));
+        if face.dot(up) < 0.5 {
+            continue;
+        }
+        ground.push(o - up * t + face * (0.002 + 0.01));
+    }
+    let across = sun.cross(up).normalize();
+    let across2 = sun.cross(across).normalize();
+    let trace = |rays: &[SceneRay]| {
+        common::trace_stream(gpu, &world.chunks, RayClass::Occlusion, eye, rays, None, 0).0
+    };
+    let ray = |p: DVec3, width: f32| {
+        let mut r = common::scene_ray(eye, p, sun, 1e30, 0.0);
+        r.cone = SceneRay::cone(width, 0.0, MASK_ALL);
+        r
+    };
+    // The exact walk at the point and half a metre (the widest ray's
+    // radius) either side across the sun.
+    let mut offsets = vec![DVec3::ZERO];
+    for k in 0..8 {
+        let angle = f64::from(k) * std::f64::consts::FRAC_PI_4;
+        offsets.push((across * angle.cos() + across2 * angle.sin()) * 0.5);
+    }
+    let exact: Vec<SceneRay> = ground
+        .iter()
+        .flat_map(|&p| offsets.iter().map(move |&o| (p, o)))
+        .map(|(p, o)| ray(p + o, 0.0))
+        .collect();
+    let exact = trace(&exact);
+    let lit = |h: &SceneHit| h.through()[0] >= 0.5;
+    let (mut open, mut covered) = (Vec::new(), Vec::new());
+    for (k, &p) in ground.iter().enumerate() {
+        let walks = &exact[k * offsets.len()..(k + 1) * offsets.len()];
+        if walks.iter().all(lit) {
+            open.push(p);
+        } else if !walks.iter().any(lit) {
+            covered.push(p);
+        }
+    }
+    eprintln!(
+        "{} ground points: {} under open sky, {} under a canopy",
+        ground.len(),
+        open.len(),
+        covered.len()
+    );
+    assert!(open.len() >= 100 && covered.len() >= 50);
+    let finest = pages.frame.info[0];
+    let mut answers = Vec::new();
+    for width in [0.0f32, 0.01, 0.1, 1.0] {
+        let stopped = trace(&open.iter().map(|&p| ray(p, width)).collect::<Vec<_>>())
+            .iter()
+            .filter(|h| !lit(h))
+            .count();
+        let passed = trace(&covered.iter().map(|&p| ray(p, width)).collect::<Vec<_>>())
+            .iter()
+            .filter(|h| lit(h))
+            .count();
+        eprintln!(
+            "width {width} m (the pages' finest texel {finest} m): {stopped} of {} open \
+             points stopped, {passed} of {} covered let through",
+            open.len(),
+            covered.len()
+        );
+        if width < finest {
+            // Walked all the way: the exact answer.
+            assert_eq!(stopped + passed, 0, "width {width}: walked rays differ");
+        }
+        answers.push((width, stopped, passed));
+    }
+    // Answered by the pages past their walked band: a page texel is a point
+    // sample of the occluders' depth over a texel, so a receiver within a
+    // texel of a shadow's edge can read either side (sun_pages_under_a_canopy
+    // allows one in twelve over GI-shaped hits); over clear ground and under
+    // a canopy at least half a metre across, at most one in fifty.
+    for (width, stopped, passed) in answers {
+        assert!(
+            stopped * 50 <= open.len() && passed * 50 <= covered.len(),
+            "width {width}: {stopped} open points stopped, {passed} covered let through"
+        );
+    }
 }

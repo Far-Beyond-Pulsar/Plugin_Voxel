@@ -5128,7 +5128,7 @@ const PAGE_WALK_TEXELS: f32 = 2.0;
 // What the sun's pages let through of an occlusion ray past its first
 // PAGE_WALK_TEXELS texels, if they answer it: the finest level resident
 // under the read's taps up to the one whose texel is the largest no wider
-// than the ray's width (at least the finest), of an epoch whose sun is the ray's
+// than half the ray's width (at least the finest), of an epoch whose sun is the ray's
 // direction within PAGE_DRIFT of its width over its length to the pages'
 // near plane, for a ray that sees every caster and every volume the pages
 // hold (`RAY_VOLUME_PAGES_SHIFT`); read at camera-relative `p`, the origin,
@@ -5147,7 +5147,13 @@ fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
     let space = scene_ray_space(ray);
     if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
     if space != SCENE_SPACE_ANY && space != held { return none; }
-    let want = sun_occlusion_level(width);
+    // A level whose texels are half the ray's width at most: the read's 2x2
+    // filter then spans the ray's width, so it answers the share of the ray
+    // the occluders cover. Read at the width's own texels, the filter's
+    // taps fell up to a width outside the ray and a canopy's gaps there let
+    // a ray under the canopy through (wide_occlusion_rays_leave_the_ground
+    // in tests/chunks.rs: 9 of 87 covered points lit by metre-wide rays).
+    let want = sun_occlusion_level(0.5 * width);
     // The finest level resident at the origin up to the footprint's: its
     // walked band is the shortest, and its texels resolve the most.
     for (var level = 0u; level <= want; level++) {
