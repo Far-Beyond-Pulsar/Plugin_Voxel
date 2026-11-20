@@ -322,6 +322,18 @@ type AnchorColumn = ((u8, i32, i32), u32, bool);
 /// `RAY_VOLUME_MOVABLE` of chunk_draw.wgsl: a volume's ray parameters'
 /// `volume.w` when it has moved since it was added.
 const RAY_VOLUME_MOVABLE: u32 = 16;
+/// `RAY_VOLUME_SPACE_SHIFT` of chunk_draw.wgsl: where in `volume.w` a
+/// volume's ray parameters hold its coordinate space slot (8 bits).
+const RAY_VOLUME_SPACE_SHIFT: u32 = 8;
+/// `RAY_VOLUME_FIRST` of chunk_draw.wgsl: the cut's first volume, whose
+/// rays' dispatch multiplies in what the sun's occlusion pages let through
+/// for every volume.
+const RAY_VOLUME_FIRST: u32 = 32;
+/// `RAY_VOLUME_PAGES_SHIFT` of chunk_draw.wgsl: where in the first volume's
+/// `volume.w` the coordinate space of every volume the pages hold is (as a
+/// ray encodes it), or `RAY_PAGES_MIXED`.
+const RAY_VOLUME_PAGES_SHIFT: u32 = 16;
+const RAY_PAGES_MIXED: u32 = 0x1ff;
 
 /// A planet-centred position as a high and a low f32 part.
 fn split(v: DVec3) -> ([f32; 4], [f32; 4]) {
@@ -3044,7 +3056,7 @@ fn draw_source(plane: bool, counting: bool) -> String {
     let source = |rel: &str, embedded: &'static str| {
         helio_core::shader::hot::source_text(env!("CARGO_MANIFEST_DIR"), rel, embedded)
     };
-    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_mats::PBR_EVAL_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
+    (helio_core::shader::PRELUDE.to_owned() + &format!("const DOMAIN_UNIT: f32 = {};\n", crate::grid::DOMAIN_UNIT) + &helio_core::shader::hot::source_text(helio_voxel_world::wgsl::DIR, helio_voxel_world::wgsl::NOISE_PATH, helio_voxel_world::wgsl::NOISE) + helio_light_api::SUN_OCCLUSION_SNIPPET.source + helio_frame_api::rays::stream::SNIPPET.source + helio_frame_api::rays::stream::SURFACE_SNIPPET.source + helio_frame_api::gbuffer::SURFACE_SNIPPET.source + helio_light_api::LIGHT_LIST_SNIPPET.source + helio_mats::MATERIAL_ROW_SNIPPET.source + helio_foliage_api::GROUND_SNIPPET.source + helio_frame_api::gbuffer::OUTPUT_SNIPPET.source + &walk_templates(&source("shaders/chunk_draw.wgsl", include_str!("../../shaders/chunk_draw.wgsl"))))
         .replace("COUNTERS", if counting { "@group(0) @binding(9) var<storage, read_write> counters: array<atomic<u32>, 256>;" } else { "" })
         .replace("WCOUNT(1)", &wcount(1))
         .replace("WCOUNT(3)", &wcount(3))
@@ -6942,8 +6954,10 @@ impl ChunkWorld {
     }
 
     /// Whether every held form's ray kernels are compiled, when ray streams
-    /// are wanted (drawing never waits for them).
-    fn ray_pipelines_ready(&self) -> bool {
+    /// are wanted (drawing never waits for them). A host drawing on demand
+    /// keeps drawing until they are (`ChunkPass::needs_frame`): the streams'
+    /// consumers hold what they have while the terrain answers short.
+    pub fn ray_pipelines_ready(&self) -> bool {
         let (forms, _) = self.forms_held();
         !self.rays_wanted
             || (0..2).all(|form| {
@@ -7071,6 +7085,15 @@ impl ChunkWorld {
         self.uploads
             .write(encoder, &self.ray_eye, 0, bytemuck::cast_slice(&[hi, lo]));
         let count = self.volumes.iter().flatten().count() as u32;
+        // The space every volume is in (the pages hold them all), as a ray
+        // encodes it, or mixed.
+        let mut spaces = self.volumes.iter().flatten().map(|v| v.space);
+        let first_space = spaces.next().unwrap_or(0);
+        let pages_space = if spaces.all(|s| s == first_space) {
+            helio_frame_api::rays::stream::space_of_slot(first_space)
+        } else {
+            RAY_PAGES_MIXED
+        };
         let mut volumes = Vec::new();
         for vol in self
             .volumes
@@ -7084,7 +7107,13 @@ impl ChunkWorld {
                 .map_or(vol.transform, |(_, t)| *t);
             let mut params = self.draw_params(v, Some((vol, last)), 0, count.max(1), 0);
             params.cut[2] = u32::MAX;
-            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 };
+            params.volume[3] = if vol.movable { RAY_VOLUME_MOVABLE } else { 0 }
+                | ((vol.space & 0xff) << RAY_VOLUME_SPACE_SHIFT)
+                | if volumes.is_empty() {
+                    RAY_VOLUME_FIRST | (pages_space << RAY_VOLUME_PAGES_SHIFT)
+                } else {
+                    0
+                };
             self.uploads
                 .write(encoder, &vol.views.rays, 0, bytemuck::bytes_of(&params));
             volumes.push(rays::RayVolume {
@@ -7092,11 +7121,26 @@ impl ChunkWorld {
                 group: self.draw_group(&vol.views.rays, vol, self.camera_view(vol)),
             });
         }
+        // The sun's occlusion pages: occlusion rays along the sun read them
+        // past their first texels.
+        let o = self
+            .sun_occlusion
+            .as_ref()
+            .expect("a camera draw has the sun's occlusion pages");
         self.ray_cut = Some(std::sync::Arc::new(rays::RayCut {
             volumes,
             pipelines: self.ray_pipelines.clone(),
-            layouts: [self.layouts.rays.clone(), self.layouts.ray_surfaces.clone()],
+            layouts: [
+                self.layouts.rays.clone(),
+                self.layouts.ray_occlusion.clone(),
+                self.layouts.ray_surfaces.clone(),
+            ],
             eye: self.ray_eye.clone(),
+            sun: rays::SunPages {
+                frame: o.frame.clone(),
+                atlas: o.atlas_view.clone(),
+                pages: o.pages_buffer.clone(),
+            },
         }));
     }
 
@@ -8596,11 +8640,6 @@ impl ChunkWorld {
         )
     }
 
-    /// Boxes drawn by the last [`Self::draw`]: from outside, from inside
-    /// (reads the cull back: diagnostics).
-    /// Follows the GI clipmap `clipmap`, around world point `world_eye`
-    /// (the eye, at `eye` in the planet's coordinates): the base cell of
-    /// each probe that came in, located in f64, for its rays' walks.
     /// World boxes (planet coordinates) whose drawn ground changed since the last
     /// call: where foliage is placed again (`chunks::ground`).
     pub fn take_ground_changes(&mut self) -> Vec<[DVec3; 2]> {
@@ -8616,7 +8655,12 @@ impl ChunkWorld {
     /// from a little over the highest terrain `planet` has at the tile's corners and
     /// centre (overhangs included), the same segments below that. Features taller than
     /// that start the walk in them: no ground under a tree's trunk or in a building.
+    ///
+    /// Whether the queries were answered: not while the pipelines compile or before
+    /// the primary volume's cut is drawn, when `hits` is left as it was and the asker
+    /// asks again (`helio_foliage_api::GroundLink::answer` is for answered batches).
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn probe_ground(
         &mut self,
         encoder: &mut helio_core::CommandRecorder<'_>,
@@ -8626,18 +8670,20 @@ impl ChunkWorld {
         planet: &Planet,
         eye: DVec3,
         camera: Vec3,
-    ) {
+    ) -> bool {
         if !self.drawable {
-            return;
+            return false;
         }
         // Foliage is tiled on the primary volume: its walks in its frame.
-        let Some(primary) = self.primary else { return };
+        let Some(primary) = self.primary else {
+            return false;
+        };
         let Some((_, group, _)) = self
             .last_groups
             .as_ref()
             .and_then(|g| g.volumes.iter().find(|(i, ..)| *i == primary).cloned())
         else {
-            return;
+            return false;
         };
         let vol = self.volumes[usize::from(primary)].as_ref().unwrap();
         let (grid, transform, plane) = (vol.grid, vol.transform, vol.grid.is_plane());
@@ -8680,7 +8726,7 @@ impl ChunkWorld {
             })
             .collect();
         if places.is_empty() || queries_in_all == 0 {
-            return;
+            return true;
         }
         self.queue
             .write_buffer(&self.probe_tiles, 0, bytemuck::cast_slice(&places));
@@ -8719,6 +8765,7 @@ impl ChunkWorld {
             pass.set_pipeline(&self.cross_pipelines(*index).ground_probe);
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
+        true
     }
 
     /// Boxes the last volume traced drew: from outside, from inside (reads

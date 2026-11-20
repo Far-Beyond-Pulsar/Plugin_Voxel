@@ -2188,6 +2188,65 @@ fn textured_normal(n: vec3<f32>, t: vec3<f32>, c: ChunkDraw, axis: u32) -> vec3<
     return normalize(tu * t.x + tv * t.y + n * t.z);
 }
 
+// The frame's surface (`//!use frame_surface`) of face `axis` (`sign` 1 its
+// positive side) of hit cell `cell` of chunk `slot`, of `material` (the
+// material shown there), at eye-relative `position` (volume frame) seen
+// along unit `view`, lit with unit normal `shading` (volume frame: the
+// face rule's, `face_rule`/`face_lit`), by a footprint `pixel_m` wide;
+// `pixel` keys the material boundaries' jitter (`surface_look`). The one
+// shading of a terrain face: the G-buffer's publish writes it at a pixel's
+// footprint, the ray streams' `Full` surfaces at a ray's. The materials'
+// colour and its patches, the cell's pigment, corner occlusion and edges
+// (`surface_look`), the host's scene materials (textures, normal maps,
+// occlusion: `voxel_scene_surface`), the shore's swash; not metallic, a
+// dielectric's reflectance; what it emits (the row's emission, varied as
+// its colour); a material that lets light through is a thin two-sided
+// surface letting its share through, tinted by its colour. The occlusion
+// of the sky (the publish's screen samples) is the caller's.
+fn voxel_surface(slot: u32, cell: vec3<i32>, axis: u32, sign: u32, material: u32, position: vec3<f32>, view: vec3<f32>, shading: vec3<f32>, pixel_m: f32, pixel: vec2<u32>) -> SurfaceData {
+    let c = chunk_frame(slot);
+    let look = surface_look(slot, cell, axis, sign, material, position, pixel_m, pixel);
+    var albedo = look.albedo;
+    let row = slot_material(material);
+    var roughness = row.roughness_metallic.x;
+    // The row's emission (its colour times its strength), varied voxel by
+    // voxel as its colour is.
+    let base = row.base_color.rgb;
+    var emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
+    let level = u32(key_level(chunk_keys[slot].x)) & 31u;
+    // A footprint along the face over its width (the view's slant).
+    let slant = 1.0 / max(abs(dot(shading, view)), 1.0 / 16.0);
+    let world_xz_from_eye = to_world(position).xz;
+    let scene = voxel_scene_surface(material, axis, sign, level, chunk_keys[slot].yzw * 64 + cell, voxel_in_cell(c, cell, position), pixel_m, slant, world_xz_from_eye);
+    var occlusion = 1.0;
+    var normal = shading;
+    if scene.valid {
+        albedo = scene.albedo;
+        roughness = scene.roughness;
+        emissive = scene.emissive;
+        occlusion = scene.occlusion;
+        normal = textured_normal(normal, scene.normal, c, axis);
+    }
+    // The land-side half of Ultra-Water's shared shore phase: an advancing
+    // bore darkens and smooths the sand, with a narrow foam edge and a drying
+    // wet line. The optional scene-material shader evaluates the shared field.
+    if axis == 2u && sign == 1u {
+        let wetness = clamp(scene.swash.z, 0.0, 1.0);
+        let film = clamp(scene.swash.x / 0.08, 0.0, 1.0);
+        let edge_foam = clamp(scene.swash.y, 0.0, 1.0);
+        albedo *= mix(1.0, 0.62, max(film, wetness * 0.55));
+        albedo = mix(albedo, vec3<f32>(0.78, 0.84, 0.84), edge_foam * 0.72);
+        roughness = mix(roughness, 0.09, max(film, wetness * 0.8));
+    }
+    var surface = surface_data(albedo, to_world(normal), clamp(roughness, 0.04, 1.0), 0.0, emissive);
+    surface.specular_f0 = vec3<f32>(0.03);
+    surface.ao = look.ao * occlusion;
+    // Materials that let light through are two-sided foliage: the light
+    // behind comes through tinted by their colour, their share of it (what
+    // lies between the light and the leaf is the light's visibility).
+    return surface_with_transmission(surface, material_transmitted(row, albedo));
+}
+
 // `GBufferDepthOutput`: the frame's G-buffer targets and the depth
 // (`//!use gbuffer_output`).
 
@@ -2211,74 +2270,34 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
     let size = textureDimensions(hit_distance);
     let position = pixel_ray(vec2<u32>(pixel.xy), size) * t;
     let clip = params.view_proj * vec4<f32>(position, 1.0);
-    let c = chunk_frame(v.x);
     let axis = (v.y >> 18u) & 3u;
     let sign = (v.y >> 20u) & 1u;
     let material = (v.y >> 21u) & 31u;
-    // In the volume's frame (the cell's axes), out in the world's.
-    var normal = to_local(shading.xyz);
     let cell = vec3<i32>(vec3<u32>(v.y, v.y >> 6u, v.y >> 12u) & vec3<u32>(63u));
-    // A pixel's width at the hit (m).
-    let pixel_m = pixel_width(vec2<u32>(pixel.xy), size, t);
-    let look = surface_look(v.x, cell, axis, sign, material, position, pixel_m, vec2<u32>(pixel.xy));
-    let f0 = 0.03;
-    var out: GBufferDepthOutput;
-    var albedo = look.albedo;
-    let row = slot_material(material);
-    var roughness = row.roughness_metallic.x;
-    // The row's emission (its colour times its strength), varied voxel by
-    // voxel as its colour is.
-    let base = row.base_color.rgb;
-    var emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
-    let level = u32(key_level(chunk_keys[v.x].x)) & 31u;
-    // A pixel's footprint along the face over its width (the view's slant).
-    let slant = 1.0 / max(abs(dot(normal, normalize(position))), 1.0 / 16.0);
-    let world_xz_from_eye = to_world(position).xz;
-    let scene = voxel_scene_surface(material, axis, sign, level, chunk_keys[v.x].yzw * 64 + cell, voxel_in_cell(c, cell, position), pixel_m, slant, world_xz_from_eye);
-    var occlusion = 1.0;
-    if scene.valid {
-        albedo = scene.albedo;
-        roughness = scene.roughness;
-        emissive = scene.emissive;
-        occlusion = scene.occlusion;
-        normal = textured_normal(normal, scene.normal, c, axis);
-    }
-    // The land-side half of Ultra-Water's shared shore phase: an advancing
-    // bore darkens and smooths the sand, with a narrow foam edge and a drying
-    // wet line. The optional scene-material shader evaluates the shared field.
-    if axis == 2u && sign == 1u {
-        let wetness = clamp(scene.swash.z, 0.0, 1.0);
-        let film = clamp(scene.swash.x / 0.08, 0.0, 1.0);
-        let edge_foam = clamp(scene.swash.y, 0.0, 1.0);
-        albedo *= mix(1.0, 0.62, max(film, wetness * 0.55));
-        albedo = mix(albedo, vec3<f32>(0.78, 0.84, 0.84), edge_foam * 0.72);
-        roughness = mix(roughness, 0.09, max(film, wetness * 0.8));
-    }
-    out.albedo = vec4<f32>(albedo, 1.0);
+    // The face's surface at the pixel's width there (`voxel_surface`, as a
+    // ray's `Full` surface takes it at the ray's footprint), lit with the
+    // shading pass's normal (in the volume's frame: the cell's axes).
+    var surface = voxel_surface(v.x, cell, axis, sign, material, position, normalize(position), to_local(shading.xyz), pixel_width(vec2<u32>(pixel.xy), size, t), vec2<u32>(pixel.xy));
+    // And the sky's share (the screen's samples, denoised).
+    surface.ao *= textureLoad(hit_sky, p, 0).r;
+    // Diagnostics: the colour, and what the face lets through with it.
+    var debug_albedo = vec3<f32>(-1.0);
     if debug_mode() == 32u {
         let h = f32((v.y >> 26u) & 63u) * 3.0 / 64.0;
-        let cost = clamp(vec3<f32>(h, h - 1.0, h - 2.0), vec3<f32>(0.0), vec3<f32>(1.0));
-        out.albedo = vec4<f32>(cost, 1.0);
+        debug_albedo = clamp(vec3<f32>(h, h - 1.0, h - 2.0), vec3<f32>(0.0), vec3<f32>(1.0));
     }
     if debug_mode() == 1u {
-        let uv = voxel_face_uv(c, cell, axis, position);
-        out.albedo = vec4<f32>(textureSample(uv_reference_texture, uv_reference_sampler, uv).rgb, 1.0);
+        debug_albedo = textureSample(uv_reference_texture, uv_reference_sampler, voxel_face_uv(chunk_frame(v.x), cell, axis, position)).rgb;
     }
     // Environment-only level diagnostics (`HELIO_VOXEL_CHUNKS_LEVELS`).
     if voxel_levels_debug() && (!voxel_levels_half_debug() || p.x < i32(size.x / 2u)) {
-        out.albedo = vec4<f32>(level_colour(u32(key_level(chunk_keys[v.x].x)) & 31u), 1.0);
+        debug_albedo = level_colour(u32(key_level(chunk_keys[v.x].x)) & 31u);
     }
-    out.normal = vec4<f32>(to_world(normal), f0);
-    out.orm = vec4<f32>(look.ao * textureLoad(hit_sky, p, 0).r * occlusion, clamp(roughness, 0.04, 1.0), 0.0, f0);
-    out.emissive = vec4<f32>(emissive, f0);
-    // Terrain tag consumed by deferred lighting (skips screen-space AO).
-    out.surface = GBUFFER_TAG_TRACED;
-    // Materials that let light through are two-sided foliage: the sun from
-    // behind comes through tinted by their colour (its share through the
-    // leaf and those past it is the sun's visibility: `shadow_fallback`).
-    let through = material_transmission(slot_material(material));
-    out.sss = vec4<f32>(select(vec3<f32>(0.0), albedo, through > 0.0), 0.0);
-    out.extra = vec4<f32>(0.0, 0.0, 0.0, select(0.0, f32(SURFACE_FLAG_TWO_SIDED), through > 0.0));
+    if debug_albedo.r >= 0.0 {
+        let share = clamp(material_transmission(slot_material(material)), 0.0, 1.0);
+        surface.albedo = vec4<f32>(debug_albedo, 1.0);
+        surface.subsurface_color = select(surface.subsurface_color, debug_albedo * share, (surface.flags & SURFACE_FLAG_TWO_SIDED) != 0u);
+    }
     // A still volume: w 0 (helio-pass-tsr MOTION_VECTORS) leaves its
     // motion, the camera's, to TSR, which derives it from depth at full
     // precision. These eye-relative matrices are f32 products that cancel
@@ -2291,9 +2310,9 @@ fn publish(@builtin(position) pixel: vec4<f32>) -> GBufferDepthOutput {
         let ndc = previous.xy / previous.w;
         velocity = pixel.xy - (vec2<f32>(ndc.x, -ndc.y) * 0.5 + 0.5) * vec2<f32>(size);
     }
-    out.velocity = vec4<f32>(velocity, 0.0, select(0.0, 1.0, (params.volume.w & 2u) != 0u));
-    out.depth = clip.z / clip.w;
-    return out;
+    // Terrain tag consumed by deferred lighting (skips screen-space AO).
+    return gbuffer_depth_output(surface, GBUFFER_TAG_TRACED,
+        vec4<f32>(velocity, 0.0, select(0.0, 1.0, (params.volume.w & 2u) != 0u)), clip.z / clip.w);
 }
 
 // ---- 4. Sun shadows ----
@@ -2535,11 +2554,17 @@ fn face_rule(slot: u32, cell: vec3<i32>, axis: u32, sign: u32, position: vec3<f3
     out.w = max(max(select(0.0, voxel_materials.detail.w, out.step), out.coarse), smoothing);
     // The heightfield's exact slope stored with the leaf; else the caller's
     // (the screen's, then the column tops: `face_lit`).
+    // (A natural step's stored slope before the caller's: a neighbouring
+    // sample's slope lent by the shading pass is its own cell's, a few
+    // degrees off this one's, and a ray's hit, which has no neighbours,
+    // would light the same face otherwise.)
     var ground = ground_hint;
     if smoothing > 0.0 && !out.step {
         // At this hit, not a neighbour's: it varies across the face.
         let local = vec3<f32>(c.i0.w, c.i1.w, c.i2.w) + vec3<f32>(dot(c.i0.xyz, position), dot(c.i1.xyz, position), dot(c.i2.xyz, position));
         ground = smooth_normal(slot, key, cell, local, c);
+    } else if out.step {
+        ground = stored;
     }
     if dot(ground, ground) == 0.0 { ground = stored; }
     out.ground = ground;
@@ -3338,15 +3363,15 @@ fn shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     let footprint = pixel_width(id.xy, size, t);
     if dot(f.shading, sun) <= 0.0 {
         own = 1.0;
-        // A material that lets light through, its back to the sun: the
-        // light through it (its share) where the sun reaches its far side,
-        // by the sun's occlusion pages (as GI's hits: a texture read,
-        // steady from frame to frame).
+        // A material that lets light through, its back to the sun: the sun
+        // where it reaches its far side, by the sun's occlusion pages (a
+        // texture read, steady from frame to frame). The share it lets
+        // through is its surface's (`voxel_surface`), as every light's.
         let through = material_transmission(slot_material((v.y >> 21u) & 31u));
         if dot(f.normal, sun) < 0.0 && through > 0.0 {
             let back = to_world(at_hit - f.normal * (1.5 * f.cell));
             ask_sun_pages(back, footprint);
-            lit = clamp(through, 0.0, 1.0) * sun_occlusion(back, vec3<f32>(0.0), footprint);
+            lit = sun_occlusion(back, vec3<f32>(0.0), footprint);
             paged = true;
         }
     } else if sub_pixel(f, id.xy, size, t) && !steady {
@@ -4839,15 +4864,21 @@ struct RayEye {
 @group(1) @binding(72) var<uniform> ray_eye: RayEye;
 
 // `params.volume.w` of a volume's ray parameters: it has moved since it was
-// added (rays of `RAY_MASK_MOVABLE` see it; else `RAY_MASK_STATIC`).
+// added (rays of `RAY_MASK_MOVABLE` see it; else `RAY_MASK_STATIC`); and,
+// in bits 8..16 (`RAY_VOLUME_SPACE_SHIFT`), the authored coordinate space
+// slot it is in (0: the world).
 const RAY_VOLUME_MOVABLE: u32 = 16u;
+const RAY_VOLUME_SPACE_SHIFT: u32 = 8u;
 
 // Whether ray `ray` is one this volume answers: a ray in its row, of a
-// caster mask this volume is in.
+// caster mask this volume is in, in a coordinate space that sees the
+// volume's (`scene_ray_sees_space`): a volume at the same place in another
+// space is not there for it.
 fn stream_sees(ray: SceneRay) -> bool {
     let movable = (params.volume.w & RAY_VOLUME_MOVABLE) != 0u;
     let mask = select(RAY_MASK_STATIC, RAY_MASK_MOVABLE, movable);
-    return ray.t_max > 0.0 && (scene_ray_mask(ray) & mask) != 0u;
+    let space = (params.volume.w >> RAY_VOLUME_SPACE_SHIFT) & 0xffu;
+    return ray.t_max > 0.0 && (scene_ray_mask(ray) & mask) != 0u && scene_ray_sees_space(ray, space);
 }
 
 // Ray `ray`'s origin eye-relative in the volume's frame.
@@ -5064,69 +5095,212 @@ fn ray_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
     stream_hits[id.x] = stream_hit(s.end.t, s.inside, s.end.slot, s.end.cell, s.end.axis, s.end.sign, s.end.material);
 }
 
+// `params.volume.w` of the cut's first volume: the sun's occlusion pages
+// answer the far part of rays for every volume (`paged_occlusion`); and in
+// bits 16..25 (`RAY_VOLUME_PAGES_SHIFT`) the coordinate space every volume
+// the pages hold is in, as a ray encodes it (`scene_space_of_slot`;
+// RAY_PAGES_MIXED: volumes of several spaces, the pages answer only rays
+// of every space).
+const RAY_VOLUME_FIRST: u32 = 32u;
+const RAY_VOLUME_PAGES_SHIFT: u32 = 16u;
+const RAY_PAGES_MIXED: u32 = 0x1ffu;
+
+// How far an epoch's sun may be from a ray's direction: the part of the
+// ray's width the two drift apart by over the ray's length to the pages'
+// near plane, half the width.
+const PAGE_DRIFT: f32 = 0.5;
+
+// How far (in texels of the level read) an occlusion ray answered by the
+// pages walks first: its own surface, and every occluder nearer than this
+// along the sun, are the walk's (exact); the pages answer from a texel short
+// of there on. A page texel holds one occluder depth, and its read lights a
+// receiver whose occluder lies within a texel of it along the sun (the
+// bias that keeps a surface from shadowing itself across the 2x2 filter):
+// from the surface itself that hid every leaf within a texel over a hit,
+// which at the probe rays' footprints is a canopy (`sun_pages_under_a_canopy`
+// in tests/chunks.rs: the pages lit 0.72-0.86 of GI-shaped hits under a
+// forest where the walk lit 0.61, every one of the difference within the
+// bias, while every texel's stored occluder was the walk's). Read from a
+// texel up the sun with the band to two texels walked, nothing is hidden,
+// and the surface's own slope up to 1.3 across the filter stays its own.
+const PAGE_WALK_TEXELS: f32 = 2.0;
+
+// What the sun's pages let through of an occlusion ray past its first
+// PAGE_WALK_TEXELS texels, if they answer it: the finest level resident
+// under the read's taps up to the one whose texel is the largest no wider
+// than half the ray's width (at least the finest), of an epoch whose sun is the ray's
+// direction within PAGE_DRIFT of its width over its length to the pages'
+// near plane, for a ray that sees every caster and every volume the pages
+// hold (`RAY_VOLUME_PAGES_SHIFT`); read at camera-relative `p`, the origin,
+// lifted a texel short of the walked band. x: the share, y: the level's
+// texel (0: no answer, the ray walks all of it). Decided by the ray's
+// footprint and the pages' residency, never by who sent it. Rays ask for
+// no pages: the pixels' and the always-resident ones about the eye answer
+// them (asked for at GI's footprints, the page tracer took 0.19 ms a frame
+// on voxel_craft where it took 0.01).
+fn paged_occlusion(ray: SceneRay, p: vec3<f32>) -> vec2<f32> {
+    let none = vec2<f32>(1.0, 0.0);
+    let every = RAY_MASK_STATIC | RAY_MASK_MOVABLE;
+    let finest = sun_occlusion_frame.info.x;
+    let width = scene_ray_width(ray);
+    let held = (params.volume.w >> RAY_VOLUME_PAGES_SHIFT) & 0x1ffu;
+    let space = scene_ray_space(ray);
+    if (scene_ray_mask(ray) & every) != every || finest <= 0.0 || width < finest { return none; }
+    if space != SCENE_SPACE_ANY && space != held { return none; }
+    // A level whose texels are half the ray's width at most: the read's 2x2
+    // filter then spans the ray's width rather than twice it, so its taps
+    // stay on the ray (wide_occlusion_rays_leave_the_ground in
+    // tests/chunks.rs).
+    let want = sun_occlusion_level(0.5 * width);
+    // The finest level resident at the origin up to the footprint's: its
+    // walked band is the shortest, and its texels resolve the most.
+    for (var level = 0u; level <= want; level++) {
+        let texel = finest * exp2(f32(level));
+        let lifted = p + ray.dir * ((PAGE_WALK_TEXELS - 1.0) * texel);
+        for (var e = 0u; e < SUN_OCCLUSION_EPOCH_COUNT; e++) {
+            if sun_occlusion_frame.epochs[e].right.w == 0.0 { continue; }
+            let forward = sun_occlusion_frame.epochs[e].forward.xyz;
+            if dot(ray.dir, -forward) <= 0.0 { continue; }
+            let at = sun_occlusion_texel(p, e, level);
+            let eye = sun_occlusion_frame.epochs[e].levels[level].texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT);
+            let slot = u32(sun_occlusion_frame.epochs[e].right.w) - 1u;
+            let physical = sun_occlusion_physical(slot, level, at.texel >> vec2<u32>(SUN_OCCLUSION_PAGE_SHIFT), eye);
+            if physical == SUN_OCCLUSION_NONE { continue; }
+            let near = bitcast<f32>(sun_occlusion_pages[sun_occlusion_frame.atlas.y + physical]);
+            let length_to_near = max(dot(p, forward) - near, 0.0);
+            let sine = length(cross(ray.dir, -forward));
+            if length_to_near > ray.t_max || sine * length_to_near > PAGE_DRIFT * width { continue; }
+            let r = sun_occlusion_read_level(lifted, vec3<f32>(0.0), e, level);
+            if r.y > 0.0 { return vec2<f32>(r.x, texel); }
+        }
+    }
+    return none;
+}
+
 // An occlusion stream: a ray the terrain meets before its end lets nothing
 // through (voxels are opaque, foliage cells too, as the sun's walks see
-// them); rows already blocked are left. Its entry stays in its kernel: its
-// rays (toward the sun, to nearby points) walk little, and a start row's
-// write and read cost them more than the entry's registers do.
+// them); rows already blocked are left. A ray the sun's pages answer
+// (`paged_occlusion`) walks only its first PAGE_WALK_TEXELS texels in each
+// volume, and the cut's first volume multiplies in what the pages let
+// through past that, for every volume they hold. Its entry stays in its
+// kernel: its rays (toward the sun, to nearby points) walk little, and a
+// start row's write and read cost them more than the entry's registers do.
 @compute @workgroup_size(64)
 fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= ray_header.count { return; }
     let ray = stream_rays[id.x];
-    if !stream_sees(ray) || stream_hits[id.x].t > 0.0 { return; }
-    if stream_walk(id.x, ray, stream_enter(id.x, ray, ray.t_max), ray.t_max).hit {
+    let row = stream_hits[id.x];
+    if !stream_sees(ray) || row.t > 0.0 { return; }
+    // The origin camera-relative in the world's axes (the pages').
+    let p = ray.origin + (ray_frame.origin_hi.xyz - ray_eye.hi.xyz) + (ray_frame.origin_lo.xyz - ray_eye.lo.xyz);
+    let paged = paged_occlusion(ray, p);
+    var reach = ray.t_max;
+    if paged.y > 0.0 { reach = min(reach, PAGE_WALK_TEXELS * paged.y); }
+    if stream_walk(id.x, ray, stream_enter(id.x, ray, reach), reach).hit {
         stream_hits[id.x] = scene_occlusion(vec3<f32>(0.0));
+        return;
+    }
+    if paged.y > 0.0 && paged.x < 1.0 && (params.volume.w & RAY_VOLUME_FIRST) != 0u {
+        stream_hits[id.x] = scene_occlusion(scene_occlusion_through(row) * paged.x);
     }
 }
 
-// The surfaces of the hits this volume found (its tracer's, its index):
-// the face's normal and the one it is lit with (`face_rule` at the ray's
-// footprint there, `scene_ray_footprint`: its width at the origin and its
-// spread times the distance), facing where the
-// ray came from (a ray that starts in rock: back along it); the cell's
-// material (`shown_material`: its own where it has one) shaded as the
-// G-buffer's publish shades it (patches and clumps at the footprint, no
-// voxel pigment; not metallic), the share of light it lets through and
-// what it emits.
+// A terrain hit of a stream as its surface kernels find it again: the
+// face (`axis`, `sign`) of cell `cell` of chunk `slot` (NONE: rock, a ray
+// that starts in it), the material shown there, where it lies
+// (eye-relative, the volume's frame), the ray's direction and footprint
+// there, the face's normal toward where the ray came from (from inside:
+// back along the ray) and the normal it is lit with (`face_rule` at the
+// footprint, `face_lit`; the face's own from inside).
+struct StreamFace {
+    slot: u32,
+    cell: vec3<i32>,
+    axis: u32,
+    sign: u32,
+    material: u32,
+    position: vec3<f32>,
+    dir: vec3<f32>,
+    footprint: f32,
+    normal: vec3<f32>,
+    shading: vec3<f32>,
+}
+
+fn stream_face(ray: SceneRay, hit: SceneHit) -> StreamFace {
+    let payload = scene_hit_payload(hit);
+    let pair = payload & 0x1ffffu;
+    var f = StreamFace(hit.b, vec3<i32>(vec3<u32>(hit.c, hit.c >> 6u, hit.c >> 12u) & vec3<u32>(63u)),
+        (payload >> 17u) & 3u, (payload >> 19u) & 1u, pair & 0xffu, vec3<f32>(0.0), to_local(ray.dir),
+        max(scene_ray_footprint(ray, hit.t), 0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+    f.position = stream_origin(ray) + f.dir * hit.t;
+    f.normal = -f.dir;
+    f.shading = -f.dir;
+    if f.slot != NONE {
+        f.material = shown_material(pair, f.slot, f.cell, f.axis == 2u && f.sign == 1u);
+        if !scene_hit_inside(hit) {
+            let rule = face_rule(f.slot, f.cell, f.axis, f.sign, f.position, f.footprint, vec3<f32>(0.0));
+            var lit = rule.f;
+            if !rule.done { lit = face_lit(rule, f.slot, f.cell, rule.ground); }
+            f.normal = lit.normal;
+            f.shading = lit.shading;
+        }
+    }
+    f.material = min(f.material, 31u);
+    return f;
+}
+
+// The surface a `Diffuse` stream asks for (`SurfaceDetail::Diffuse`: what a
+// probe or a diffuse bounce lights) of face `f`: the material's colour and
+// patches at the footprint, varied from the cell's centre (rock: the hit),
+// no voxel pigment, corner occlusion or textures (cells under the
+// footprint: GI's rays are a probe ray's square wide, decimetres to metres,
+// where the publish fades those out too); the row's roughness, not
+// metallic; its emission and the share it lets through, as `voxel_surface`.
+fn diffuse_surface(f: StreamFace) -> SurfaceData {
+    var at = f.position;
+    if f.slot != NONE {
+        let c = cell_frame(f.slot, f.cell);
+        at = vec3<f32>(c.m0.w, c.m1.w, c.m2.w) + mat3x3<f32>(c.m0.xyz, c.m1.xyz, c.m2.xyz) * (vec3<f32>(f.cell) + 0.5);
+    }
+    let p = params.eye_domain.xyz + vec3<i32>(floor(params.eye_domain_frac.xyz + at / DOMAIN_UNIT));
+    let albedo = clamp(material_albedo(f.material, p, 0.0, f.footprint, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
+    let row = slot_material(f.material);
+    let base = row.base_color.rgb;
+    let emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
+    var surface = surface_data(albedo, to_world(f.shading), clamp(row.roughness_metallic.x, 0.04, 1.0), 0.0, emissive);
+    surface.specular_f0 = vec3<f32>(0.03);
+    return surface_with_transmission(surface, material_transmitted(row, albedo));
+}
+
+// Whether `hit` is this tracer's, in this volume.
+fn stream_ours(hit: SceneHit) -> bool {
+    return scene_hit_tracer(hit) == ray_frame.tracer.x && (hit.c >> 18u) == params.volume.x;
+}
+
+// The surfaces of a `Diffuse` stream's hits this volume found
+// (`diffuse_surface`).
 @compute @workgroup_size(64)
 fn ray_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= ray_header.count { return; }
     let hit = stream_hits[id.x];
-    if scene_hit_tracer(hit) != ray_frame.tracer.x || (hit.c >> 18u) != params.volume.x { return; }
-    let ray = stream_rays[id.x];
-    let payload = scene_hit_payload(hit);
-    let pair = payload & 0x1ffffu;
-    let axis = (payload >> 17u) & 3u;
-    let sign = (payload >> 19u) & 1u;
-    let slot = hit.b;
-    let cell = vec3<i32>(vec3<u32>(hit.c, hit.c >> 6u, hit.c >> 12u) & vec3<u32>(63u));
-    let dir = to_local(ray.dir);
-    let position = stream_origin(ray) + dir * hit.t;
-    let footprint = max(scene_ray_footprint(ray, hit.t), 0.0);
-    var normal = -dir;
-    var shading = -dir;
-    var material = pair & 0xffu;
-    // Where the material varies from: the cell's centre (rock: the hit).
-    var at = position;
-    if slot != NONE {
-        material = shown_material(pair, slot, cell, axis == 2u && sign == 1u);
-        let c = cell_frame(slot, cell);
-        at = vec3<f32>(c.m0.w, c.m1.w, c.m2.w) + mat3x3<f32>(c.m0.xyz, c.m1.xyz, c.m2.xyz) * (vec3<f32>(cell) + 0.5);
-        if !scene_hit_inside(hit) {
-            let rule = face_rule(slot, cell, axis, sign, position, footprint, vec3<f32>(0.0));
-            var f = rule.f;
-            if !rule.done { f = face_lit(rule, slot, cell, rule.ground); }
-            normal = f.normal;
-            shading = f.shading;
-        }
+    if !stream_ours(hit) { return; }
+    let f = stream_face(stream_rays[id.x], hit);
+    stream_surfaces[id.x] = scene_surface_pack(diffuse_surface(f), to_world(f.normal));
+}
+
+// The surfaces of a `Full` stream's hits this volume found: each shaded as
+// the G-buffer's publish shades the face (`voxel_surface`), at the ray's
+// footprint, its material boundaries jittered by the ray's row as a
+// pixel's are by the pixel; a hit in rock, or from inside, the diffuse
+// surface (no face to shade).
+@compute @workgroup_size(64)
+fn ray_surface_full(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= ray_header.count { return; }
+    let hit = stream_hits[id.x];
+    if !stream_ours(hit) { return; }
+    let f = stream_face(stream_rays[id.x], hit);
+    var surface = diffuse_surface(f);
+    if f.slot != NONE && !scene_hit_inside(hit) {
+        surface = voxel_surface(f.slot, f.cell, f.axis, f.sign, f.material, f.position, f.dir, f.shading, f.footprint, vec2<u32>(id.x & 63u, id.x >> 6u));
     }
-    let m = min(material, 31u);
-    let p = params.eye_domain.xyz + vec3<i32>(floor(params.eye_domain_frac.xyz + at / DOMAIN_UNIT));
-    let albedo = clamp(material_albedo(m, p, 0.0, footprint, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
-    let row = slot_material(m);
-    // The row's emission (its colour times its strength), varied as its
-    // colour is (the publish's).
-    let base = row.base_color.rgb;
-    let emissive = albedo * select(vec3<f32>(0.0), row.emissive.rgb / base, base > vec3<f32>(0.0)) * row.emissive.w;
-    stream_surfaces[id.x] = scene_surface(to_world(shading), to_world(normal), albedo, 0.0, clamp(row.roughness_metallic.x, 0.04, 1.0), material_transmission(row), emissive);
+    stream_surfaces[id.x] = scene_surface_pack(surface, to_world(f.normal));
 }

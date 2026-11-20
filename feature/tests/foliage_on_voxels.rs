@@ -191,20 +191,18 @@ impl Harness {
         }
     }
 
-    /// Until the planet pass is settled (at most `limit` frames), then `extra` more.
-    fn settle(
-        &mut self,
-        planet: &Arc<Planet>,
-        eye: DVec3,
-        forward: DVec3,
-        limit: usize,
-        extra: usize,
-    ) {
-        for _ in 0..limit {
+    /// Until the planet pass is settled, then `extra` frames more. The pass
+    /// settles once its kernels are compiled (off the frame, a minute or
+    /// more on a driver cache that has not seen them) and nothing is left to
+    /// generate: the wait is by that signal, never a count of frames.
+    fn settle(&mut self, planet: &Arc<Planet>, eye: DVec3, forward: DVec3, extra: usize) {
+        let started = std::time::Instant::now();
+        while !self.renderer.find_pass::<ChunkPass>().unwrap().settled() {
+            assert!(
+                started.elapsed().as_secs() < 900,
+                "the planet pass never settled"
+            );
             self.run(planet, eye, forward, 1);
-            if self.renderer.find_pass::<ChunkPass>().unwrap().settled() {
-                break;
-            }
         }
         self.run(planet, eye, forward, extra);
     }
@@ -375,7 +373,7 @@ fn foliage_grows_on_the_voxel_ground() {
     let up = eye.normalize();
     let forward = (up.any_orthonormal_vector() - up * 0.6).normalize();
     let shared = Arc::new(planet.clone());
-    h.settle(&shared, eye, forward, 600, 120);
+    h.settle(&shared, eye, forward, 120);
     let (blades, resident) = h.blades(eye);
     // Within the level-0 range of the view (cells of a pixel or more) the ground is the
     // CPU's exactly; further, a coarser level's surface (a cell's height).

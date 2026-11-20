@@ -655,7 +655,9 @@ where tiles held more (toward the horizon): the list has no per-tile cap.
 
 ### Publish
 
-The publish pass writes Helio's gbuffer and depth: material colour
+The publish pass writes Helio's gbuffer and depth through `voxel_surface`
+(the one shading of a face, which ray streams' `Full` surfaces call at a
+ray's footprint: Ray streams, below): material colour
 (`material_albedo`: per-voxel pigment and the materials' patches, clumps
 and blades from the appearance table, sampled at the cell centre's domain
 point; a voxel's pigment is as much its 0.4 m clump's as its own, since a
@@ -756,37 +758,79 @@ offers that to its graph (`stream::offer`).
   0..17 the walk's hit pair (`ROCK_PAIR` a Solid or Buried node's), 17..19
   the face's axis, 19 its side; `b` the chunk's slot (NONE: none); `c` the
   cell (6 bits an axis) and the volume's index (bits 18..30).
-- **Surfaces** (`ray_surface`), a pass of their own once every tracer
-  traced (the walk's kernel stays small, and only hits that stayed the
-  terrain's are shaded): the face's normal toward where the ray came from
-  (a ray from inside: back along it), the normal it is lit with by
-  `hit_face`'s rule without the screen (`face_rule`, `face_lit`: natural
-  steps by the stored slope, smooth worlds by `smooth_normal`, cells under
-  the ray's footprint, its width at the origin plus its spread times the
-  distance (`scene_ray_footprint`), by the slope:
-  the level the cut drew decides), the cell's material (`shown_material`,
-  per-voxel where it has its own) as the G-buffer's publish shades it
-  (`material_albedo`'s patches and clumps at the footprint, no voxel
-  pigment; metalness 0, as the publish writes; the row's roughness), its
-  transmission (`material_transmission`) and emission (the publish's).
+- **Surfaces**, a pass of their own once every tracer traced, only for the
+  hits that stayed the terrain's, by the detail the stream asks
+  (`Stream::detail`; the kernel is picked when the graph builds). Both find
+  the face again the same way (`stream_face`): the face's normal toward
+  where the ray came from (a ray from inside: back along it), the normal it
+  is lit with by `hit_face`'s rule without the screen (`face_rule`,
+  `face_lit`: natural steps by their stored slope, smooth worlds by
+  `smooth_normal`, cells under the ray's footprint, its width at the origin
+  plus its spread times the distance (`scene_ray_footprint`), by the
+  slope), the cell's material (`shown_material`).
+  - `Full` (`ray_surface_full`): `voxel_surface`, the one shading of a
+    face, which the publish calls too (below), at the ray's footprint; the
+    material boundaries' jitter keyed by the ray's row as a pixel's by the
+    pixel. A hit and the G-buffer texel through the same pixel decode to
+    the same surface (`full_stream_surfaces_are_the_gbuffer_texels`: 0 of
+    4,649 differ in any field; worst normal cosine 0.9999999).
+  - `Diffuse` (`ray_surface`, `diffuse_surface`): what a probe lights: the
+    material's colour, patches and clumps at the footprint from the cell's
+    centre, no pigment, corner occlusion or textures (at GI's footprints the
+    publish fades those out too), the row's roughness, not metallic, its
+    emission and the share it lets through. Written by the walk as it takes
+    each hit instead (the contract allows it), the walk's kernel took 0.14
+    ms more than walk and pass together on GI's rays in isolation and 0.16
+    to 0.20 ms more in voxel_craft: the registers the shading holds slow the
+    walk (as every walk kernel's lookups do).
+- **One shading of a face** (`voxel_surface`): the publish's (material
+  colour and patches, the cell's pigment, corner occlusion and edges,
+  scene materials, the shore's swash, emission; not metallic; a
+  dielectric's reflectance; a material that lets light through a thin
+  two-sided surface letting its share through, tinted by its colour). The
+  publish multiplies in the screen's sky samples; a hit has none. Two of
+  the publish's inputs moved to the surface, where a hit has them too: a
+  natural step lights with its own stored slope before the slope a
+  neighbouring shading sample lends (the lent one is its own cell's, a few
+  degrees off); a leaf's share let through is in its surface
+  (`subsurface_color`) and no longer in the shading pass's sun visibility
+  of a back-lit leaf (the sun's light is the same; local lights and GI
+  behind a leaf take the share now too).
 - **Occlusion** (`ray_occlusion`): blocked rows are left; a walk that
   meets the terrain before `t_max` blocks the ray (voxels are opaque, leaf
   cells too, as the sun's walks see them).
-- **Not done: occlusion from the sun's pages at the ray's footprint.**
-  Answering occlusion rays along the sun from the sun's occlusion pages,
-  at the level whose texel is the ray's width (GI's shadow rays are as
-  wide as their probe ray's footprint), cut GI's sun rays on voxel_craft
-  from 0.41 to 0.07-0.09 ms and matched CPU rays to the sun beside towers
-  (5 wrong of 1,295 rays 0.5 m wide), but brightened voxel_craft's shade
-  by 3-8 % (mean |Δ| 0.007-0.014 against r0, where r0-r0 is
-  0.0001-0.0025), with every filter tried (the origin lifted two texels up
-  the sun; a slope bias from the taps' depths; an origin on the taps'
-  interpolated surface taken as lit, else a texel's bias), while the same
-  build with the pages turned off matched the walk (0.0006-0.0013, inside
-  run-to-run noise). Coarse pages under canopies let more sun through than
-  the walk does; why (their trace through a coarse cut, the texel's one
-  ray through gaps, transmissive leaves) is open, and occlusion rays walk
-  until it is known.
+- **Occlusion along the sun at the ray's footprint** (`paged_occlusion`).
+  A ray along the epoch's sun (within half its width over its length to
+  the pages' near plane), at least a finest texel wide, seeing every caster
+  and every volume the pages hold (`RAY_VOLUME_PAGES_SHIFT`: their common
+  space, or mixed), whose page at its origin is resident on a level up to
+  the one whose texel is its width (the finest such), walks its first two
+  texels of that level in every volume and takes what the pages let through
+  past that, multiplied in by the cut's first volume's dispatch
+  (`RAY_VOLUME_FIRST`), read a texel up the sun. Decided by the ray's footprint
+  and page residency alone. Rays ask for no pages: the pixels' and the
+  always-resident ones about the eye answer them (asked for at GI's
+  footprints, the page tracer took 0.19 ms a frame on voxel_craft, where
+  it takes 0.01; most rays find a resident level).
+  - **Why the walked band.** r1 answered these rays from the pages alone
+    and brightened voxel_craft's shade by 3 to 8 %. `sun_pages_under_a_canopy`
+    (a forest planet, 2,573 GI-shaped receivers, every level 0..12)
+    proves the cause: every texel's stored occluder is the walk's at its
+    centre (99.8 to 100 %), and every receiver the pages light that the
+    walk shades lies within the read's bias, a texel (plus the receiver's
+    slope), of its occluder. That bias keeps a surface from shadowing
+    itself across the 2x2 filter and is right for a receiver whose own
+    surface is the texel's size (a pixel of the terrain's sub-pixel cells,
+    which is how the shading pass reads them); from a GI hit, finer than
+    its footprint, it hides every leaf less than a texel over it: the pages
+    lit 0.75 (level 3) to 0.89 (level 5) of the receivers where the walk lit
+    0.61. Walked two texels and read a texel up the sun, the band the bias
+    hides was walked and the receiver's own surface (slopes up to 1.3 over
+    the filter) stays its own: 0.600 lit against the walk's 0.607, 59 of
+    2,573 receivers differ, every level within 0.02.
+  - Cost: GI's 45,466 sun rays from its probe rays' hits, walked whole 0.60
+    ms, answered so 0.14 to 0.15 (`stream_rays_cost`); in voxel_craft
+    VoxelRays gi_shadow 0.20-0.23 ms against 0.41-0.42 walked (r1).
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
   they came, or a form's ray kernels still compiling: `RayLink::complete`;
@@ -794,7 +838,14 @@ offers that to its graph (`stream::offer`).
   trace pass marks the stream short, so a consumer that keeps history
   (GI's probes) holds instead of learning a world without the terrain.
   `ChunkPass::settled` waits for it too: a host that renders until settled
-  gets frames whose ray streams see the terrain.
+  gets frames whose ray streams see the terrain. And the pass asks for
+  frames while its ray kernels compile (`needs_frame`): a host that draws
+  on demand would otherwise go idle with the residency settled and the
+  streams still short, and nothing would wake it when the kernels arrive.
+- **Foliage's ground batches** are answered only when the probes ran
+  (`ChunkWorld::probe_ground` says): while the pipelines compile or before
+  the primary volume's cut is drawn the batch stays unanswered and
+  placement asks again, rather than placing tiles from hits nothing wrote.
 - **The pixels' sky rays** stop at the frame's
   `lighting::indirect_occlusion` distance (GI: twice its finest probe
   spacing), read when the chunk node builds; without one, at
@@ -812,13 +863,13 @@ offers that to its graph (`stream::offer`).
   in its kernel (`ray_occlusion`): its short walks paid more for the row
   than for the registers.
 - **Cost** (`stream_rays_cost`, RTX 3060, a frame of GI's 174 080 probe
-  rays about a ball on the ground, pipelined frames, 2026-11-17, six runs
-  within 0.01 ms): the old `gi_trace` on the same rays (from
-  CPU-placed cells, its hits shaded in its kernel) 1.12 ms; nearest 1.32 ms
-  (its entry 0.17 of it, with the start rows' write; the walk 1.15: the
-  rows' read over `gi_trace`'s walk), surfaces 0.09 ms, occlusion toward
-  the sun 0.25 ms (its entry about 0.14 of it). In one kernel the nearest
-  pass took 1.39 ms; an occlusion pass split took 0.26.
+  rays about a ball on the ground, each started behind its probe as GI
+  starts them, pipelined frames, 2026-11-19): nearest 1.33 ms with its entry
+  (the entry alone 0.19), the `Diffuse` surfaces 0.095, the `Full` ones
+  0.18, the sun's rays from the probe rays' hits 0.60 walked whole and 0.14
+  to 0.15 at their footprint. (2026-11-17, with the probe rays in runs from
+  their probe: nearest 1.32, entry 0.17; the old in-draw `gi_trace` on the
+  same rays 1.12; in one kernel the nearest pass took 1.39 ms.)
 - **Kernels** compile off the frame per form once a stream is traced
   (`ChunkWorld::want_rays`: the link asks for them), like the cross-volume
   passes; drawing never waits for them.
