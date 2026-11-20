@@ -183,8 +183,9 @@ impl ChunkPass {
         self.residency_eye = eye;
     }
 
-    /// Whether residency settles, a save's chunks pack, picks wait or a new
-    /// look settles: a host rendering on demand keeps drawing meanwhile.
+    /// Whether residency settles, the ray kernels compile, a save's chunks
+    /// pack, picks wait or a new look settles: a host rendering on demand
+    /// keeps drawing meanwhile.
     fn wants_frames(&self) -> bool {
         let asked = self.shown.as_ref().is_some_and(|frame| {
             frame.volumes.iter().any(|v| {
@@ -204,7 +205,10 @@ impl ChunkPass {
         asked
             || self.settling > 0
             || self.world.as_ref().is_some_and(ChunkWorld::picks_in_flight)
-            || self.world.as_ref().is_none_or(|w| !w.settled())
+            || self
+                .world
+                .as_ref()
+                .is_none_or(|w| !w.settled() || !w.ray_pipelines_ready())
                 && self.shown.as_ref().is_some_and(|f| !f.volumes.is_empty())
     }
 
@@ -818,7 +822,9 @@ impl ChunkPass {
                 primary_volume(world, &self.held, &frame).map(|v| &v.volume.planet),
             );
             if let (Some(queries), Some(hits), Some(planet)) = exchange {
-                world.probe_ground(
+                // An unanswered batch is asked again: the hits of a world
+                // that cannot draw yet are no ground's.
+                if world.probe_ground(
                     encoder,
                     &queries,
                     &hits,
@@ -826,8 +832,9 @@ impl ChunkPass {
                     planet,
                     trace_eye,
                     at,
-                );
-                self.foliage_ground.answer(question.batch);
+                ) {
+                    self.foliage_ground.answer(question.batch);
+                }
             }
         }
         drop(ground_scope);

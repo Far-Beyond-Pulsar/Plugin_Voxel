@@ -4843,7 +4843,7 @@ fn probe(
 ) -> Vec<helio_foliage_api::GpuGroundHit> {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     let mut recorder = helio_core::CommandRecorder::from_encoder(&mut encoder);
-    world.chunks.probe_ground(
+    let answered = world.chunks.probe_ground(
         &mut recorder,
         &probes.queries,
         &probes.hits,
@@ -4852,6 +4852,7 @@ fn probe(
         eye,
         Vec3::ZERO,
     );
+    assert!(answered, "a drawn world answers ground queries");
     drop(recorder);
     gpu.queue.submit([encoder.finish()]);
     let bytes = common::read_buffer(gpu, &probes.hits, probes.starts.len() as u64 * 16);

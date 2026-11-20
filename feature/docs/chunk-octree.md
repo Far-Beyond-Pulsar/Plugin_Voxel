@@ -838,7 +838,14 @@ offers that to its graph (`stream::offer`).
   trace pass marks the stream short, so a consumer that keeps history
   (GI's probes) holds instead of learning a world without the terrain.
   `ChunkPass::settled` waits for it too: a host that renders until settled
-  gets frames whose ray streams see the terrain.
+  gets frames whose ray streams see the terrain. And the pass asks for
+  frames while its ray kernels compile (`needs_frame`): a host that draws
+  on demand would otherwise go idle with the residency settled and the
+  streams still short, and nothing would wake it when the kernels arrive.
+- **Foliage's ground batches** are answered only when the probes ran
+  (`ChunkWorld::probe_ground` says): while the pipelines compile or before
+  the primary volume's cut is drawn the batch stays unanswered and
+  placement asks again, rather than placing tiles from hits nothing wrote.
 - **The pixels' sky rays** stop at the frame's
   `lighting::indirect_occlusion` distance (GI: twice its finest probe
   spacing), read when the chunk node builds; without one, at

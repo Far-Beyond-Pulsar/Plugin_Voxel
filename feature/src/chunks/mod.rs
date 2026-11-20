@@ -6954,8 +6954,10 @@ impl ChunkWorld {
     }
 
     /// Whether every held form's ray kernels are compiled, when ray streams
-    /// are wanted (drawing never waits for them).
-    fn ray_pipelines_ready(&self) -> bool {
+    /// are wanted (drawing never waits for them). A host drawing on demand
+    /// keeps drawing until they are (`ChunkPass::needs_frame`): the streams'
+    /// consumers hold what they have while the terrain answers short.
+    pub fn ray_pipelines_ready(&self) -> bool {
         let (forms, _) = self.forms_held();
         !self.rays_wanted
             || (0..2).all(|form| {
@@ -8638,11 +8640,6 @@ impl ChunkWorld {
         )
     }
 
-    /// Boxes drawn by the last [`Self::draw`]: from outside, from inside
-    /// (reads the cull back: diagnostics).
-    /// Follows the GI clipmap `clipmap`, around world point `world_eye`
-    /// (the eye, at `eye` in the planet's coordinates): the base cell of
-    /// each probe that came in, located in f64, for its rays' walks.
     /// World boxes (planet coordinates) whose drawn ground changed since the last
     /// call: where foliage is placed again (`chunks::ground`).
     pub fn take_ground_changes(&mut self) -> Vec<[DVec3; 2]> {
@@ -8658,7 +8655,12 @@ impl ChunkWorld {
     /// from a little over the highest terrain `planet` has at the tile's corners and
     /// centre (overhangs included), the same segments below that. Features taller than
     /// that start the walk in them: no ground under a tree's trunk or in a building.
+    ///
+    /// Whether the queries were answered: not while the pipelines compile or before
+    /// the primary volume's cut is drawn, when `hits` is left as it was and the asker
+    /// asks again (`helio_foliage_api::GroundLink::answer` is for answered batches).
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn probe_ground(
         &mut self,
         encoder: &mut helio_core::CommandRecorder<'_>,
@@ -8668,18 +8670,20 @@ impl ChunkWorld {
         planet: &Planet,
         eye: DVec3,
         camera: Vec3,
-    ) {
+    ) -> bool {
         if !self.drawable {
-            return;
+            return false;
         }
         // Foliage is tiled on the primary volume: its walks in its frame.
-        let Some(primary) = self.primary else { return };
+        let Some(primary) = self.primary else {
+            return false;
+        };
         let Some((_, group, _)) = self
             .last_groups
             .as_ref()
             .and_then(|g| g.volumes.iter().find(|(i, ..)| *i == primary).cloned())
         else {
-            return;
+            return false;
         };
         let vol = self.volumes[usize::from(primary)].as_ref().unwrap();
         let (grid, transform, plane) = (vol.grid, vol.transform, vol.grid.is_plane());
@@ -8722,7 +8726,7 @@ impl ChunkWorld {
             })
             .collect();
         if places.is_empty() || queries_in_all == 0 {
-            return;
+            return true;
         }
         self.queue
             .write_buffer(&self.probe_tiles, 0, bytemuck::cast_slice(&places));
@@ -8761,6 +8765,7 @@ impl ChunkWorld {
             pass.set_pipeline(&self.cross_pipelines(*index).ground_probe);
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
+        true
     }
 
     /// Boxes the last volume traced drew: from outside, from inside (reads
