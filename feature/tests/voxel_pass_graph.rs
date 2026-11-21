@@ -1506,8 +1506,10 @@ fn saved_edited_chunks_come_back_through_the_frame() {
 
 /// The pixels' sky rays stop where the frame's indirect diffuse resolves
 /// occlusion (`helio_frame_api::lighting::indirect_occlusion`): GI's offer,
-/// twice its finest probes' spacing, whatever that spacing is; without GI
-/// building in the graph, the terrain's own reach (none set).
+/// with its pixels' gather (its default) where its rays start off the
+/// surface, with its probes alone twice their finest spacing, whatever that
+/// spacing is; without GI building in the graph, the terrain's own reach
+/// (none set).
 #[test]
 fn the_sky_rays_reach_follows_the_indirect_diffuse() {
     let _gpu = gpu_serial();
@@ -1524,12 +1526,18 @@ fn the_sky_rays_reach_follows_the_indirect_diffuse() {
     let Some(default) = reach(voxel_features(), None, &[]) else {
         return;
     };
+    assert_eq!(default, Some(helio_pass_gi::gather::OCCLUSION_START));
+    let probes = helio_pass_gi::GiSettings {
+        quality: helio_pass_gi::GiQuality::Probes,
+        ..Default::default()
+    };
     assert_eq!(
-        default,
+        reach(voxel_features(), Some(probes), &[]).unwrap(),
         Some(2.0 * helio_pass_gi::DEFAULT_FINEST_SPACING as f32)
     );
     let open_ground = helio_pass_gi::GiSettings {
         probe_spacing: Some(1.0),
+        quality: helio_pass_gi::GiQuality::Probes,
         ..Default::default()
     };
     assert_eq!(

@@ -458,15 +458,15 @@ impl Gfx {
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range);
         // Open ground: GI's finest probes a metre apart (its default is
-        // half a metre, for rooms); the pixels' sky rays follow, stopping
-        // where the probes resolve occlusion (`indirect_occlusion`).
+        // half a metre, for rooms); the pixels' sky rays stop where GI's
+        // indirect diffuse resolves occlusion (`indirect_occlusion`).
         let renderer_config =
             renderer_config
                 .with_feature(terrain)
-                .with_feature(helio_pass_gi::GiSettings {
+                .with_feature(crate::gi_ab::gi_settings(helio_pass_gi::GiSettings {
                     probe_spacing: Some(1.0),
                     ..Default::default()
-                });
+                }));
         let handle = scene_db_handle(&scene);
         let builder = RendererBuilder::new(renderer_config.clone(), handle).with_graph(
             // The voxel world, the leaf kinds (particles, sprites, decals,
