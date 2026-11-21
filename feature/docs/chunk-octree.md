@@ -833,7 +833,8 @@ offers that to its graph (`stream::offer`).
     VoxelRays gi_shadow 0.20-0.23 ms against 0.41-0.42 walked (r1).
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
-  they came, or a form's ray kernels still compiling: `RayLink::complete`;
+  they came, or the kernels that stream needs still compiling:
+  `RayLink::complete`;
   a later view that draws none, looking away, is no shortfall), the
   trace pass marks the stream short, so a consumer that keeps history
   (GI's probes) holds instead of learning a world without the terrain.
@@ -842,6 +843,15 @@ offers that to its graph (`stream::offer`).
   frames while its ray kernels compile (`needs_frame`): a host that draws
   on demand would otherwise go idle with the residency settled and the
   streams still short, and nothing would wake it when the kernels arrive.
+- **Kernels compiled in the order the streams need them** (`RayKernel`,
+  `RayKernels::of`). Each ray kernel compiles as a job of its own
+  (`helio_core::compile`), only if a scheduled stream needs it: the trace
+  kernels (a nearest stream's entry and walk, a stream in runs' run
+  entry, an occlusion stream's walk) and the `Diffuse` surfaces first,
+  together, then the `Full` surfaces, the longest, which only a stream
+  asking `Full` waits for. A stream answers once its own kernels are ready
+  for every volume, and traces nothing before (its hits would get no
+  surface).
 - **Foliage's ground batches** are answered only when the probes ran
   (`ChunkWorld::probe_ground` says): while the pipelines compile or before
   the primary volume's cut is drawn the batch stays unanswered and
@@ -870,9 +880,10 @@ offers that to its graph (`stream::offer`).
   to 0.15 at their footprint. (2026-11-17, with the probe rays in runs from
   their probe: nearest 1.32, entry 0.17; the old in-draw `gi_trace` on the
   same rays 1.12; in one kernel the nearest pass took 1.39 ms.)
-- **Kernels** compile off the frame per form once a stream is traced
-  (`ChunkWorld::want_rays`: the link asks for them), like the cross-volume
-  passes; drawing never waits for them.
+- **Kernels** compile off the frame per form, each once a scheduled stream
+  needs it (`ChunkWorld::want_rays` with the link's `RayKernels`; their
+  order above), like the cross-volume passes; drawing never waits for
+  them.
 
 ## Costs
 

@@ -5455,7 +5455,9 @@ use helio_frame_api::rays::stream::{
 /// A world drawn for ray streams: its ray kernels compiled.
 fn ray_world(gpu: &Gpu, planet: &Planet) -> World {
     let mut world = World::new(gpu, planet);
-    world.chunks.want_rays();
+    world
+        .chunks
+        .want_rays(helio_pass_voxel_planet::chunks::rays::RayKernels::ALL);
     world
         .chunks
         .wait_for_pipelines()
