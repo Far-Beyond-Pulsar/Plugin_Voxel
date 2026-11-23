@@ -1685,7 +1685,7 @@ impl Editor {
     fn gather_signal(&self) -> Option<Vec<f32>> {
         let pass = self
             .renderer
-            .find_pass::<helio_pass_gi::GiGatherShadePass>()?;
+            .find_pass::<helio_pass_gi::GiGatherSignalPass>()?;
         let texture = &pass.signal_textures()?[0];
         let (width, height) = (texture.width(), texture.height());
         let row = (width * 8).div_ceil(256) * 256;
