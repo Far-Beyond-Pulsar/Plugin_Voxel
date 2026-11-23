@@ -3944,11 +3944,13 @@ fn history_at(r: Reprojection, n: vec3<f32>, size: vec2<u32>) -> History {
 const GROUP: i32 = 16;
 
 // The clamp's tile: this frame's walked sun about the workgroup (-1: no
-// terrain hit), then each tile row's range over the window's width.
+// terrain hit), then each tile row's range, sum and count over the
+// window's width.
 const CLAMP_TILE: i32 = GROUP + 2 * CLAMP_RADIUS;
 var<workgroup> w_sun: array<f32, 576>;
 var<workgroup> w_lo: array<f32, 384>;
 var<workgroup> w_hi: array<f32, 384>;
+var<workgroup> w_sum: array<vec2<f32>, 384>;
 
 // The sun's and the sky's history (`history_prev`, `history_short_prev`
 // along the hits' motion, the sun's clamped to the range of this frame's
@@ -3978,15 +3980,18 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
         let column = i32(i) % GROUP;
         var lo = 1.0;
         var hi = 0.0;
+        var sum = vec2<f32>(0.0);
         for (var k = 0; k <= 2 * CLAMP_RADIUS; k++) {
             let v = w_sun[row * CLAMP_TILE + column + k];
             if v >= 0.0 {
                 lo = min(lo, v);
                 hi = max(hi, v);
+                sum += vec2<f32>(v, 1.0);
             }
         }
         w_lo[i] = lo;
         w_hi[i] = hi;
+        w_sum[i] = sum;
     }
     workgroupBarrier();
     if id.x >= size.x || id.y >= size.y { return; }
@@ -4006,11 +4011,15 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
     let sky = textureLoad(hit_normals, p, 0).w;
     var lo = sun;
     var hi = sun;
+    var sum = vec2<f32>(0.0);
     for (var k = 0; k <= 2 * CLAMP_RADIUS; k++) {
         let i = (i32(local.y) + k) * GROUP + i32(local.x);
         lo = min(lo, w_lo[i]);
         hi = max(hi, w_hi[i]);
+        sum += w_sum[i];
     }
+    // This frame's samples around, their mean (the pixel's own among them).
+    let around = sum.x / max(sum.y, 1.0);
     // The histories along the motion (none: this frame's samples).
     // Along the hit's volume's motion (`previous_projection`).
     let slot = textureLoad(hit_visibility, p, 0).x;
@@ -4024,6 +4033,18 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
         sun_weight = last.short.z;
         h.x = clamp(h.x, lo, hi);
         short.x = clamp(short.x, lo, hi);
+    } else {
+        // A history begun this frame (a disocclusion, a view that turned)
+        // starts from what this frame's samples around say, worth a cycle
+        // of the pixel's own samples (as ReBLUR's history fix and SVGF's
+        // spatial estimate start short histories), not from its one sample:
+        // most often a neighbour's lent one, worth a twentieth of its own,
+        // which with nothing accumulated showed at full weight until its own
+        // samples came (a lit leaf's sample lent into a canopy's shade: the
+        // speckles after the camera moves).
+        h.x = around;
+        short.x = around;
+        sun_weight = SUN_SHORT * SUN_FRAME_WEIGHT;
     }
     // The short histories: the sun's weighted as the long one (a cycle's
     // weight), so both keep to the same mean.

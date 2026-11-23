@@ -819,6 +819,13 @@ impl Gfx {
                         "screenshot {:?}: no surface texture ({why})",
                         view.screenshot
                     );
+                    // A surface out of date or lost is configured again
+                    // (wgpu's rule); the next frame draws to it.
+                    if why == "outdated" || why == "lost" {
+                        let size = self.size;
+                        self.configured = None;
+                        self.configure(size);
+                    }
                     return;
                 }
             }
