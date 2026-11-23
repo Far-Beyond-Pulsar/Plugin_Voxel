@@ -1530,6 +1530,7 @@ fn the_sky_rays_reach_follows_the_indirect_diffuse() {
     );
     let open_ground = helio_pass_gi::GiSettings {
         probe_spacing: Some(1.0),
+        ..Default::default()
     };
     assert_eq!(
         reach(voxel_features(), Some(open_ground), &[]).unwrap(),

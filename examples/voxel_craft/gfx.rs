@@ -485,6 +485,7 @@ impl Gfx {
                 .with_feature(terrain)
                 .with_feature(helio_pass_gi::GiSettings {
                     probe_spacing: Some(1.0),
+                    ..Default::default()
                 });
         let handle = scene_db_handle(&scene);
         let builder = RendererBuilder::new(renderer_config.clone(), handle).with_graph(
