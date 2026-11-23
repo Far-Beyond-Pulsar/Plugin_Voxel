@@ -6060,6 +6060,157 @@ fn terrain_traces_stream_rays() {
     assert_eq!(past_touched, 0);
 }
 
+/// A cell that lets light through is passed by a ray that starts in it at
+/// the exact levels too, where the tracer walks the grid's own cells (a
+/// smooth 3 km world: exact from level 2, 0.4 m cells, about the eye). From just
+/// inside the top cells the tracer drew there, rays go up and down: on
+/// opaque ground they are in their cell at once; when every material lets
+/// light through, up they leave the cell for the sky (as the CPU finds it
+/// from there: nothing), down they meet the cell under it, about a cell on.
+#[test]
+fn rays_pass_coarse_cells_that_let_light_through() {
+    let Some(gpu) = gpu() else { return };
+    let recipe = PlanetRecipe {
+        radius_m: 3_000.0,
+        // Smooth: a 3 km world's Earth heights are mountains its size.
+        terrain: TerrainLayers::flat().source(7),
+        ..Default::default()
+    };
+    let planet = Planet::new(recipe).unwrap();
+    let exact = helio_pass_voxel_planet::chunks::exact_level(planet.grid());
+    let ground = planet.surface_point(DVec3::new(0.3, 0.9, 0.2).normalize(), 0.0);
+    let up = planet.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let eye = ground + up * 6.0;
+    // Looking down: a small view to resolve, the spots about it drawn at
+    // the coarse levels (out of view).
+    let view = View::new(eye, (side * 0.2 - up).normalize().as_vec3(), [256, 144]);
+    let mut world = ray_world(gpu, &planet);
+    world.settle(gpu, &planet, &view);
+    let frame = eye + DVec3::new(0.75, -0.5, 0.25);
+    let voxel = planet.grid().voxel_size();
+
+    // The drawn top cells about the eye: a probe ray down onto each spot.
+    // Rings 20 to 320 m out: the farther, the coarser the drawn cells.
+    let mut spots = Vec::new();
+    for ring in 0..5 {
+        let r = 20.0 * f64::from(1u32 << ring);
+        for k in 0..48 {
+            let (s, c) = (f64::from(k) * std::f64::consts::TAU / 48.0).sin_cos();
+            let over = planet.surface_point(ground + (side * c + up.cross(side) * s) * r, 0.0);
+            spots.push(over + planet.grid().up(over) * 8.0);
+        }
+    }
+    let probes: Vec<SceneRay> = spots
+        .iter()
+        .map(|&o| common::scene_ray(frame, o, -planet.grid().up(o), 1e30, 0.0))
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &probes,
+        None,
+        0,
+    );
+    // A hundredth of the drawn cell into it: (origin, its up, cell size).
+    let mut starts = Vec::new();
+    let mut levels = [0usize; 16];
+    for (k, &o) in spots.iter().enumerate() {
+        let Some((t, inside)) = terrain_hit(&hits[k]) else {
+            continue;
+        };
+        let level = world
+            .chunks
+            .chunk_at(hits[k].b)
+            .map_or(0, |(key, _)| key.level);
+        levels[(level as usize).min(15)] += 1;
+        if inside || level < exact {
+            continue;
+        }
+        let cell = voxel * f64::from(1u32 << level);
+        let down = -planet.grid().up(o);
+        starts.push((o + down * (t + 0.01 * cell), -down, cell));
+    }
+    eprintln!(
+        "{} starts at the exact levels (from level {exact}); spots by drawn level {levels:?}",
+        starts.len()
+    );
+    assert!(
+        starts.len() > 50,
+        "{} starts at the exact levels",
+        starts.len()
+    );
+    let rays: Vec<SceneRay> = starts
+        .iter()
+        .flat_map(|&(o, u, _)| {
+            [
+                common::scene_ray(frame, o, u, 1e30, 0.0),
+                common::scene_ray(frame, o, -u, 1e30, 0.0),
+            ]
+        })
+        .collect();
+
+    // Opaque ground: in the cell at once, whichever way.
+    let (hits, _) =
+        common::trace_stream(gpu, &world.chunks, RayClass::Nearest, frame, &rays, None, 0);
+    let not_inside = hits
+        .iter()
+        .filter(|h| !terrain_hit(h).is_some_and(|(t, inside)| inside && t < 1e-5))
+        .count();
+    eprintln!("opaque: {not_inside} of {} not inside", rays.len());
+    assert!(
+        not_inside * 100 <= rays.len(),
+        "{not_inside} of {} not inside",
+        rays.len()
+    );
+
+    // Every material lets light through: past the cell.
+    let mut appearance = planet.field().appearance();
+    for m in appearance.materials.iter_mut() {
+        m.transmission = 0.5;
+    }
+    world.chunks.set_appearance(VolumeId(0), &appearance);
+    world.settle(gpu, &planet, &view);
+    let (hits, _) =
+        common::trace_stream(gpu, &world.chunks, RayClass::Nearest, frame, &rays, None, 0);
+    let (mut up_wrong, mut down_wrong) = (0, 0);
+    for (k, &(o, u, cell)) in starts.iter().enumerate() {
+        // Up: the sky past the cell, where the CPU finds nothing either.
+        let cpu = planet.raycast(o + u * (2.0 * cell), u, 200.0);
+        let up_hit = terrain_hit(&hits[2 * k]);
+        if cpu.is_none() && up_hit.is_some() {
+            up_wrong += 1;
+            if up_wrong < 8 {
+                eprintln!("up {k}: traced {up_hit:?} from a cell {cell} m");
+            }
+        }
+        // Down: the cell under it, past this one.
+        let down = terrain_hit(&hits[2 * k + 1]);
+        if !down.is_some_and(|(t, inside)| !inside && t > 0.005 * cell && t < 3.0 * cell) {
+            down_wrong += 1;
+            if down_wrong < 8 {
+                eprintln!("down {k}: traced {down:?} from a cell {cell} m");
+            }
+        }
+    }
+    eprintln!(
+        "letting light through: {} starts, up {up_wrong} wrong, down {down_wrong} wrong",
+        starts.len()
+    );
+    assert!(
+        up_wrong * 100 <= starts.len(),
+        "{up_wrong} of {} up",
+        starts.len()
+    );
+    assert!(
+        down_wrong * 100 <= starts.len(),
+        "{down_wrong} of {} down",
+        starts.len()
+    );
+}
+
 /// Occlusion streams agree with CPU casts: from hits near the eye (a
 /// twentieth of a cell off their face) toward the sun (to 60 m) and toward
 /// points of the air within 8 m, a ray is blocked exactly where the CPU's

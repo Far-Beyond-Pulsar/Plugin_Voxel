@@ -911,7 +911,7 @@ fn chunk_frame(grid: &Grid, tile: Footprint, cz: i32, z: f64) -> Frame {
 /// planet-centred f32 positions err by under a fiftieth of one. Level 13
 /// on an Earth at 0.1 m voxels (820 m cells), level 2 on a 3 km world.
 /// None on a plane.
-fn exact_level(grid: &Grid) -> u32 {
+pub fn exact_level(grid: &Grid) -> u32 {
     if grid.is_plane() {
         return u32::MAX;
     }

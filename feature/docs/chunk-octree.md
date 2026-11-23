@@ -748,13 +748,20 @@ offers that to its graph (`stream::offer`).
   face back along the ray: no walk), and so is one that starts on a solid
   cell's face, within `ON_FACE` (1/1024) of a cell of it, whichever way it
   goes (`on_solid_face`: far past the frames' rounding, so the answer never
-  depends on it; as GI's probes on a mesh's surface count as inside).
+  depends on it; as GI's probes on a mesh's surface count as inside). At
+  every level: below the exact levels in the start chunk's frame; at them,
+  where a start is not placed in a chunk (`point_start`: the walk places
+  itself), in the drawn chunk at the point (`place_at`, as the walk finds
+  it) and the grid's own cells (`cell_point`, `exact_cell`), where the
+  frames only approximate the sphere.
   Consumers start rays off the surfaces they leave. A cell that lets light
   through (`lets_light_through`: its material's transmission, as
   `voxel_surface` shades it, a thin two-sided surface) is the exception: a
   ray from its face (the consumer lighting its back through it, a bounce
   through it) starts where it leaves the cell (`cell_exit`, a hundredth of
-  a cell past its far face; `THROUGH` in the start's row), and an occlusion
+  a cell past its far face: by the frame below the exact levels, by the
+  grid's cell sides at them, `box_exit`; `THROUGH` in the start's row,
+  placed again there with `enter_volume`), and an occlusion
   ray's pages answer from there too. A leaf's back thus takes what reaches
   its far side, for rays as for the pixels' sun (`shadow`) and the local
   lights' walks (`hit_walk`'s `through`); cells past it block as any.

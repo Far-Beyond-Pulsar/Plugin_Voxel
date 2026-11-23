@@ -4907,21 +4907,43 @@ fn cell_pair(slot: u32, c: vec3<i32>) -> u32 {
     return leaf_pair(index);
 }
 
-// The solid cell eye-relative `org` lies in or on a face of, of the chunk
-// it starts in (`start`, a chunk finer than the exact levels): its own cell
-// when solid (no walk then: the walk's first cell would end it at once),
-// else within ON_FACE of a side whose neighbour across is solid (in the
-// start chunk's cells: past its sides for a neighbour in the chunk beside);
-// x 64 where none. Its hit pair in w (a neighbour in the chunk beside: none
-// known, 0).
-fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
-    let none = vec4<i32>(64, 0, 0, 0);
-    if !start.real || exact_level(key_level(start.key.x)) { return none; }
-    let f = chunk_frame(start.slot);
-    let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, org), dot(f.i1.xyz, org), dot(f.i2.xyz, org));
+// The solid cell eye-relative `org` lies in or on a face of, of the drawn
+// chunk holding it (`slot`, `key`; `cell` in its cells, past its sides for
+// a neighbour in the chunk beside; `pair` its hit pair, 0 for a neighbour
+// in the chunk beside: none known): its own cell when solid (no walk then:
+// the walk's first cell would end it at once), else within ON_FACE of a
+// side whose neighbour across is solid; `found` false where none. A start
+// placed in a chunk is that chunk's; at the exact levels a start is not
+// placed (`point_start`: the walk places itself), and the chunk is the
+// drawn one at the point (`place_at`, as the walk finds it), its cells the
+// grid's own (`cell_point`).
+struct SolidFace {
+    slot: u32,
+    key: vec4<i32>,
+    cell: vec3<i32>,
+    pair: u32,
+    found: bool,
+}
+
+fn on_solid_face(start: Walk, org: vec3<f32>, r: i32) -> SolidFace {
+    var out = SolidFace(start.slot, start.key, vec3<i32>(0), 0u, false);
+    if !start.real {
+        let level = key_level(start.key.x);
+        if !exact_level(level) { return out; }
+        let face = start.key.x & 7;
+        let q = exact_cell(exact_ray(org, vec3<f32>(0.0, 0.0, 1.0)), face, level, 0.0);
+        let at = place_at(face, level, vec3<i32>(floor(q)), clamp(fract(q), vec3<f32>(0.0), vec3<f32>(0.999)), r, false);
+        if at.slot == NONE { return out; }
+        out.slot = at.slot;
+        out.key = chunk_keys[at.slot];
+    }
+    let o = cell_point(out.slot, out.key, org);
     let c = vec3<i32>(floor(o));
-    if all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(63)) && solid_at(start.slot, c) {
-        return vec4<i32>(c, i32(cell_pair(start.slot, c)));
+    if all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(63)) && solid_at(out.slot, c) {
+        out.cell = c;
+        out.pair = cell_pair(out.slot, c);
+        out.found = true;
+        return out;
     }
     let into = o - vec3<f32>(c);
     for (var axis = 0u; axis < 3u; axis++) {
@@ -4934,12 +4956,15 @@ fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
             continue;
         }
         let n = c + step;
-        if solid_near(start.slot, start.key, n) {
+        if solid_near(out.slot, out.key, n) {
             let inside = all(n >= vec3<i32>(0)) && all(n <= vec3<i32>(63));
-            return vec4<i32>(n, select(0, i32(cell_pair(start.slot, n)), inside));
+            out.cell = n;
+            out.pair = select(0u, cell_pair(out.slot, n), inside);
+            out.found = true;
+            return out;
         }
     }
-    return none;
+    return out;
 }
 
 // Whether cell `c` of chunk `slot` (key `key`; past its sides, the drawn
@@ -4963,12 +4988,33 @@ fn lets_light_through(slot: u32, key: vec4<i32>, c: vec3<i32>) -> bool {
     return material_transmission(slot_material(shown_material(cell_pair(s, at), s, at, false))) > 0.0;
 }
 
-// Where a ray from eye-relative `org` along `dir` (the volume's frame)
-// leaves cell `c` of chunk `slot`'s frame (`c` may lie past its sides), a
-// hundredth of a cell past its face.
-fn cell_exit(slot: u32, c: vec3<i32>, org: vec3<f32>, dir: vec3<f32>) -> f32 {
+// Eye-relative point `p` in the cells of chunk `slot` (key `key`),
+// continuous: in its frame below the exact levels, in the grid's own cells
+// at them (`exact_cell`: the frame there only approximates the sphere's
+// cells, as `walk` crosses them).
+fn cell_point(slot: u32, key: vec4<i32>, p: vec3<f32>) -> vec3<f32> {
+    let level = key_level(key.x);
+    if exact_level(level) {
+        // At its own point a ray's direction does not matter.
+        return exact_cell(exact_ray(p, vec3<f32>(0.0, 0.0, 1.0)), key.x & 7, level, 0.0) - vec3<f32>(key.yzw * 64);
+    }
     let f = chunk_frame(slot);
-    let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, org), dot(f.i1.xyz, org), dot(f.i2.xyz, org));
+    return vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, p), dot(f.i1.xyz, p), dot(f.i2.xyz, p));
+}
+
+// Where a ray from eye-relative `org` along `dir` (the volume's frame)
+// leaves cell `c` of chunk `slot` (key `key`; `c` may lie past its sides),
+// a hundredth of a cell past its face: in the chunk's frame below the
+// exact levels, by the grid's own cell sides at them (`box_exit`).
+fn cell_exit(slot: u32, key: vec4<i32>, c: vec3<i32>, org: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let level = key_level(key.x);
+    if exact_level(level) {
+        let at = key.yzw * 64 + c;
+        let s = box_exit(exact_ray(org, dir), key.x & 7, level, at, at + vec3<i32>(1), 0.0);
+        return max(s.t1, 0.0) + 0.01 * params.planet.y * f32(1u << u32(level));
+    }
+    let f = chunk_frame(slot);
+    let o = cell_point(slot, key, org);
     let d = vec3<f32>(dot(f.i0.xyz, dir), dot(f.i1.xyz, dir), dot(f.i2.xyz, dir));
     let side = vec3<f32>(c) + select(vec3<f32>(0.0), vec3<f32>(1.0), d > vec3<f32>(0.0));
     let far = select((side - o) / d, vec3<f32>(1e30), d == vec3<f32>(0.0));
@@ -5034,13 +5080,13 @@ fn stream_enter(index: u32, ray: SceneRay, reach: f32) -> RayStart {
     var start = e.t;
     var through = 0u;
     if e.t <= 0.0 {
-        let face = on_solid_face(e.walk, org);
-        if face.x < 64 {
-            if lets_light_through(e.walk.slot, e.walk.key, face.xyz) {
+        let face = on_solid_face(e.walk, org, fade_dither(vec2<u32>(index & 63u, index >> 6u)));
+        if face.found {
+            if lets_light_through(face.slot, face.key, face.cell) {
                 // Placed again where the ray leaves the cell (in the chunk
                 // beside, for a cell past the start chunk's side).
                 let dir = to_local(ray.dir);
-                let past = cell_exit(e.walk.slot, face.xyz, org, dir);
+                let past = cell_exit(face.slot, face.key, face.cell, org, dir);
                 if past >= reach { return out; }
                 let p = enter_volume(org + dir * past, dir, reach - past, fade_dither(vec2<u32>(index & 63u, index >> 6u)));
                 if p.kind == 2u { return out; }
@@ -5054,10 +5100,10 @@ fn stream_enter(index: u32, ray: SceneRay, reach: f32) -> RayStart {
                 start = past + p.t;
                 through = THROUGH;
             } else {
-                let c = vec3<u32>(clamp(face.xyz, vec3<i32>(0), vec3<i32>(63)));
+                let c = vec3<u32>(clamp(face.cell, vec3<i32>(0), vec3<i32>(63)));
                 out.hi.w = START_FACE;
-                out.lo.w = i32(e.walk.slot);
-                out.at = vec4<u32>(0u, u32(face.w), c.x | (c.y << 6u) | (c.z << 12u), 0u);
+                out.lo.w = i32(face.slot);
+                out.at = vec4<u32>(0u, face.pair, c.x | (c.y << 6u) | (c.z << 12u), 0u);
                 return out;
             }
         }
