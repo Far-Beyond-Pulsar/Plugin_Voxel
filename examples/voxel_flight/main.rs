@@ -49,6 +49,8 @@
 //! which inflates every GPU timing.
 
 mod cinematic;
+#[path = "../gi_ab.rs"]
+mod gi_ab;
 mod worlds;
 
 use glam::{DVec3, Vec3};
@@ -284,14 +286,14 @@ impl Flight {
                 .range = Some(meadow.range);
         }
         // Open ground: GI's finest probes a metre apart (its default is
-        // half a metre, for rooms); the pixels' sky rays follow, stopping
-        // where the probes resolve occlusion (`indirect_occlusion`).
+        // half a metre, for rooms); the pixels' sky rays stop where GI's
+        // indirect diffuse resolves occlusion (`indirect_occlusion`).
         let config = config
             .with_feature(terrain)
-            .with_feature(helio_pass_gi::GiSettings {
+            .with_feature(gi_ab::gi_settings(helio_pass_gi::GiSettings {
                 probe_spacing: Some(1.0),
                 ..Default::default()
-            });
+            }));
         let mut renderer = RendererBuilder::new(config.clone(), mirror)
             .with_external_device()
             // The voxel world, the leaf kinds (particles, sprites, decals,

@@ -463,15 +463,37 @@ fn editor_with(
     gi: Option<helio_pass_gi::GiSettings>,
     bypass: &[&str],
 ) -> Option<Editor> {
+    editor_on(width, height, features, gi, bypass, true)
+}
+
+/// [`editor_with`] on a device with hardware ray queries where the adapter
+/// has them and `ray_queries` asks, without otherwise (the non-ray-tracing
+/// tier: the meshes trace nothing, the terrain still does).
+fn editor_on(
+    width: u32,
+    height: u32,
+    features: helio_feature_api::FeatureSet,
+    gi: Option<helio_pass_gi::GiSettings>,
+    bypass: &[&str],
+    ray_queries: bool,
+) -> Option<Editor> {
     let instance = wgpu::Instance::new(helio_core::wgpu_instance_descriptor());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         eprintln!("GPU_VALIDATION_SKIPPED_NO_ADAPTER: editor overlays");
         return None;
     };
+    let mut wanted = required_wgpu_features(adapter.features());
+    if !ray_queries {
+        wanted = wanted - wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: required_wgpu_features(adapter.features()),
+        required_features: wanted,
         required_limits: required_wgpu_limits(adapter.limits()),
-        experimental_features: required_experimental_features(adapter.features()),
+        experimental_features: if ray_queries {
+            required_experimental_features(adapter.features())
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        },
         ..Default::default()
     }))
     .unwrap();
@@ -1506,8 +1528,10 @@ fn saved_edited_chunks_come_back_through_the_frame() {
 
 /// The pixels' sky rays stop where the frame's indirect diffuse resolves
 /// occlusion (`helio_frame_api::lighting::indirect_occlusion`): GI's offer,
-/// twice its finest probes' spacing, whatever that spacing is; without GI
-/// building in the graph, the terrain's own reach (none set).
+/// with its pixels' gather (its default) where its rays start off the
+/// surface, with its probes alone twice their finest spacing, whatever that
+/// spacing is; without GI building in the graph, the terrain's own reach
+/// (none set).
 #[test]
 fn the_sky_rays_reach_follows_the_indirect_diffuse() {
     let _gpu = gpu_serial();
@@ -1524,12 +1548,18 @@ fn the_sky_rays_reach_follows_the_indirect_diffuse() {
     let Some(default) = reach(voxel_features(), None, &[]) else {
         return;
     };
+    assert_eq!(default, Some(helio_pass_gi::gather::OCCLUSION_START));
+    let probes = helio_pass_gi::GiSettings {
+        quality: helio_pass_gi::GiQuality::Probes,
+        ..Default::default()
+    };
     assert_eq!(
-        default,
+        reach(voxel_features(), Some(probes), &[]).unwrap(),
         Some(2.0 * helio_pass_gi::DEFAULT_FINEST_SPACING as f32)
     );
     let open_ground = helio_pass_gi::GiSettings {
         probe_spacing: Some(1.0),
+        quality: helio_pass_gi::GiQuality::Probes,
         ..Default::default()
     };
     assert_eq!(
@@ -1616,7 +1646,91 @@ impl Editor {
             .find_pass::<helio_pass_gi::GiPass>()
             .expect("GI runs: the terrain traces its rays");
         let clipmap = pass.clipmap().expect("placed");
-        let buffer = pass.probes();
+        let words = self.read_words(pass.probes());
+        let updated = (0..helio_pass_gi::PROBES)
+            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] >> 8 > 0)
+            .count();
+        let active = (0..helio_pass_gi::PROBES)
+            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] & 1 == 1)
+            .count();
+        eprintln!(
+            "GI probes: {updated} updated, {active} active; level 0 around {:?} (spacing {})",
+            clipmap.first[0], clipmap.finest
+        );
+        (clipmap, words)
+    }
+
+    /// The frame's indirect diffuse (`INDIRECT_DIFFUSE`): a pixel's rgb
+    /// irradiance / pi and the weight it holds the pixel with.
+    fn indirect_diffuse(&self) -> Option<Vec<[f32; 4]>> {
+        let pass = self.renderer.find_pass::<helio_pass_gi::GiResolvePass>()?;
+        let words = self.read_words(pass.irradiance()?);
+        Some(
+            words
+                .chunks(2)
+                .map(|w| {
+                    [
+                        half(w[0] & 0xffff),
+                        half(w[0] >> 16),
+                        half(w[1] & 0xffff),
+                        half(w[1] >> 16),
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    /// The gather's signal 0 (luminance, chroma, hit distance a traced
+    /// texel), as the last frame wrote it.
+    fn gather_signal(&self) -> Option<Vec<f32>> {
+        let pass = self
+            .renderer
+            .find_pass::<helio_pass_gi::GiGatherSignalPass>()?;
+        let texture = &pass.signal_textures()?[0];
+        let (width, height) = (texture.width(), texture.height());
+        let row = (width * 8).div_ceil(256) * 256;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            texture.size(),
+        );
+        self.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let bytes = staging.slice(..).get_mapped_range().unwrap().to_vec();
+        let mut out = Vec::new();
+        for y in 0..height {
+            for x in 0..width * 4 {
+                let at = (y * row + x * 2) as usize;
+                out.push(half(u32::from(u16::from_le_bytes([
+                    bytes[at],
+                    bytes[at + 1],
+                ]))));
+            }
+        }
+        Some(out)
+    }
+
+    /// `buffer`'s words (waits for the GPU: a test's readback).
+    fn read_words(&self, buffer: &wgpu::Buffer) -> Vec<u32> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: buffer.size(),
@@ -1632,19 +1746,7 @@ impl Editor {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
-        let words: Vec<u32> =
-            bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
-        let updated = (0..helio_pass_gi::PROBES)
-            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] >> 8 > 0)
-            .count();
-        let active = (0..helio_pass_gi::PROBES)
-            .filter(|i| words[(i * helio_pass_gi::PROBE_WORDS + 6) as usize] & 1 == 1)
-            .count();
-        eprintln!(
-            "GI probes: {updated} updated, {active} active; level 0 around {:?} (spacing {})",
-            clipmap.first[0], clipmap.finest
-        );
-        (clipmap, words)
+        bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
     }
 }
 
@@ -1754,6 +1856,75 @@ fn gi_probes_over_voxel_terrain_take_its_light() {
         under > 500 && under_inactive * 20 >= under * 19,
         "{under_inactive} of {under}"
     );
+}
+
+/// GI's pixels' gather on a device without hardware ray queries (the
+/// non-ray-tracing tier): the terrain's tracer alone answers the pixels'
+/// rays, and the sunlit ground's indirect diffuse at its pixels comes from
+/// them (the gather's, weight 1), not from the probes' stand-in.
+#[test]
+fn the_pixels_gather_runs_over_terrain_without_ray_queries() {
+    let _gpu = gpu_serial();
+    let Some(mut editor) = editor_on(320, 180, voxel_features(), None, &[], false) else {
+        return;
+    };
+    assert!(!editor
+        .device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY));
+    editor.renderer.set_editor_mode(false);
+    let open = flat_world(None);
+    let ground = open.surface_point(glam::DVec3::Y, 0.0);
+    let up = open.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let sun = (up + side * 0.5).normalize().as_vec3();
+    editor.set_sky(sun, None);
+    editor.show(Some(PlanetFrame::single(open, sun)));
+    let camera = Camera::perspective_look_to(
+        ground + up * 1.7,
+        (side - up * 0.6).normalize().as_vec3(),
+        up.as_vec3(),
+        std::f32::consts::FRAC_PI_4,
+        16.0 / 9.0,
+        0.05,
+        10_000.0,
+    );
+    editor.settle_gi(&camera, 0, |_| {});
+    assert!(
+        editor
+            .renderer
+            .find_pass::<helio_pass_gi::GiGatherPass>()
+            .is_some(),
+        "the gather builds with the terrain's tracer alone"
+    );
+    // Until the gather's own signal (its rays' hits lit from the cache)
+    // holds light at most of its traced texels and the indirect diffuse
+    // holds most pixels, under a guard.
+    let started = std::time::Instant::now();
+    loop {
+        editor.render(&camera);
+        let image = editor.indirect_diffuse().unwrap_or_default();
+        let lit = image
+            .iter()
+            .filter(|p| p[3] >= 1.0 && p[0] + p[1] + p[2] > 0.0)
+            .count();
+        let signal = editor.gather_signal().unwrap_or_default();
+        let traced = signal.len() / 4;
+        let gathered = signal.chunks(4).filter(|t| t[0] > 0.0).count();
+        if lit * 2 > image.len().max(1) && gathered * 2 > traced.max(1) {
+            eprintln!(
+                "the gather's rays lit {gathered} of {traced} traced texels, the indirect                  diffuse {lit} of {} pixels, after {:.1} s",
+                image.len(),
+                started.elapsed().as_secs_f64()
+            );
+            break;
+        }
+        assert!(
+            started.elapsed().as_secs() < 300,
+            "the gather lit {gathered} of {traced} texels, {lit} of {} pixels",
+            image.len()
+        );
+    }
 }
 
 /// A local light's shadow ray sees the terrain: a point light 2 m over flat
