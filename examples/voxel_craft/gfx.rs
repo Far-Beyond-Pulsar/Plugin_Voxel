@@ -116,6 +116,7 @@ impl PassTimings {
         snapshot: &helio::RenderTimingSnapshot,
         voxel: &[helio_pass_voxel_planet::chunks::FrameTimings],
         stats: Option<helio_pass_voxel_planet::chunks::UpdateStats>,
+        frame_stats: &helio_core::FrameStats,
         size: [u32; 2],
     ) {
         if let Some(render) = profiling::collect_events()
@@ -217,6 +218,11 @@ impl PassTimings {
         }
         self.generation = [0.0; 7];
         self.generated = [0; 2];
+        // The frame statistics last read back (the radiance cache's cells in
+        // use, new, evicted, lit and settled, rays a stream).
+        for (name, value) in frame_stats.latest().iter() {
+            log::info!("[stats] {name} {value}");
+        }
         if let Some(s) = self.last_stats {
             let [generated, evicted, unseen, switches] = self.residency;
             log::info!(
@@ -870,7 +876,13 @@ impl Gfx {
                 .renderer
                 .find_pass::<ChunkPass>()
                 .map(|pass| *pass.stats());
-            timings.add(self.renderer.timing_snapshot(), &voxel, stats, self.size);
+            timings.add(
+                self.renderer.timing_snapshot(),
+                &voxel,
+                stats,
+                self.renderer.frame_stats(),
+                self.size,
+            );
         }
         if let (Some(path), Some(output)) = (view.screenshot, output.as_ref()) {
             self.save_screenshot(&output.texture, path);
