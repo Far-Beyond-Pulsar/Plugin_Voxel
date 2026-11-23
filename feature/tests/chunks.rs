@@ -5782,15 +5782,27 @@ fn terrain_traces_stream_rays() {
         "{inside} rays from over a face start in rock"
     );
     // From exactly on those faces (no offset: the consumer's to give), out
-    // and in: in the cell at once, whichever way they go.
-    let on_face: Vec<SceneRay> = near_hits
+    // and in: in the cell at once, whichever way they go; but a cell that
+    // lets light through (the ball's, a thin two-sided surface) is passed,
+    // the ray starting where it leaves it: in, it meets the ball's next cell
+    // about a cell on; out, what the world shows past the face.
+    let faces: Vec<(DVec3, DVec3, bool)> = near_hits
         .iter()
         .step_by(4)
-        .flat_map(|&(o, d, cpu)| {
-            let at = o + d * cpu.distance;
+        .map(|&(o, d, cpu)| {
+            (
+                o + d * cpu.distance,
+                cpu.normal,
+                planet.material(cpu.cell) == material::BRICK,
+            )
+        })
+        .collect();
+    let on_face: Vec<SceneRay> = faces
+        .iter()
+        .flat_map(|&(at, n, _)| {
             [
-                common::scene_ray(frame, at, cpu.normal, 1e30, 0.0),
-                common::scene_ray(frame, at, -cpu.normal, 1e30, 0.0),
+                common::scene_ray(frame, at, n, 1e30, 0.0),
+                common::scene_ray(frame, at, -n, 1e30, 0.0),
             ]
         })
         .collect();
@@ -5803,18 +5815,52 @@ fn terrain_traces_stream_rays() {
         None,
         0,
     );
-    let not_inside = hits
-        .iter()
-        .filter(|h| !terrain_hit(h).is_some_and(|(t, inside)| inside && t < 1e-5))
-        .count();
+    let (mut opaque, mut not_inside, mut through, mut through_wrong) = (0, 0, 0, 0);
+    for (k, &(at, n, passes)) in faces.iter().enumerate() {
+        for (j, dir) in [n, -n].into_iter().enumerate() {
+            let got = terrain_hit(&hits[2 * k + j]);
+            if !passes {
+                opaque += 1;
+                not_inside += usize::from(!got.is_some_and(|(t, inside)| inside && t < 1e-5));
+                continue;
+            }
+            through += 1;
+            // Past the cell: in, through its far side (a cell on); out, off
+            // the face itself.
+            let past = if j == 1 { voxel } else { 0.0 };
+            let start = at + dir * (past + 0.02 * voxel);
+            // A solid cell past it is met where the ray leaves the first.
+            let cpu = if planet.solid(planet.grid().locate(start).0) {
+                Some(past)
+            } else {
+                planet
+                    .raycast(start, dir, 60.0)
+                    .map(|c| past + 0.02 * voxel + c.distance)
+            };
+            let ok = match (got, cpu) {
+                (Some((t, inside)), Some(want)) => !inside && (t - want).abs() <= 0.1 * voxel,
+                // Nothing within the CPU's 60 m: none, or a hit past them.
+                (got, None) => got.is_none_or(|(t, inside)| !inside && t > 60.0),
+                _ => false,
+            };
+            if !ok {
+                through_wrong += 1;
+                if through_wrong < 8 {
+                    eprintln!("through ray {k}.{j}: traced {got:?}, cpu {cpu:?}");
+                }
+            }
+        }
+    }
     eprintln!(
-        "rays from on faces: {} rays, {not_inside} not inside",
-        on_face.len()
+        "rays from on faces: {opaque} on opaque cells, {not_inside} not inside; {through} on cells that let light through, {through_wrong} wrong"
     );
     assert!(
-        not_inside * 100 <= on_face.len(),
-        "{not_inside} of {} on faces",
-        on_face.len()
+        not_inside * 100 <= opaque,
+        "{not_inside} of {opaque} on faces"
+    );
+    assert!(
+        through > 20 && through_wrong * 100 <= through,
+        "{through_wrong} of {through} through cells that let light through"
     );
     assert!(
         compared > 200 && wrong * 50 <= compared,

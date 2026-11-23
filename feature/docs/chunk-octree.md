@@ -600,7 +600,14 @@ once. A plan that changes a switch under way ends it at once.
    surface (view depth within its slope, normal within 37 degrees),
    bilinear where some are not, none past a disocclusion. A pixel's own
    sample (its walk, once a sample block's cycle) weighs 1, a neighbour's
-   lent one 0.05, so the history keeps to the pixel's own shadow. A long
+   lent one 0.05, so the history keeps to the pixel's own shadow. Past a
+   disocclusion (a turned view, a moved camera) the sun's history begins
+   from the mean of this frame's samples in the 9x9 pixels around, worth a
+   cycle of the pixel's own samples (ReBLUR's history fix, SVGF's spatial
+   estimate for short histories), not from its one sample: most often a
+   neighbour's lent one, which with nothing accumulated showed at full
+   weight until the pixel's own samples came (a lit leaf's sample lent into
+   a canopy's shade: speckles for a few frames after every camera move). A long
    history (32 frames for the sun, 64 for the sky, 16 for a light) and a
    short one (a cycle: 4, 8, 4) are kept; the sun's and the lights' are
    clamped to the range of this frame's samples in the 9x9 pixels around,
@@ -742,7 +749,15 @@ offers that to its graph (`stream::offer`).
   cell's face, within `ON_FACE` (1/1024) of a cell of it, whichever way it
   goes (`on_solid_face`: far past the frames' rounding, so the answer never
   depends on it; as GI's probes on a mesh's surface count as inside).
-  Consumers start rays off the surfaces they leave.
+  Consumers start rays off the surfaces they leave. A cell that lets light
+  through (`lets_light_through`: its material's transmission, as
+  `voxel_surface` shades it, a thin two-sided surface) is the exception: a
+  ray from its face (the consumer lighting its back through it, a bounce
+  through it) starts where it leaves the cell (`cell_exit`, a hundredth of
+  a cell past its far face; `THROUGH` in the start's row), and an occlusion
+  ray's pages answer from there too. A leaf's back thus takes what reaches
+  its far side, for rays as for the pixels' sun (`shadow`) and the local
+  lights' walks (`hit_walk`'s `through`); cells past it block as any.
 - **Runs from one origin** (`Stream::run`: a stream whose rays share an
   origin, r2's camera rays first; GI's probe rays are not runs, each starts
   behind its probe along its own direction). Where a ray starts depends on its direction only when its origin
@@ -763,11 +778,13 @@ offers that to its graph (`stream::offer`).
   (`Stream::detail`; the kernel is picked when the graph builds). Both find
   the face again the same way (`stream_face`): the face's normal toward
   where the ray came from (a ray from inside: back along it), the normal it
-  is lit with by `hit_face`'s rule without the screen (`face_rule`,
-  `face_lit`: natural steps by their stored slope, smooth worlds by
-  `smooth_normal`, cells under the ray's footprint, its width at the origin
-  plus its spread times the distance (`scene_ray_footprint`), by the
-  slope), the cell's material (`shown_material`).
+  is lit with by `hit_face`'s rule (`face_rule`, `face_lit`: natural steps
+  by their stored slope, smooth worlds by `smooth_normal`, cells under the
+  ray's footprint, its width at the origin plus its spread times the
+  distance (`scene_ray_footprint`), by the slope: the leaf's stored one,
+  else the column tops' around, as a pixel's hit is lit: one description of
+  a hit's slope for the screen and the rays), the cell's material
+  (`shown_material`).
   - `Full` (`ray_surface_full`): `voxel_surface`, the one shading of a
     face, which the publish calls too (below), at the ray's footprint; the
     material boundaries' jitter keyed by the ray's row as a pixel's by the
