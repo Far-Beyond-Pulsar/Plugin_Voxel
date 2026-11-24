@@ -1775,6 +1775,12 @@ fn chunk_engine_hold(flight: &mut Flight, view: &str, eye: DVec3, forward: Vec3)
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // The frame statistics last read back (the radiance cache's cells in
+    // use, new, evicted, lit and settled; GI's hits by state), as
+    // voxel_craft logs them.
+    for (name, value) in flight.renderer.frame_stats().latest().iter() {
+        eprintln!("[stats] {name} {value}");
+    }
     // The foliage drawn: blades a LOD (the pass's last read-back counters).
     if let Some(foliage) = flight
         .renderer
