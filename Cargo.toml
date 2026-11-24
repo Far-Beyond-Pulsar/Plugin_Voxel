@@ -1,6 +1,6 @@
 [package]
 name = "voxel_plugin"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 description = "Voxel Worlds (`pulsar.voxel`): the plugin's root crate, the one place it registers everything it contributes (runtime registrations always, the editor's with `editor`)"
@@ -8,6 +8,9 @@ description = "Voxel Worlds (`pulsar.voxel`): the plugin's root crate, the one p
 autoexamples = false
 
 [features]
+# The plugin as a library of its own, loaded by the editor from plugins/editor:
+# cargo build -p <this package> --release --features dll
+dll = ["editor", "dep:plugin_editor_api", "plugin_editor_api/editor", "plugin_editor_api/shared-dylibs"]
 # The editor's registrations (the sculpt and terrain tool modes, the stroke
 # interaction, the save hook, the generator follow-up, the terrain's camera
 # framing) and the crates they need. A game links the root without it, so it
@@ -15,6 +18,8 @@ autoexamples = false
 editor = ["dep:voxel_editor", "dep:ui_level_editor", "dep:ui_common"]
 
 [dependencies]
+# The plugin library's editor plugin entry point (feature `dll`).
+plugin_editor_api = { workspace = true, optional = true }
 # The plugin gate and the builder its registrations go through.
 pulsar_plugins = { workspace = true }
 # The plugin's crates.
@@ -86,3 +91,7 @@ ui_common = { workspace = true }
 
 [lints]
 workspace = true
+
+# Also the plugin as a library of its own (feature `dll`, loaded by the editor).
+[lib]
+crate-type = ["cdylib", "rlib"]
