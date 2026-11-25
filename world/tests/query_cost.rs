@@ -219,3 +219,170 @@ fn brick_cost_on_earth() {
         );
     }
 }
+
+/// What sampling bricks costs side by side: 64 bricks of a forest (cold
+/// caches each time) one after another and on 8 threads, and how long one
+/// cell's query (the game thread's) waits while 4 threads sample bricks. A
+/// measurement, run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn bricks_sampled_side_by_side() {
+    const N: i32 = 16;
+    const THREADS: usize = 8;
+    let origins = |planet: &Planet| {
+        let (cell, _) = planet.grid().locate(forest(planet));
+        let mut out = Vec::new();
+        for dj in -4..4 {
+            for di in -4..4 {
+                out.push((
+                    cell.face,
+                    [
+                        (cell.i.div_euclid(N) + di) * N,
+                        (cell.j.div_euclid(N) + dj) * N,
+                        (cell.k.div_euclid(N) - 1) * N,
+                    ],
+                ));
+            }
+        }
+        (cell, out)
+    };
+    for round in 0..3 {
+        let planet = earth();
+        let (_, bricks) = origins(&planet);
+        let started = Instant::now();
+        for (face, origin) in &bricks {
+            std::hint::black_box(planet.sample_brick(*face, *origin, N, true));
+        }
+        let one = started.elapsed().as_secs_f64() * 1e3;
+
+        let planet = earth();
+        let (_, bricks) = origins(&planet);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (planet, bricks) = (&planet, &bricks);
+                scope.spawn(move || {
+                    for (face, origin) in bricks.iter().skip(t).step_by(THREADS) {
+                        std::hint::black_box(planet.sample_brick(*face, *origin, N, true));
+                    }
+                });
+            }
+        });
+        let many = started.elapsed().as_secs_f64() * 1e3;
+        // The same on a world a thread (nothing shared but the machine):
+        // what the threads cost each other apart from the world's caches.
+        let planets: Vec<Planet> = (0..THREADS).map(|_| earth()).collect();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for (t, planet) in planets.iter().enumerate() {
+                let bricks = &bricks;
+                scope.spawn(move || {
+                    for (face, origin) in bricks.iter().skip(t).step_by(THREADS) {
+                        std::hint::black_box(planet.sample_brick(*face, *origin, N, true));
+                    }
+                });
+            }
+        });
+        let apart = started.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "QUERY_COST round {round}: 64 bricks 16^3 one thread {one:.1} ms, {THREADS} threads {many:.1} ms ({:.2}x), a world each {apart:.1} ms ({:.2}x)",
+            one / many,
+            one / apart
+        );
+
+        // A reader beside the samplers: cells 40 m off, each a new column.
+        let planet = earth();
+        let (cell, bricks) = origins(&planet);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut waits: Vec<f64> = Vec::new();
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                let (planet, bricks, done) = (&planet, &bricks, &done);
+                scope.spawn(move || {
+                    for (face, origin) in bricks.iter().skip(t).step_by(4) {
+                        std::hint::black_box(planet.sample_brick(*face, *origin, N, true));
+                    }
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                });
+            }
+            let mut n = 0;
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let started = Instant::now();
+                std::hint::black_box(planet.solid_of(
+                    Cell::new(
+                        cell.face,
+                        cell.i + 400 + n % 600,
+                        cell.j + n / 600,
+                        cell.k - 3,
+                    ),
+                    Matter::All,
+                ));
+                waits.push(started.elapsed().as_secs_f64() * 1e3);
+                n += 1;
+            }
+        });
+        waits.sort_by(f64::total_cmp);
+        let at = |share: f64| waits[((waits.len() - 1) as f64 * share) as usize];
+        eprintln!(
+            "QUERY_COST round {round}: one cell beside 4 samplers: {} queries, median {:.4} ms, p99 {:.3} ms, max {:.3} ms",
+            waits.len(),
+            at(0.5),
+            at(0.99),
+            at(1.0)
+        );
+    }
+}
+
+/// What making a focus resident costs through the query workers (16 m
+/// around an eye in a forest, as a sculpting camera or a player keeps),
+/// and how long the thread that asked waits on a call meanwhile. A
+/// measurement, run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn a_focus_loads() {
+    use helio_voxel_world::queries::WorldQueries;
+    for (round, threads) in [(0, 2), (1, 2), (2, 8)] {
+        let planet = std::sync::Arc::new(earth());
+        let eye = forest(&planet);
+        let queries = WorldQueries::new(planet.clone(), threads);
+        let started = Instant::now();
+        queries.focus(1, eye, 16.0);
+        let first = started.elapsed().as_secs_f64() * 1e3;
+        let wanted = queries.loading();
+        let mut waits: Vec<f64> = Vec::new();
+        loop {
+            let asked = Instant::now();
+            let left = queries.loading();
+            waits.push(asked.elapsed().as_secs_f64() * 1e3);
+            if left == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        // The focus follows its eye: each move past half a brick lists it
+        // again, on the thread that calls (a game's, every few frames).
+        let side = planet.grid().up(eye).any_orthonormal_vector();
+        let mut moves: Vec<f64> = (1..=20)
+            .map(|n| {
+                let asked = Instant::now();
+                queries.focus(1, eye + side * f64::from(n), 16.0);
+                asked.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        moves.sort_by(f64::total_cmp);
+        eprintln!(
+            "QUERY_COST round {round}: focus() first {first:.2} ms; moved 1 m: median {:.2} ms, max {:.2} ms",
+            moves[moves.len() / 2],
+            moves[moves.len() - 1]
+        );
+        waits.sort_by(f64::total_cmp);
+        eprintln!(
+            "QUERY_COST round {round}: a 16 m focus, {threads} workers: {wanted} bricks in {ms:.0} ms ({:.3} ms a brick); the asking thread's calls: median {:.4} ms, p99 {:.3} ms, max {:.3} ms",
+            ms / wanted as f64,
+            waits[waits.len() / 2],
+            waits[(waits.len() - 1) * 99 / 100],
+            waits[waits.len() - 1],
+        );
+    }
+}

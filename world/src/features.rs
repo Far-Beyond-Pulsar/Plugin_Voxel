@@ -970,7 +970,10 @@ impl<'a> FeatureEval<'a> {
             self.features.spawns[s].reach,
         );
         let g = |v: i32| v.div_euclid(spacing);
-        ([g(i[0] - r), g(i[1] - 1 + r)], [g(j[0] - r), g(j[1] - 1 + r)])
+        (
+            [g(i[0] - r), g(i[1] - 1 + r)],
+            [g(j[0] - r), g(j[1] - 1 + r)],
+        )
     }
 
     /// `visit` each of spawn `s`'s placements of the squares that may reach

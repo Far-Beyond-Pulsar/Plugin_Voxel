@@ -2233,6 +2233,8 @@ pub struct Worker {
     jobs: std::sync::mpsc::Sender<Job>,
     results: std::sync::Mutex<std::sync::mpsc::Receiver<Plans>>,
     busy: bool,
+    /// The planner's thread ended (it panicked): no plan comes any more.
+    stopped: bool,
     /// Volumes added or removed since the last job.
     changes: Vec<Change>,
     /// Structural events and frames of ray reports submitted so far.
@@ -2331,10 +2333,16 @@ impl Worker {
             },
         )
         .expect("chunk residency thread");
+        Self::over(jobs, results)
+    }
+
+    /// The planners' side of their thread's channels.
+    fn over(jobs: std::sync::mpsc::Sender<Job>, results: std::sync::mpsc::Receiver<Plans>) -> Self {
         Self {
             jobs,
             results: std::sync::Mutex::new(results),
             busy: false,
+            stopped: false,
             changes: Vec::new(),
             events_sent: 0,
             reports_sent: 0,
@@ -2383,23 +2391,54 @@ impl Worker {
             .filter(|e| e.structural())
             .count() as u64;
         self.reports_sent += std::mem::take(reports);
-        self.busy = self
-            .jobs
-            .send(Job {
-                events_seen: self.events_sent,
-                reports_seen: self.reports_sent,
-                frame,
-                changes: std::mem::take(&mut self.changes),
-                volumes,
-            })
-            .is_ok();
+        let sent = self.jobs.send(Job {
+            events_seen: self.events_sent,
+            reports_seen: self.reports_sent,
+            frame,
+            changes: std::mem::take(&mut self.changes),
+            volumes,
+        });
+        self.busy = true;
+        if sent.is_err() {
+            self.stop();
+        }
+    }
+
+    /// The planners' thread is gone: said once, and busy from now on
+    /// (nothing is submitted to it).
+    fn stop(&mut self) {
+        if !self.stopped {
+            eprintln!(
+                "VOXEL error: the residency planner stopped; the terrain keeps the detail it has and streams no more"
+            );
+        }
+        self.stopped = true;
+        self.busy = true;
     }
 
     /// The finished plans, if any.
     pub fn poll(&mut self) -> Option<Plans> {
-        let plans = self.results.get_mut().ok()?.try_recv().ok()?;
-        self.busy = false;
-        Some(plans)
+        let results = self
+            .results
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match results.try_recv() {
+            Ok(plans) => {
+                self.busy = false;
+                Some(plans)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.stop();
+                None
+            }
+        }
+    }
+
+    /// Whether the planners' thread ended: the plans in hand are the last
+    /// (the cut drawn stays, nothing refines or is released any more).
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// Structural events submitted so far ([`Event::structural`]).
@@ -2453,6 +2492,34 @@ pub fn tiles_at(grid: &Grid, level: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A planner thread that is gone (it panicked) is reported, not waited
+    /// for: the worker stays busy, so nothing more is submitted to it, and
+    /// says it stopped, so the world keeps no events for it.
+    #[test]
+    fn a_planner_thread_that_is_gone_is_reported() {
+        let (jobs, inbox) = std::sync::mpsc::channel();
+        let (outbox, results) = std::sync::mpsc::channel::<Plans>();
+        let mut worker = Worker::over(jobs, results);
+        assert!(worker.poll().is_none() && !worker.stopped() && !worker.busy());
+        let mut reports = 3;
+        worker.submit(1, &mut reports, Vec::new());
+        assert!(worker.busy() && !worker.stopped() && worker.reports_sent() == 3);
+        // The thread ends with the job in hand: no plan comes.
+        drop(outbox);
+        assert!(worker.poll().is_none());
+        assert!(worker.stopped() && worker.busy());
+        assert!(worker.poll().is_none() && worker.busy(), "and stays so");
+
+        // A thread already gone when a job is sent.
+        let (jobs, inbox_gone) = std::sync::mpsc::channel();
+        let (_outbox, results) = std::sync::mpsc::channel::<Plans>();
+        drop(inbox_gone);
+        let mut worker = Worker::over(jobs, results);
+        worker.submit(1, &mut reports, Vec::new());
+        assert!(worker.stopped() && worker.busy());
+        drop(inbox);
+    }
 
     fn config() -> PlanConfig {
         PlanConfig {

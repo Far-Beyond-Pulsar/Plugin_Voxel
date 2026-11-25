@@ -397,15 +397,76 @@ pub struct Planet {
     edit_bottom: f64,
     /// Column heights and feature placements: functions of the terrain
     /// alone, so every copy of the world (a snapshot) shares them.
-    heights: Arc<Mutex<rustc_hash::FxHashMap<(u8, i32, i32, u32), i32>>>,
+    heights: Arc<TerrainCache<(u8, i32, i32, u32), i32>>,
     features: Arc<CompiledFeatures>,
     placements: Arc<Mutex<PlacementCache>>,
     /// The field's volume layer (`docs/volumes.md`), its regions' cave
     /// networks and the volume columns queries read (functions of the
     /// terrain alone, shared like the caches above).
     volumes: Option<VolumeLayer>,
-    networks: Arc<Mutex<rustc_hash::FxHashMap<(u8, i32, i32), Arc<Vec<Primitive>>>>>,
-    volume_columns: Arc<Mutex<rustc_hash::FxHashMap<(u8, i32, i32, u32), Arc<VolumeColumn>>>>,
+    networks: Arc<TerrainCache<(u8, i32, i32), Arc<Vec<Primitive>>>>,
+    volume_columns: Arc<TerrainCache<(u8, i32, i32, u32), Arc<VolumeColumn>>>,
+}
+
+/// One of the world's caches (heights, placements, cave networks, volume
+/// columns): functions of the terrain alone, each entry inserted whole, so
+/// what a thread that panicked holding one left is valid as it is. A query
+/// after it reads the cache, not a poisoned lock.
+fn cached<T>(cache: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Shards of a [`TerrainCache`].
+const CACHE_SHARDS: usize = 64;
+
+/// What a function of the terrain gave for each key asked so far (a
+/// column's height, its volume column, a region's cave network), shared by
+/// every copy of the world and every thread that queries one. Sharded by
+/// key: threads sampling side by side (query workers, a rebuild on every
+/// core, the game thread's own queries) seldom meet on a lock, and a shard
+/// is held for a lookup or an insert only, never while a value is
+/// evaluated (two threads that miss a key both evaluate it, to the same
+/// value). A shard that fills starts over alone, so the cache never drops
+/// everything it knows at once.
+struct TerrainCache<K, V> {
+    shards: [Mutex<rustc_hash::FxHashMap<K, V>>; CACHE_SHARDS],
+}
+
+impl<K, V> Default for TerrainCache<K, V> {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::default()),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> TerrainCache<K, V> {
+    fn shard(&self, key: &K) -> std::sync::MutexGuard<'_, rustc_hash::FxHashMap<K, V>> {
+        use std::hash::BuildHasher;
+        // Not the bits the map itself spreads its buckets by.
+        let hash = rustc_hash::FxBuildHasher.hash_one(key);
+        cached(&self.shards[(hash >> 40) as usize % CACHE_SHARDS])
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.shard(key).get(key).cloned()
+    }
+
+    /// Keep `value` for `key`, in a cache of at most about `kept` entries.
+    fn insert(&self, key: K, value: V, kept: usize) {
+        let mut shard = self.shard(&key);
+        if shard.len() >= kept / CACHE_SHARDS {
+            shard.clear();
+        }
+        shard.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| cached(shard).len()).sum()
+    }
 }
 
 /// A copy shares everything but what its edits change: the recipe, field,
@@ -497,7 +558,7 @@ impl Planet {
             )
         };
         let near = {
-            let mut cache = self.placements.lock().expect("placements");
+            let mut cache = cached(&self.placements);
             if cache.len() > 1 << 20 {
                 cache.clear();
             }
@@ -753,8 +814,8 @@ impl Planet {
             return Arc::default();
         };
         let key = (face, ri, rj);
-        if let Some(n) = self.networks.lock().expect("networks").get(&key) {
-            return Arc::clone(n);
+        if let Some(n) = self.networks.get(&key) {
+            return n;
         }
         let level = v.reference_level();
         let mut ground = [(0, 0); SITES];
@@ -767,11 +828,7 @@ impl Planet {
             }
         }
         let network = Arc::new(v.network(face, ri, rj, &ground));
-        let mut cache = self.networks.lock().expect("networks");
-        if cache.len() > 1 << 16 {
-            cache.clear();
-        }
-        cache.insert(key, Arc::clone(&network));
+        self.networks.insert(key, Arc::clone(&network), 1 << 16);
         network
     }
     /// What the volume layer reads of level column `(i, j)` once: its
@@ -779,13 +836,8 @@ impl Planet {
     /// below and above its top they may change (`tile_volumes_main`).
     pub fn volume_column(&self, face: u8, i: i32, j: i32, level: u32) -> Arc<VolumeColumn> {
         let key = (face, i, j, level);
-        if let Some(c) = self
-            .volume_columns
-            .lock()
-            .expect("volume columns")
-            .get(&key)
-        {
-            return Arc::clone(c);
+        if let Some(c) = self.volume_columns.get(&key) {
+            return c;
         }
         let height = self.column_height(face, i, j, level);
         let top = terrain::top_cells(&self.grid, height, level);
@@ -822,11 +874,7 @@ impl Planet {
             }
         }
         let c = Arc::new(c);
-        let mut cache = self.volume_columns.lock().expect("volume columns");
-        if cache.len() > 1 << 18 {
-            cache.clear();
-        }
-        cache.insert(key, Arc::clone(&c));
+        self.volume_columns.insert(key, Arc::clone(&c), 1 << 18);
         c
     }
     /// Generated kind of level cell `k` of a column before edits (0 air,
@@ -887,20 +935,13 @@ impl Planet {
     /// Band-limited surface height of a level column, in height units.
     pub fn column_height(&self, face: u8, i: i32, j: i32, level: u32) -> i32 {
         let key = (face, i, j, level);
-        if let Ok(cache) = self.heights.lock() {
-            if let Some(&h) = cache.get(&key) {
-                return h;
-            }
+        if let Some(h) = self.heights.get(&key) {
+            return h;
         }
         let h = self
             .field
             .height(crate::terrain::Column { face, i, j, level });
-        if let Ok(mut cache) = self.heights.lock() {
-            if cache.len() > 1 << 20 {
-                cache.clear();
-            }
-            cache.insert(key, h);
-        }
+        self.heights.insert(key, h, 1 << 20);
         h
     }
     /// First air layer above the column (level cells).
@@ -912,17 +953,11 @@ impl Planet {
     pub fn column_top_bound(&self, face: u8, i: i32, j: i32, level: u32) -> i32 {
         // Cached with the heights, keyed past the grid's levels.
         let key = (face, i, j, level + 64);
-        let cached = self.heights.lock().ok().and_then(|c| c.get(&key).copied());
-        let h = cached.unwrap_or_else(|| {
+        let h = self.heights.get(&key).unwrap_or_else(|| {
             let h = self
                 .field
                 .height_bound(crate::terrain::Column { face, i, j, level });
-            if let Ok(mut cache) = self.heights.lock() {
-                if cache.len() > 1 << 20 {
-                    cache.clear();
-                }
-                cache.insert(key, h);
-            }
+            self.heights.insert(key, h, 1 << 20);
             h
         });
         terrain::top_cells(&self.grid, h, level)
@@ -1029,7 +1064,7 @@ impl Planet {
                     self.column_height(f, i, j, 0),
                 )
             };
-            let mut cache = self.placements.lock().expect("placements");
+            let mut cache = cached(&self.placements);
             if cache.len() > 1 << 20 {
                 cache.clear();
             }
@@ -1837,6 +1872,78 @@ mod tests {
         );
         let landed = planet.surface_point_of(eye, 0.0, Matter::Ground);
         assert!((g.height(landed) - f64::from(ground) * g.voxel_size()).abs() < 1e-4);
+    }
+
+    /// A thread that panics holding one of the world's caches leaves the
+    /// world answering: every query after it reads the caches as they are
+    /// (whole entries), with the answers of a world never touched.
+    #[test]
+    fn a_panic_holding_a_cache_does_not_poison_the_world() {
+        let recipe = PlanetRecipe {
+            terrain: crate::layers::TerrainLayers::earth().source(7),
+            features: crate::feature_recipe::FeatureRecipe::earth().grow(0.1, 7),
+            ..Default::default()
+        };
+        let planet = Planet::new(recipe.clone()).unwrap();
+        let (face, c0) = (2u8, planet.grid().cells() / 2);
+        let top = planet.column_top(face, c0, c0, 0);
+        let cells: Vec<Cell> = (0..40)
+            .flat_map(|d| (-3..6).map(move |k| Cell::new(face, c0 + d * 7, c0 - d * 3, top + k)))
+            .collect();
+        // Warm, so the caches hold entries when they are poisoned.
+        for cell in &cells[..90] {
+            planet.material(*cell);
+        }
+        let key = (face, c0, c0, 0u32);
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _placements = planet.placements.lock().unwrap();
+                    let _heights = planet.heights.shard(&key);
+                    let _columns = planet.volume_columns.shard(&key);
+                    let _networks = planet.networks.shard(&(face, 0, 0));
+                    panic!("a query fell over holding the caches");
+                })
+                .join()
+        });
+        assert!(panicked.is_err() && planet.placements.is_poisoned());
+        let fresh = Planet::new(recipe).unwrap();
+        for cell in &cells {
+            assert_eq!(planet.material(*cell), fresh.material(*cell), "{cell:?}");
+            assert_eq!(
+                planet.solid_of(*cell, Matter::All),
+                fresh.solid_of(*cell, Matter::All)
+            );
+        }
+        assert_eq!(
+            planet.sample_brick(face, [c0, c0, top - 8], 16, true),
+            fresh.sample_brick(face, [c0, c0, top - 8], 16, true)
+        );
+        assert_eq!(
+            planet.cave_network(face, 0, 0),
+            fresh.cave_network(face, 0, 0)
+        );
+    }
+
+    /// A terrain cache holds about what it is told to keep: a shard that
+    /// fills starts over alone, the others keep what they know.
+    #[test]
+    fn a_full_cache_shard_starts_over_alone() {
+        let cache = TerrainCache::<(u8, i32, i32, u32), i32>::default();
+        let kept = CACHE_SHARDS * 32;
+        let mut most = 0;
+        for n in 0..20_000i32 {
+            let key = (0, n, n * 7, 0);
+            cache.insert(key, n, kept);
+            assert_eq!(cache.get(&key), Some(n));
+            most = most.max(cache.len());
+        }
+        assert!(most <= kept, "{most} entries of {kept}");
+        assert!(
+            cache.len() > kept / 4,
+            "shards start over one at a time: {} entries left",
+            cache.len()
+        );
     }
 
     /// Earth without caves and overhangs: a pure heightfield, for

@@ -72,9 +72,13 @@ struct Request {
     base: Option<Arc<BuiltWorld>>,
 }
 
+/// A build's outcome: the world and the edits it applied to its base, in
+/// order, or why it has none.
+type Built = Result<(BuiltWorld, Vec<EditYield>), String>;
+
 struct Landed {
     target: WorldTarget,
-    built: Result<(BuiltWorld, Vec<EditYield>), String>,
+    built: Built,
 }
 
 #[derive(Default)]
@@ -127,19 +131,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl TerrainWorld {
     fn new() -> Self {
+        Self::built_by(build)
+    }
+
+    /// A terrain's world whose builds `build` makes, on its own thread.
+    fn built_by(
+        build: impl Fn(&WorldTarget, Option<&BuiltWorld>) -> Built + Send + 'static,
+    ) -> Self {
         let (requests, inbox) = mpsc::channel::<Request>();
         let (outbox, results) = mpsc::channel();
         // Ends with the runtime (its sender dropped). A build has no bound
         // (a new recipe bakes its maps), so it names its phase instead of
         // beating.
-        helio_tasks::spawn_service(
+        let started = helio_tasks::spawn_service(
             helio_tasks::ServiceSpec::new("Voxel world builder", "voxel-world")
                 .owner("voxel")
                 .no_heartbeat(),
             move |ctx| {
                 while let Ok(request) = ctx.wait(|| inbox.recv()) {
                     ctx.set_phase("Building the world");
-                    let built = build(&request.target, request.base.as_deref());
+                    let built = guarded(|| build(&request.target, request.base.as_deref()));
                     ctx.set_phase("Waiting for a request");
                     let landed = Landed {
                         target: request.target,
@@ -150,8 +161,17 @@ impl TerrainWorld {
                     }
                 }
             },
-        )
-        .expect("spawn the voxel world builder");
+        );
+        // Without a thread the terrain has no world and says why (its
+        // requests find the builder gone): the scene goes on.
+        if let Err(error) = started {
+            tracing::error!("Voxel world builder not started: {error}");
+        }
+        Self::over(requests, results)
+    }
+
+    /// A terrain's world over its builder's channels.
+    fn over(requests: mpsc::Sender<Request>, results: mpsc::Receiver<Landed>) -> Self {
         Self {
             state: Mutex::default(),
             requests,
@@ -359,7 +379,7 @@ impl TerrainWorld {
         let base = state.shown.clone();
         if self.requests.send(Request { target, base }).is_err() {
             state.building = None;
-            state.rejected = Some((None, "the voxel world builder stopped".into()));
+            state.rejected = Some((None, BUILDER_STOPPED.into()));
         }
     }
 
@@ -371,12 +391,31 @@ impl TerrainWorld {
     /// Take the builds that landed: the edits each applied to its base, in
     /// order (`None`: nothing landed).
     fn receive(&self) -> Option<Vec<EditYield>> {
-        let landed: Vec<Landed> = lock(&self.results).try_iter().collect();
+        let (landed, stopped) = {
+            let results = lock(&self.results);
+            let mut landed = Vec::new();
+            loop {
+                match results.try_recv() {
+                    Ok(result) => landed.push(result),
+                    Err(mpsc::TryRecvError::Empty) => break (landed, false),
+                    Err(mpsc::TryRecvError::Disconnected) => break (landed, true),
+                }
+            }
+        };
+        if landed.is_empty() && !stopped {
+            return None;
+        }
+        let mut state = lock(&self.state);
+        // A builder that ended with a build in hand never lands it: the
+        // terrain says so and shows the world it has, not "building" for
+        // good.
         if landed.is_empty() {
+            if state.building.take().is_some() {
+                state.rejected = Some((None, BUILDER_STOPPED.into()));
+            }
             return None;
         }
         let mut yields = Vec::new();
-        let mut state = lock(&self.state);
         for result in landed {
             state.building = None;
             match result.built {
@@ -400,13 +439,31 @@ impl TerrainWorld {
     }
 }
 
+/// Why a terrain whose builder is gone has no world for what it describes.
+const BUILDER_STOPPED: &str = "the voxel world builder stopped";
+
+/// `build`'s result, or the panic it ended in as the reason the world was
+/// not built: the terrain's builder goes on to its next request, and the
+/// terrain reports the failure like any world that does not build (the
+/// world shown stays). Nothing a build left half done is read again: it
+/// works on its own copy of the world, and the caches copies share hold
+/// whole entries only.
+fn guarded<T>(build: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).unwrap_or_else(|panic| {
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        tracing::error!("Voxel world builder panicked: {reason}");
+        Err(format!("the voxel world could not be built: {reason}"))
+    })
+}
+
 /// The world `target` describes: `base` extended by the edits appended to
 /// its journal (each one's yield counted against the world the edits before
 /// it left), or with its latest edits undone, or built anew.
-fn build(
-    target: &WorldTarget,
-    base: Option<&BuiltWorld>,
-) -> Result<(BuiltWorld, Vec<EditYield>), String> {
+fn build(target: &WorldTarget, base: Option<&BuiltWorld>) -> Built {
     let started = Instant::now();
     let base = base.filter(|b| b.target.source == target.source);
     let edits = &target.edits;
@@ -428,7 +485,9 @@ fn build(
         {
             let mut planet = (*base.planet).clone();
             for _ in edits.len()..base.target.edits.len() {
-                planet.undo().expect("within the undoable edits");
+                planet
+                    .undo()
+                    .ok_or("the voxel world's latest edits could not be undone")?;
             }
             (planet, "undone", base.kept.clone(), Vec::new())
         }
@@ -765,5 +824,89 @@ pub fn wait_for_voxel_worlds(world: &mut World, timeout: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helio_pass_voxel_planet::{PlanetRecipe, TerrainSource};
+
+    fn target(seed: u64) -> WorldTarget {
+        WorldTarget {
+            source: WorldSource {
+                recipe: PlanetRecipe {
+                    terrain: TerrainSource {
+                        seed,
+                        ..TerrainSource::default()
+                    },
+                    ..PlanetRecipe::default()
+                },
+                features: Default::default(),
+            },
+            edits: VoxelEditJournal::default(),
+        }
+    }
+
+    /// Take what lands until nothing is building.
+    fn land(world: &TerrainWorld) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while world.building() {
+            world.receive();
+            assert!(Instant::now() < deadline, "the build never landed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A build that panics is a world that did not build: the terrain says
+    /// why and stops waiting, the target is not built again, and the
+    /// builder takes the next one.
+    #[test]
+    fn a_build_that_panics_is_reported_and_the_builder_goes_on() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = builds.clone();
+        let world = TerrainWorld::built_by(move |target, _| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match target.source.recipe.terrain.seed {
+                1 => panic!("the ground gave way"),
+                seed => Err(format!("seed {seed} refused")),
+            }
+        });
+        world.want(target(1));
+        assert!(world.building());
+        land(&world);
+        let error = world.error().expect("the panic is the terrain's error");
+        assert!(error.contains("the ground gave way"), "{error}");
+        assert!(!world.settling() && world.world().is_none());
+        // The same description is not built again.
+        world.want(target(1));
+        assert!(!world.building());
+        // Another is, by the same builder.
+        world.want(target(2));
+        land(&world);
+        assert_eq!(world.error().as_deref(), Some("seed 2 refused"));
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// A builder that is gone with a build in hand is reported: the terrain
+    /// does not stay "building" for good.
+    #[test]
+    fn a_builder_that_is_gone_is_reported() {
+        let (requests, inbox) = mpsc::channel();
+        let (outbox, results) = mpsc::channel::<Landed>();
+        let world = TerrainWorld::over(requests, results);
+        world.want(target(1));
+        assert!(world.building() && world.receive().is_none());
+        assert!(world.building(), "nothing landed yet, the builder lives");
+        // The builder ends without landing the build.
+        drop(outbox);
+        assert!(world.receive().is_none());
+        assert!(!world.building() && !world.settling());
+        assert_eq!(world.error().as_deref(), Some(BUILDER_STOPPED));
+        // Asked again with the builder's inbox gone too: the same answer.
+        drop(inbox);
+        world.want(target(2));
+        assert!(!world.building());
+        assert_eq!(world.error().as_deref(), Some(BUILDER_STOPPED));
     }
 }

@@ -219,6 +219,9 @@ impl Planet {
         };
         let sealed = (r.u64()? as usize, r.u64()?);
         let bounds = (r.f64()?, r.f64()?);
+        if bounds.0.is_nan() || bounds.1.is_nan() {
+            return Err(SnapshotError::Corrupt("edit bounds"));
+        }
         let large = r.brushes()?;
         let recent = r.brushes()?;
         let mut baked = EditStore::default();
@@ -241,7 +244,12 @@ impl Planet {
                 run.fill(CellEdit(value));
                 at += len;
             }
-            if at != BRICK_CELLS || key.face > 5 {
+            // A brick of a face or level the grid does not have is no brick
+            // of this world: coarse rebuilds and renderers index by both.
+            if at != BRICK_CELLS
+                || !grid.faces().contains(&key.face)
+                || u32::from(key.level) >= grid.levels()
+            {
                 return Err(SnapshotError::Corrupt("brick"));
             }
             baked.set(key, Some(brick));
@@ -368,5 +376,88 @@ mod tests {
             Planet::from_snapshot(PlanetRecipe::default(), b"nope"),
             Err(SnapshotError::NotASnapshot)
         ));
+    }
+
+    /// `bytes` with `change` made to its body and its checksum made again:
+    /// damage a checksum does not catch (a writer's bug, a hand-made file).
+    fn resummed(bytes: &[u8], change: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let mut body = bytes[..bytes.len() - 8].to_vec();
+        change(&mut body);
+        let sum = record::fnv64(&body);
+        body.extend_from_slice(&sum.to_le_bytes());
+        body
+    }
+
+    /// A snapshot whose checksum holds but whose content is not this
+    /// world's is refused, not loaded as bricks no query or renderer can
+    /// index: a brick of a level or face the grid lacks, bounds that are not
+    /// numbers, counts past the file's end.
+    #[test]
+    fn well_summed_snapshots_of_invalid_content_are_refused() {
+        let (p, _) = edited();
+        let bytes = p.snapshot();
+        let edits = p.edits();
+        // Header, six words, the two brush lists, the brick count.
+        let first_brick = 16
+            + 48
+            + 4
+            + edits.large.len() * record::RECORD_BYTES
+            + 4
+            + edits.recent.len() * record::RECORD_BYTES
+            + 8;
+        let load = |bytes: &[u8]| Planet::from_snapshot(PlanetRecipe::default(), bytes).err();
+        assert_eq!(load(&resummed(&bytes, |_| {})), None, "unchanged, it loads");
+        assert_eq!(
+            load(&resummed(&bytes, |b| b[first_brick + 1] = 200)),
+            Some(SnapshotError::Corrupt("brick")),
+            "a level the grid lacks"
+        );
+        assert_eq!(
+            load(&resummed(&bytes, |b| b[first_brick] = 9)),
+            Some(SnapshotError::Corrupt("brick")),
+            "a face no cube has"
+        );
+        assert_eq!(
+            load(&resummed(&bytes, |b| {
+                b[16 + 32..16 + 40].copy_from_slice(&f64::NAN.to_le_bytes())
+            })),
+            Some(SnapshotError::Corrupt("edit bounds"))
+        );
+        // Counts past the end: an error, not an allocation of that size.
+        for at in [16 + 48, first_brick - 8] {
+            assert!(
+                load(&resummed(&bytes, |b| b[at..at + 4].fill(0xff))).is_some(),
+                "count at {at}"
+            );
+        }
+        // A plane has one face: a sphere's brick on another is not its.
+        let plane = PlanetRecipe {
+            shape: crate::grid::Shape::Plane,
+            ..PlanetRecipe::default()
+        };
+        let mut flat = Planet::new(plane.clone()).unwrap();
+        let ground = flat.surface_point(glam::DVec3::ZERO, 0.0);
+        for n in 0..(crate::planet::RECENT_BRUSHES + 20) {
+            flat.apply(Brush {
+                center: (ground + glam::DVec3::X * n as f64 * 0.2).to_array(),
+                radius: 0.3,
+                shape: BrushShape::Sphere,
+                op: BrushOp::Remove,
+                material: 0,
+                height: 0.0,
+            })
+            .unwrap();
+        }
+        assert!(flat.edits().sealed_len() > 0 && flat.edits().large.is_empty());
+        let bytes = flat.snapshot();
+        let first_brick = 16 + 48 + 4 + 4 + flat.edits().recent.len() * record::RECORD_BYTES + 8;
+        assert!(Planet::from_snapshot(plane.clone(), &bytes).is_ok());
+        let other_face = (0..6u8)
+            .find(|f| !flat.grid().faces().contains(f))
+            .expect("a plane has one face");
+        assert_eq!(
+            Planet::from_snapshot(plane, &resummed(&bytes, |b| b[first_brick] = other_face)).err(),
+            Some(SnapshotError::Corrupt("brick"))
+        );
     }
 }
