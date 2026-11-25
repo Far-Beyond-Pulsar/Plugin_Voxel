@@ -912,7 +912,7 @@ fn chunk_frame(grid: &Grid, tile: Footprint, cz: i32, z: f64) -> Frame {
 /// planet-centred f32 positions err by under a fiftieth of one. Level 13
 /// on an Earth at 0.1 m voxels (820 m cells), level 2 on a 3 km world.
 /// None on a plane.
-fn exact_level(grid: &Grid) -> u32 {
+pub fn exact_level(grid: &Grid) -> u32 {
     if grid.is_plane() {
         return u32::MAX;
     }
@@ -2139,11 +2139,13 @@ pub struct ChunkWorld {
     /// Each form's passes lighting other volumes' points, compiled once the
     /// world holds more than one volume ([`Self::pipelines_ready`]).
     cross: [Option<helio_core::compile::Compiling<volumes::CrossPipelines>>; 2],
-    /// Each form's ray stream kernels, compiled once a stream is traced
-    /// ([`Self::want_rays`]); the eye of the last camera draw (world, high
-    /// and low parts) and the cut it left for ray streams (`rays`).
-    ray_pipelines: [Option<std::sync::Arc<helio_core::compile::Compiling<rays::RayPipelines>>>; 2],
-    rays_wanted: bool,
+    /// Each form's ray stream kernels, each compiled once a scheduled
+    /// stream needs it ([`Self::want_rays`], in the order the streams need
+    /// them: `rays::RayKernel::order`); the eye of the last camera draw
+    /// (world, high and low parts) and the cut it left for ray streams
+    /// (`rays`).
+    ray_pipelines: [rays::FormRayKernels; 2],
+    rays_wanted: rays::RayKernels,
     ray_eye: wgpu::Buffer,
     ray_cut: Option<std::sync::Arc<rays::RayCut>>,
     /// The world's own pipelines (chunk table, records, leaf pool).
@@ -3426,8 +3428,8 @@ impl ChunkWorld {
             layouts,
             pipelines: [None, None],
             cross: [None, None],
-            ray_pipelines: [None, None],
-            rays_wanted: false,
+            ray_pipelines: Default::default(),
+            rays_wanted: rays::RayKernels::NONE,
             ray_eye: buffer(
                 "chunk ray eye",
                 32,
@@ -6985,9 +6987,9 @@ impl ChunkWorld {
                 ));
             }
         }
-        if self.rays_wanted {
+        if !self.rays_wanted.is_empty() {
             for form in 0..2 {
-                if !forms[form] || self.ray_pipelines[form].is_some() {
+                if !forms[form] {
                     continue;
                 }
                 let Some(draw) = self.pipelines[form]
@@ -6996,13 +6998,12 @@ impl ChunkWorld {
                 else {
                     continue;
                 };
-                let (layouts, module) = (self.layouts.clone(), draw.module.clone());
-                self.ray_pipelines[form] =
-                    Some(std::sync::Arc::new(helio_core::compile::Compiling::start(
-                        &self.device,
-                        "voxel ray stream pipelines",
-                        move |device| rays::RayPipelines::new(device, &layouts, &module),
-                    )));
+                self.ray_pipelines[form].start(
+                    &self.device,
+                    &self.layouts,
+                    &draw.module,
+                    self.rays_wanted,
+                );
             }
         }
         fn built<T: Send + Sync + 'static>(c: &Option<helio_core::compile::Compiling<T>>) -> bool {
@@ -7040,8 +7041,8 @@ impl ChunkWorld {
             for c in self.cross.iter().flatten() {
                 c.wait()?;
             }
-            for c in self.ray_pipelines.iter().flatten() {
-                c.wait()?;
+            for kernels in &self.ray_pipelines {
+                kernels.wait()?;
             }
             if self.pipelines_ready() && self.ray_pipelines_ready() {
                 return Ok(());
@@ -7049,19 +7050,13 @@ impl ChunkWorld {
         }
     }
 
-    /// Whether every held form's ray kernels are compiled, when ray streams
-    /// are wanted (drawing never waits for them). A host drawing on demand
-    /// keeps drawing until they are (`ChunkPass::needs_frame`): the streams'
+    /// Whether every held form has compiled every ray kernel the scheduled
+    /// streams need (drawing never waits for them). A host drawing on demand
+    /// keeps drawing until it has (`ChunkPass::needs_frame`): the streams'
     /// consumers hold what they have while the terrain answers short.
     pub fn ray_pipelines_ready(&self) -> bool {
         let (forms, _) = self.forms_held();
-        !self.rays_wanted
-            || (0..2).all(|form| {
-                !forms[form]
-                    || self.ray_pipelines[form]
-                        .as_ref()
-                        .is_some_and(|c| c.ready().is_some())
-            })
+        (0..2).all(|form| !forms[form] || self.ray_pipelines[form].all_ready(self.rays_wanted))
     }
 
     /// The volumes with chunks in the drawn cut.
@@ -7085,7 +7080,7 @@ impl ChunkWorld {
     /// stream traced. Placed again only when the drawn set or an eye's
     /// column changes.
     fn place_anchors(&mut self, eye: DVec3) {
-        if self.volumes.iter().flatten().count() < 2 && !self.rays_wanted {
+        if self.volumes.iter().flatten().count() < 2 && self.rays_wanted.is_empty() {
             self.anchors.clear();
             self.anchors_for = None;
             return;
@@ -7148,11 +7143,12 @@ impl ChunkWorld {
         self.anchors_for = Some((version, columns));
     }
 
-    /// Ray streams will be traced through this world (`chunks::rays`): its
-    /// draws keep a cut for them ([`Self::ray_cut`]) and its forms' ray
-    /// kernels compile off the frame.
-    pub fn want_rays(&mut self) {
-        self.rays_wanted = true;
+    /// Ray streams needing `kernels` will be traced through this world
+    /// (`chunks::rays`; `rays::RayKernels::of` a stream): its draws keep a
+    /// cut for them ([`Self::ray_cut`]) and its forms compile those kernels
+    /// off the frame, in the order the streams need them.
+    pub fn want_rays(&mut self, kernels: rays::RayKernels) {
+        self.rays_wanted = self.rays_wanted.union(kernels);
     }
 
     /// The cut the last camera draw left for ray streams (none before one,
@@ -7173,7 +7169,7 @@ impl ChunkWorld {
         prev: &[(u16, crate::volume::VolumeTransform)],
         drawn_in: &FxHashSet<u16>,
     ) {
-        if !self.rays_wanted {
+        if self.rays_wanted.is_empty() {
             self.ray_cut = None;
             return;
         }

@@ -35,8 +35,15 @@
 //!   stayed the terrain's, by the stream's detail: `Full` shades a hit as
 //!   the G-buffer's publish shades the face (`ray_surface_full`,
 //!   `voxel_surface`), `Diffuse` takes the cheaper kernel (`ray_surface`).
+//! - **Compiled in the order the streams need them.** Each kernel compiles
+//!   as a job of its own ([`RayKernel`], `helio_core::compile`), only those
+//!   a scheduled stream needs ([`RayKernels::of`]): first every stream's
+//!   trace and the `Diffuse` surfaces, then `Full`'s (the longest, which only
+//!   a stream asking `Full` waits for). A stream is answered once its own
+//!   kernels are ready for every volume ([`RayLink::complete`]); until then
+//!   it is short and traces nothing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glam::DVec3;
@@ -47,84 +54,214 @@ use helio_frame_api::rays::stream::{Answers, RayClass, Stream, SurfaceDetail, Tr
 use super::volumes::DrawLayouts;
 use super::{entry, split};
 
-/// A form's ray stream kernels (chunk_draw.wgsl 8): each volume's ray
-/// parameters in group 0 (the draw layout), the stream in group 1.
-pub(super) struct RayPipelines {
-    /// A nearest-hit stream's entry (the rays' starts) and walk; an
-    /// occlusion stream's both in one.
-    enter_nearest: wgpu::ComputePipeline,
-    nearest: wgpu::ComputePipeline,
+/// A ray stream kernel of a form's draw source (chunk_draw.wgsl 8): each
+/// volume's ray parameters in group 0 (the draw layout), the stream in
+/// group 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RayKernel {
+    /// A nearest-hit stream's entry (the rays' starts).
+    EnterNearest,
+    /// A nearest-hit stream's walk.
+    Nearest,
     /// A stream in runs from one origin: each run's start.
-    enter_runs: wgpu::ComputePipeline,
-    occlusion: wgpu::ComputePipeline,
-    /// The surfaces of a stream's hits, by the detail it asks
-    /// (`SurfaceDetail`): `Diffuse`'s, then `Full`'s.
-    surface: [wgpu::ComputePipeline; 2],
+    EnterRuns,
+    /// An occlusion stream's entry and walk, in one.
+    Occlusion,
+    /// The surfaces of a `SurfaceDetail::Diffuse` stream's hits.
+    SurfaceDiffuse,
+    /// The surfaces of a `SurfaceDetail::Full` stream's hits.
+    SurfaceFull,
 }
 
-impl RayPipelines {
-    /// The kernels of a form's draw source `module`: built once a stream
-    /// is traced ([`super::ChunkWorld::want_rays`]), as walks are long
-    /// kernels to compile.
-    pub fn new(device: &wgpu::Device, layouts: &DrawLayouts, module: &wgpu::ShaderModule) -> Self {
-        let compute = |label: &str, second: &wgpu::BindGroupLayout, entry: &str| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&layouts.draw), Some(second)],
-                immediate_size: 0,
-            });
-            helio_core::shader::create_compute_pipeline(
-                device,
-                wgpu::ComputePipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&layout),
-                    module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    cache: None,
-                },
-            )
-        };
-        let mut kernels = super::kernels::Kernels::new(device);
-        let enter_nearest = kernels.add(|| {
-            compute(
-                "voxel nearest ray starts",
-                &layouts.rays,
-                "ray_enter_nearest",
-            )
-        });
-        let nearest = kernels.add(|| compute("voxel nearest rays", &layouts.rays, "ray_nearest"));
-        let occlusion = kernels.add(|| {
-            compute(
-                "voxel occlusion rays",
-                &layouts.ray_occlusion,
-                "ray_occlusion",
-            )
-        });
-        let enter_runs =
-            kernels.add(|| compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"));
-        let surface = kernels.add(|| {
-            [
-                compute(
-                    "voxel ray surfaces (diffuse)",
-                    &layouts.ray_surfaces,
-                    "ray_surface",
-                ),
-                compute(
-                    "voxel ray surfaces (full)",
-                    &layouts.ray_surfaces,
-                    "ray_surface_full",
-                ),
-            ]
-        });
-        kernels.compile();
-        Self {
-            enter_nearest: enter_nearest.take(),
-            nearest: nearest.take(),
-            occlusion: occlusion.take(),
-            enter_runs: enter_runs.take(),
-            surface: surface.take(),
+impl RayKernel {
+    pub const ALL: [RayKernel; 6] = [
+        RayKernel::EnterNearest,
+        RayKernel::Nearest,
+        RayKernel::EnterRuns,
+        RayKernel::Occlusion,
+        RayKernel::SurfaceDiffuse,
+        RayKernel::SurfaceFull,
+    ];
+
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    /// The order it compiles in: every trace kernel and `Diffuse`'s surfaces
+    /// first (0), then `Full`'s (1), the longest kernel, which only a stream
+    /// asking `Full` waits for. Kernels of one order compile at once.
+    pub(super) fn order(self) -> u8 {
+        u8::from(self == RayKernel::SurfaceFull)
+    }
+
+    /// Its entry point, label and layout (of `layouts`).
+    fn entry(self) -> (&'static str, &'static str) {
+        match self {
+            RayKernel::EnterNearest => ("ray_enter_nearest", "voxel nearest ray starts"),
+            RayKernel::Nearest => ("ray_nearest", "voxel nearest rays"),
+            RayKernel::EnterRuns => ("ray_enter_runs", "voxel ray run starts"),
+            RayKernel::Occlusion => ("ray_occlusion", "voxel occlusion rays"),
+            RayKernel::SurfaceDiffuse => ("ray_surface", "voxel ray surfaces (diffuse)"),
+            RayKernel::SurfaceFull => ("ray_surface_full", "voxel ray surfaces (full)"),
         }
+    }
+
+    /// The kernel's pipeline over the form's draw source `module`.
+    pub(super) fn build(
+        self,
+        device: &wgpu::Device,
+        layouts: &DrawLayouts,
+        module: &wgpu::ShaderModule,
+    ) -> wgpu::ComputePipeline {
+        let (entry, label) = self.entry();
+        let second = match self {
+            RayKernel::Occlusion => &layouts.ray_occlusion,
+            RayKernel::SurfaceDiffuse | RayKernel::SurfaceFull => &layouts.ray_surfaces,
+            _ => &layouts.rays,
+        };
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layouts.draw), Some(second)],
+            immediate_size: 0,
+        });
+        helio_core::shader::create_compute_pipeline(
+            device,
+            wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        )
+    }
+}
+
+/// A set of [`RayKernel`]s: what a stream needs, or what a world's
+/// scheduled streams need.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RayKernels(u8);
+
+impl RayKernels {
+    pub const NONE: RayKernels = RayKernels(0);
+    /// Every kernel (tests and tools tracing streams of every kind).
+    pub const ALL: RayKernels = RayKernels(0x3f);
+
+    /// What a stream of `class` in runs of `run` rays, asking `detail` of
+    /// its hits' surfaces, needs traced and shaded.
+    pub fn of(class: RayClass, detail: SurfaceDetail, run: u32) -> Self {
+        let kernels: &[RayKernel] = match (class, detail) {
+            (RayClass::Occlusion, _) => &[RayKernel::Occlusion],
+            (RayClass::Nearest, SurfaceDetail::Diffuse) => &[
+                RayKernel::EnterNearest,
+                RayKernel::Nearest,
+                RayKernel::SurfaceDiffuse,
+            ],
+            (RayClass::Nearest, SurfaceDetail::Full) => &[
+                RayKernel::EnterNearest,
+                RayKernel::Nearest,
+                RayKernel::SurfaceFull,
+            ],
+        };
+        let mut out = kernels.iter().fold(Self::NONE, |s, k| s.with(*k));
+        if class == RayClass::Nearest && run > 1 {
+            out = out.with(RayKernel::EnterRuns);
+        }
+        out
+    }
+
+    pub fn with(self, kernel: RayKernel) -> Self {
+        Self(self.0 | kernel.bit())
+    }
+
+    pub fn union(self, other: RayKernels) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn contains(self, kernel: RayKernel) -> bool {
+        self.0 & kernel.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = RayKernel> {
+        RayKernel::ALL
+            .into_iter()
+            .filter(move |k| self.contains(*k))
+    }
+}
+
+/// A form's ray kernels, each compiling off the frame on its own
+/// ([`RayKernel`]): those asked for so far.
+#[derive(Clone, Default)]
+pub struct FormRayKernels {
+    kernels: [Option<Arc<Compiling<wgpu::ComputePipeline>>>; 6],
+}
+
+impl FormRayKernels {
+    /// Starts compiling the kernels of `wanted` not started yet over the
+    /// form's draw `module`, in their order (`RayKernel::order`): a later
+    /// order once every kernel of the earlier ones it started has finished.
+    pub(super) fn start(
+        &mut self,
+        device: &wgpu::Device,
+        layouts: &DrawLayouts,
+        module: &wgpu::ShaderModule,
+        wanted: RayKernels,
+    ) {
+        for order in 0..2 {
+            let mut started = false;
+            for kernel in wanted.iter().filter(|k| k.order() == order) {
+                let slot = &mut self.kernels[kernel as usize];
+                if slot.is_none() {
+                    let (layouts, module) = (layouts.clone(), module.clone());
+                    *slot = Some(Arc::new(Compiling::start(
+                        device,
+                        kernel.entry().1,
+                        move |device| kernel.build(device, &layouts, &module),
+                    )));
+                }
+                started = true;
+            }
+            let pending = wanted.iter().filter(|k| k.order() == order).any(|k| {
+                self.kernels[k as usize]
+                    .as_ref()
+                    .is_some_and(|c| c.is_pending())
+            });
+            if started && pending {
+                return;
+            }
+        }
+    }
+
+    /// Kernel `kernel`'s pipeline, once compiled.
+    pub fn ready(&self, kernel: RayKernel) -> Option<&wgpu::ComputePipeline> {
+        self.kernels[kernel as usize]
+            .as_ref()
+            .and_then(|c| c.ready())
+    }
+
+    /// Kernel `kernel`'s pipeline, of a form whose kernels a stream checked
+    /// ready ([`RayCut::kernels`]).
+    fn get(&self, kernel: RayKernel) -> &wgpu::ComputePipeline {
+        self.ready(kernel).expect("a stream's kernels are ready")
+    }
+
+    /// Whether every kernel of `kernels` is compiled.
+    pub fn all_ready(&self, kernels: RayKernels) -> bool {
+        kernels.iter().all(|k| self.ready(k).is_some())
+    }
+
+    /// Blocks until every kernel started has finished compiling, or one
+    /// failed: for tests and offline tools.
+    pub(super) fn wait(&self) -> Result<(), String> {
+        for c in self.kernels.iter().flatten() {
+            c.wait().map_err(str::to_owned)?;
+        }
+        Ok(())
     }
 }
 
@@ -142,7 +279,8 @@ pub(super) struct RayVolume {
 #[derive(Clone)]
 pub struct RayCut {
     pub(super) volumes: Vec<RayVolume>,
-    pub(super) pipelines: [Option<Arc<Compiling<RayPipelines>>>; 2],
+    /// Each form's kernels (spheres, planes).
+    pub(super) pipelines: [FormRayKernels; 2],
     /// The stream's layouts: a nearest-hit stream's trace, an occlusion
     /// stream's, the surfaces'.
     pub(super) layouts: [wgpu::BindGroupLayout; 3],
@@ -167,15 +305,18 @@ impl RayCut {
         self.volumes.len()
     }
 
-    /// Whether every volume's form has its kernels.
-    pub fn ready(&self) -> bool {
-        self.volumes.iter().all(|v| self.kernels(v.plane).is_some())
+    /// Whether every volume's form has the kernels of `kernels` (what a
+    /// stream needs, [`RayKernels::of`]).
+    pub fn ready(&self, kernels: RayKernels) -> bool {
+        self.volumes
+            .iter()
+            .all(|v| self.pipelines[usize::from(v.plane)].all_ready(kernels))
     }
 
-    fn kernels(&self, plane: bool) -> Option<&RayPipelines> {
-        self.pipelines[usize::from(plane)]
-            .as_ref()
-            .and_then(|c| c.ready())
+    /// The kernels of form `plane`, if every one of `kernels` is compiled.
+    fn kernels(&self, plane: bool, kernels: RayKernels) -> Option<&FormRayKernels> {
+        let form = &self.pipelines[usize::from(plane)];
+        form.all_ready(kernels).then_some(form)
     }
 }
 
@@ -186,7 +327,8 @@ impl RayCut {
 #[derive(Default)]
 pub struct RayLink {
     cut: Mutex<Option<Arc<RayCut>>>,
-    wanted: AtomicBool,
+    /// The kernels the graph's streams need ([`RayKernels`] bits).
+    wanted: AtomicU8,
     /// The frame holds volumes (the chunk pass, each frame), and a cut
     /// with drawn chunks of them was published since they came.
     volumes: AtomicBool,
@@ -213,14 +355,16 @@ impl RayLink {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = cut;
     }
 
-    /// A stream of the graph is traced by the terrain: the world keeps a cut
-    /// for it ([`super::ChunkWorld::want_rays`]).
-    pub fn want(&self) {
-        self.wanted.store(true, Ordering::Relaxed);
+    /// A stream of the graph needing `kernels` is traced by the terrain: the
+    /// world keeps a cut for it and compiles them
+    /// ([`super::ChunkWorld::want_rays`]).
+    pub fn want(&self, kernels: RayKernels) {
+        self.wanted.fetch_or(kernels.0, Ordering::Relaxed);
     }
 
-    pub fn wanted(&self) -> bool {
-        self.wanted.load(Ordering::Relaxed)
+    /// The kernels the graph's streams need (none: no stream is traced).
+    pub fn wanted(&self) -> RayKernels {
+        RayKernels(self.wanted.load(Ordering::Relaxed))
     }
 
     /// Whether this frame holds volumes (the chunk pass, as it takes the
@@ -232,15 +376,16 @@ impl RayLink {
         }
     }
 
-    /// Whether the cut answers rays for every volume the frame holds: none
-    /// held, or chunks of them drawn once and the cut's kernels compiled.
-    /// Short (`stream::Answers::short`) until the volumes' first chunks are
-    /// drawn and while their ray kernels compile. Later frames that draw
-    /// none of them (an eye looking away) and chunks still generating are
-    /// what the cut holds of the volumes, no shortfall.
-    pub fn complete(&self) -> bool {
+    /// Whether the cut answers a stream needing `kernels` for every volume
+    /// the frame holds: none held, or chunks of them drawn once and those
+    /// kernels compiled. Short (`stream::Answers::short`) until the volumes'
+    /// first chunks are drawn and while the stream's kernels compile. Later
+    /// frames that draw none of them (an eye looking away) and chunks still
+    /// generating are what the cut holds of the volumes, no shortfall.
+    pub fn complete(&self, kernels: RayKernels) -> bool {
         !self.volumes.load(Ordering::Relaxed)
-            || (self.drawn.load(Ordering::Relaxed) && self.cut().is_some_and(|cut| cut.ready()))
+            || (self.drawn.load(Ordering::Relaxed)
+                && self.cut().is_some_and(|cut| cut.ready(kernels)))
     }
 }
 
@@ -324,6 +469,12 @@ impl StreamTracer {
     pub fn with_detail(mut self, detail: SurfaceDetail) -> Self {
         self.detail = detail;
         self
+    }
+
+    /// The kernels the stream needs: a volume is traced only once every one
+    /// of them is compiled, so a hit it writes always gets its surface.
+    pub fn kernels(&self) -> RayKernels {
+        RayKernels::of(self.class, self.detail, self.run)
     }
 
     /// The starts' buffers for `rays`, a ray's and a run's (made, or remade
@@ -415,8 +566,9 @@ impl StreamTracer {
     }
 
     /// The trace of `stream` through every volume of `cut`: a dispatch a
-    /// volume over the stream's indirect groups (volumes whose kernels are
-    /// still compiling trace nothing), its pass timed as `timing` says.
+    /// volume over the stream's indirect groups (volumes whose form has not
+    /// compiled every kernel the stream needs trace nothing), its pass timed
+    /// as `timing` says.
     pub fn trace(
         &self,
         device: &wgpu::Device,
@@ -435,23 +587,24 @@ impl StreamTracer {
             timestamp_writes: timing,
         });
         pass.set_bind_group(1, &group, &[]);
+        let needs = self.kernels();
         for v in &cut.volumes {
-            let Some(kernels) = cut.kernels(v.plane) else {
+            let Some(kernels) = cut.kernels(v.plane, needs) else {
                 continue;
             };
             pass.set_bind_group(0, &v.group, &[]);
             if self.class == RayClass::Nearest {
                 if self.run > 1 {
-                    pass.set_pipeline(&kernels.enter_runs);
+                    pass.set_pipeline(kernels.get(RayKernel::EnterRuns));
                     pass.dispatch_workgroups(run_groups, 1, 1);
                 }
-                pass.set_pipeline(&kernels.enter_nearest);
+                pass.set_pipeline(kernels.get(RayKernel::EnterNearest));
                 pass.dispatch_workgroups_indirect(stream.header, 0);
             }
-            pass.set_pipeline(match self.class {
-                RayClass::Nearest => &kernels.nearest,
-                RayClass::Occlusion => &kernels.occlusion,
-            });
+            pass.set_pipeline(kernels.get(match self.class {
+                RayClass::Nearest => RayKernel::Nearest,
+                RayClass::Occlusion => RayKernel::Occlusion,
+            }));
             pass.dispatch_workgroups_indirect(stream.header, 0);
         }
     }
@@ -476,11 +629,16 @@ impl StreamTracer {
             timestamp_writes: timing,
         });
         pass.set_bind_group(1, &group, &[]);
+        let surface = match self.detail {
+            SurfaceDetail::Diffuse => RayKernel::SurfaceDiffuse,
+            SurfaceDetail::Full => RayKernel::SurfaceFull,
+        };
         for v in &cut.volumes {
-            let Some(kernels) = cut.kernels(v.plane) else {
+            // Only volumes the trace walked (every kernel of the stream).
+            let Some(kernels) = cut.kernels(v.plane, self.kernels()) else {
                 continue;
             };
-            pass.set_pipeline(&kernels.surface[usize::from(self.detail == SurfaceDetail::Full)]);
+            pass.set_pipeline(kernels.get(surface));
             pass.set_bind_group(0, &v.group, &[]);
             pass.dispatch_workgroups_indirect(stream.header, 0);
         }
@@ -514,7 +672,10 @@ impl VoxelRayPass {
         id: TracerId,
         surface: bool,
     ) -> Self {
-        link.want();
+        let tracer = StreamTracer::new(device, stream.class, id)
+            .with_run(stream.run)
+            .with_detail(stream.detail);
+        link.want(tracer.kernels());
         let (name, writes) = if surface {
             (
                 format!("VoxelRaySurfaces {}", stream.name),
@@ -526,9 +687,7 @@ impl VoxelRayPass {
         Self {
             link,
             answers,
-            tracer: StreamTracer::new(device, stream.class, id)
-                .with_run(stream.run)
-                .with_detail(stream.detail),
+            tracer,
             surface,
             name: helio_frame_api::static_name(&name),
             reads: helio_frame_api::static_names(&[stream.header, stream.rays, stream.hits]),
@@ -559,7 +718,7 @@ impl RenderPass for VoxelRayPass {
     }
 
     fn execute(&mut self, ctx: &mut PassContext) -> HelioResult<()> {
-        if !self.surface && !self.link.complete() {
+        if !self.surface && !self.link.complete(self.tracer.kernels()) {
             self.answers.short();
         }
         let Some(cut) = self.link.cut() else {

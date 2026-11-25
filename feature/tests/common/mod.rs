@@ -188,7 +188,7 @@ pub fn trace_stream_detailed(
         gpu.queue.write_buffer(buffer, 0, bytes)
     });
     let cut = world.ray_cut().expect("a cut drawn for ray streams");
-    assert!(cut.ready(), "the ray kernels compiled");
+    assert!(cut.ready(tracer.kernels()), "the ray kernels compiled");
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
         let mut recorder = helio_core::CommandRecorder::from_encoder(&mut encoder);

@@ -238,7 +238,7 @@ impl ChunkPass {
     /// its ray kernels compiled (`chunks::rays::RayLink::complete`).
     pub fn settled(&self) -> bool {
         self.world.as_ref().is_some_and(ChunkWorld::settled)
-            && (!self.rays.wanted() || self.rays.complete())
+            && (self.rays.wanted().is_empty() || self.rays.complete(self.rays.wanted()))
     }
 
     /// What the sun's occlusion pages did last frame (`ChunkWorld::sun_page_stats`).
@@ -733,9 +733,7 @@ impl ChunkPass {
         let binding = |name: &str| ctx.registry.buffer_binding(name).cloned();
         // The graph traces ray streams through the terrain: its draws keep
         // a cut for them and their kernels compile.
-        if self.rays.wanted() {
-            world.want_rays();
-        }
+        world.want_rays(self.rays.wanted());
         let mut cmds = ctx.graphics_cmds();
         let encoder = &mut cmds;
         // The frame's length: the setting when it gives one, else the host's

@@ -106,6 +106,8 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 game.frame();
                 if game.quit {
+                    // The tour's last screenshots, written before it ends.
+                    game.gfx.collect_screenshots(true);
                     event_loop.exit();
                 }
                 game.gfx.window.request_redraw();

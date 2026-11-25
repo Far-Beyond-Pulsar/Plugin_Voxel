@@ -986,7 +986,9 @@ fn stream_rays_cross_every_volume() {
         size: [320, 180],
     };
     let mut scene = Scene::new(gpu, &volumes);
-    scene.world.want_rays();
+    scene
+        .world
+        .want_rays(helio_pass_voxel_planet::chunks::rays::RayKernels::ALL);
     scene
         .world
         .wait_for_pipelines()
@@ -1114,7 +1116,9 @@ fn stream_rays_see_only_volumes_of_their_space() {
     for (id, v) in scene.ids.clone().into_iter().zip(&all) {
         scene.world.set_space(id, v.space);
     }
-    scene.world.want_rays();
+    scene
+        .world
+        .want_rays(helio_pass_voxel_planet::chunks::rays::RayKernels::ALL);
     scene
         .world
         .wait_for_pipelines()
