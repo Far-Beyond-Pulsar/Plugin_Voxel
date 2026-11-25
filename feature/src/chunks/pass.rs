@@ -502,40 +502,27 @@ impl RenderPass for ChunkPass {
 }
 
 impl ChunkPass {
-    fn prepare_frame(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        // The last frame was submitted: its results can be mapped.
-        if let Some(world) = &mut self.world {
-            world.set_plain_colour(false);
-            helio_core::cpu_scope!("VoxelChunks: submitted");
-            world.submitted();
-            self.timings.extend(world.take_timings());
-            let excess = self.timings.len().saturating_sub(KEEP_TIMINGS);
-            self.timings.drain(..excess);
-        }
-        self.settling = self.settling.saturating_sub(1);
-        // No volumes published: the chunks and storage go.
-        let frame = ctx.scene_buffers.payload(&VOXEL_FRAME);
-        // Without volumes the scene has no voxel ground: foliage grows on its own.
-        self.planet_ground
-            .set_absent(frame.as_ref().is_none_or(|frame| frame.volumes.is_empty()));
-        let Some(frame) = frame else {
-            self.shown = None;
-            self.world = None;
-            self.held.clear();
-            self.rays.publish(None);
-            self.rays.set_volumes(false);
-            return Ok(());
-        };
-        self.rays.set_volumes(!frame.volumes.is_empty());
+    /// Starts what the scene's volumes need before the graph draws: the world
+    /// exists and holds the frame's volumes, so their pipelines (draw,
+    /// generation, ray streams) compile while the rest of the graph builds
+    /// instead of when its first frame meets them. The first frame finds
+    /// each volume held and follows its edits as for any other.
+    pub fn precompile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &PlanetFrame) {
+        self.adopt_volumes(device, queue, frame);
+    }
+
+    /// Makes the world if there is none and brings its volumes to what
+    /// `frame` holds: each volume followed by its edits (any history, in
+    /// place), placed by its transform; another recipe, the volume added
+    /// again. Adding a volume starts its pipelines compiling.
+    fn adopt_volumes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &PlanetFrame) {
+        let debug_mode = self.debug_mode;
         let world = self.world.get_or_insert_with(|| {
-            let mut world = ChunkWorld::new(ctx.device, ctx.queue);
+            let mut world = ChunkWorld::new(device, queue);
             world.set_plain_colour(false);
-            world.set_debug_mode(self.debug_mode);
+            world.set_debug_mode(debug_mode);
             world
         });
-        // The frame's volumes: each followed by its edits (any history, in
-        // place), placed by its transform; another recipe, the volume added
-        // again.
         let mut held = Vec::with_capacity(frame.volumes.len());
         for v in &frame.volumes {
             let planet = &v.volume.planet;
@@ -598,6 +585,35 @@ impl ChunkPass {
         for gone in std::mem::replace(&mut self.held, held) {
             world.remove_volume(gone.volume);
         }
+    }
+
+    fn prepare_frame(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
+        // The last frame was submitted: its results can be mapped.
+        if let Some(world) = &mut self.world {
+            world.set_plain_colour(false);
+            helio_core::cpu_scope!("VoxelChunks: submitted");
+            world.submitted();
+            self.timings.extend(world.take_timings());
+            let excess = self.timings.len().saturating_sub(KEEP_TIMINGS);
+            self.timings.drain(..excess);
+        }
+        self.settling = self.settling.saturating_sub(1);
+        // No volumes published: the chunks and storage go.
+        let frame = ctx.scene_buffers.payload(&VOXEL_FRAME);
+        // Without volumes the scene has no voxel ground: foliage grows on its own.
+        self.planet_ground
+            .set_absent(frame.as_ref().is_none_or(|frame| frame.volumes.is_empty()));
+        let Some(frame) = frame else {
+            self.shown = None;
+            self.world = None;
+            self.held.clear();
+            self.rays.publish(None);
+            self.rays.set_volumes(false);
+            return Ok(());
+        };
+        self.rays.set_volumes(!frame.volumes.is_empty());
+        self.adopt_volumes(ctx.device, ctx.queue, &frame);
+        let world = self.world.as_mut().expect("adopt_volumes made the world");
         // Foliage tiles the volume the world follows the eye on (its
         // primary; a rebuilt graph's new pass too).
         if let Some(v) = primary_volume(world, &self.held, &frame) {

@@ -109,6 +109,19 @@ impl Feature for VoxelFeature {
                         return Ok(());
                     }
                     let mut pass = ChunkPass::new(settings.residency);
+                    // The volumes the scene holds as this graph starts to build:
+                    // their pipelines compile alongside the rest of the build
+                    // (a first build only: a rebuild's pass inherits the
+                    // running world and its compiled pipelines).
+                    if let Some(hints) = build
+                        .env
+                        .setting::<helio_core::BuildHints>()
+                        .filter(|hints| hints.first_build)
+                    {
+                        if let Some(frame) = hints.payloads.get(&crate::engine::VOXEL_FRAME) {
+                            pass.precompile(build.env.device, build.env.queue, &frame);
+                        }
+                    }
                     // The pixels' sky rays stop where the frame's indirect
                     // diffuse resolves the sky's occlusion (none: their own
                     // reach).
