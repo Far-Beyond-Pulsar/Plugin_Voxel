@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use glam::DVec3;
+use helio_pass_voxel_planet::queries::{Answer, Query, Resident, Ticket};
 /// Terrain material ids (`material::GRASS`, ...) and their names.
 pub use helio_pass_voxel_planet::terrain::material;
 use helio_pass_voxel_planet::{
@@ -615,9 +616,80 @@ impl VoxelTerrainComponent {
         if direction.length_squared() == 0.0 {
             return Err("the ray direction is zero".into());
         }
+        let origin = position(x, y, z)?;
+        // Over the bricks the world's queries keep resident (around the
+        // camera, the players, a sculpting eye) a ray reads cells, it does
+        // not evaluate terrain: taken when they hold exactly this world.
+        // A ray that leaves them walks the terrain here, on this thread:
+        // long rays belong to `cast_ray`.
+        if let Some(runtime) = crate::runtime::VoxelTerrainRuntime::of(world, entity) {
+            if let Some(queries) = runtime.queries() {
+                if queries.editing() == 0 && Arc::ptr_eq(&queries.planet(), &planet) {
+                    if let Resident::Ready(hit) =
+                        queries.raycast(origin, direction, max_distance, Matter::All)
+                    {
+                        return Ok(hit.map_or(-1.0, |hit| hit.distance));
+                    }
+                }
+            }
+        }
         Ok(planet
-            .raycast(position(x, y, z)?, direction, max_distance)
+            .raycast(origin, direction, max_distance)
             .map_or(-1.0, |hit| hit.distance))
+    }
+
+    /// Ask for the distance along a ray to the first solid block, answered
+    /// off the game thread however long the ray is (a 100 m ray over ground
+    /// not yet in memory takes 10 ms to walk): returns a ticket for
+    /// `ray_distance`, which has the answer a frame or so later.
+    #[world_method(category = "Voxel")]
+    #[allow(clippy::too_many_arguments)]
+    fn cast_ray(
+        world: &mut World,
+        entity: Entity,
+        x: f64,
+        y: f64,
+        z: f64,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        max_distance: f64,
+    ) -> Result<i64, String> {
+        terrain_world(world, entity)?;
+        let direction = position(dx, dy, dz)?;
+        if direction.length_squared() == 0.0 {
+            return Err("the ray direction is zero".into());
+        }
+        let origin = position(x, y, z)?;
+        let runtime = crate::runtime::VoxelTerrainRuntime::of(world, entity)
+            .ok_or("the voxel world is not built yet")?;
+        let queries = runtime
+            .queries()
+            .ok_or("the voxel world is not built yet")?;
+        let ticket = queries.ask(Query::Ray {
+            origin,
+            direction,
+            max: max_distance,
+            matter: Matter::All,
+        });
+        Ok(ticket.id() as i64)
+    }
+
+    /// The answer to a `cast_ray` ticket, once: the distance to the first
+    /// solid block, -1 when the ray hit none, -2 while the answer is on its
+    /// way (or the ticket is not one of this terrain's waiting answers).
+    #[world_method(category = "Voxel")]
+    fn ray_distance(world: &mut World, entity: Entity, ticket: i64) -> Result<f64, String> {
+        let runtime = crate::runtime::VoxelTerrainRuntime::of(world, entity)
+            .ok_or("the voxel world is not built yet")?;
+        let queries = runtime
+            .queries()
+            .ok_or("the voxel world is not built yet")?;
+        Ok(match queries.answer(Ticket::of(ticket as u64)) {
+            Some(Answer::Ray(Some(hit))) => hit.distance,
+            Some(Answer::Ray(None)) => -1.0,
+            _ => -2.0,
+        })
     }
 
     /// Edge length of one block in metres.

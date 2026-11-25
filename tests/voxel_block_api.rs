@@ -501,3 +501,67 @@ fn scripts_read_and_set_every_world_setting() {
     );
     assert_eq!(text(&mut world, "air"), "none");
 }
+
+/// A ray asked for off the game thread (`cast_ray`, `ray_distance`) answers
+/// what the one walked at once does, a moment later and once; and the ray
+/// walked at once is the world's own, over resident bricks or not, before
+/// and after an edit.
+#[test]
+fn rays_asked_off_the_thread_answer_as_rays_walked_at_once() {
+    let (mut world, entity) = flat_world();
+    let ray = |x: f64| -> Vec<Box<dyn Any>> {
+        vec![
+            Box::new(x),
+            Box::new(30.0f64),
+            Box::new(0.5f64),
+            Box::new(0.0f64),
+            Box::new(-1.0f64),
+            Box::new(0.0f64),
+            Box::new(100.0f64),
+        ]
+    };
+    let at_once = |world: &mut World, x: f64| -> f64 {
+        *call(world, entity, "raycast_distance", ray(x))
+            .unwrap()
+            .unwrap()
+            .downcast::<f64>()
+            .unwrap()
+    };
+    let asked = |world: &mut World, x: f64| -> f64 {
+        let ticket = *call(world, entity, "cast_ray", ray(x))
+            .unwrap()
+            .unwrap()
+            .downcast::<i64>()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let out = call(world, entity, "ray_distance", vec![Box::new(ticket)]).unwrap();
+            let distance = *out.unwrap().downcast::<f64>().unwrap();
+            if distance != -2.0 {
+                // Taken once.
+                let again = call(world, entity, "ray_distance", vec![Box::new(ticket)]).unwrap();
+                assert_eq!(*again.unwrap().downcast::<f64>().unwrap(), -2.0);
+                return distance;
+            }
+            assert!(std::time::Instant::now() < deadline, "no answer");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    for x in [0.5, 3.5, 40.5] {
+        let now = at_once(&mut world, x);
+        assert!(now > 0.0, "{now}");
+        assert_eq!(asked(&mut world, x), now);
+        let planet = terrain_world(&world, entity).unwrap();
+        let direct = planet
+            .raycast(DVec3::new(x, 30.0, 0.5), -DVec3::Y, 100.0)
+            .unwrap()
+            .distance;
+        assert_eq!(now, direct);
+    }
+    // A hole dug under one ray: both see it once the world with it is built.
+    let before = at_once(&mut world, 3.5);
+    set(&mut world, entity, [3.5, 30.0 - before - 0.05, 0.5], 0).unwrap();
+    let after = at_once(&mut world, 3.5);
+    assert!(after > before, "{before} -> {after}");
+    assert_eq!(asked(&mut world, 3.5), after);
+}

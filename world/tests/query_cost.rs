@@ -348,7 +348,6 @@ fn a_focus_loads() {
         let started = Instant::now();
         queries.focus(1, eye, 16.0);
         let first = started.elapsed().as_secs_f64() * 1e3;
-        let wanted = queries.loading();
         let mut waits: Vec<f64> = Vec::new();
         loop {
             let asked = Instant::now();
@@ -360,6 +359,7 @@ fn a_focus_loads() {
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         let ms = started.elapsed().as_secs_f64() * 1e3;
+        let wanted = queries.resident();
         // The focus follows its eye: each move past half a brick lists it
         // again, on the thread that calls (a game's, every few frames).
         let side = planet.grid().up(eye).any_orthonormal_vector();

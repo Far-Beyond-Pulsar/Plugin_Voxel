@@ -11,7 +11,9 @@
 //!   worker threads ([`Planet::sample_brick`]: exactly the cells' own
 //!   queries, columns and features evaluated once a brick) around the
 //!   points the host keeps in focus ([`WorldQueries::focus`]: a camera, the
-//!   players, physics bodies). Bricks provably in open air are not sampled.
+//!   players, physics bodies; a worker lists a focus's bricks, the caller
+//!   only says where it is), nearest first from a queue sorted by distance.
+//!   Bricks provably in open air are not sampled.
 //! * **Reads** ([`WorldQueries::solid`], [`WorldQueries::material`],
 //!   [`WorldQueries::raycast`]) are synchronous and exact over the resident
 //!   bricks, and [`Resident::Pending`] where a brick is not resident yet
@@ -411,6 +413,20 @@ impl Query {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(u64);
 
+impl Ticket {
+    /// The ticket as a number (what a script holds), and back.
+    pub fn id(self) -> u64 {
+        self.0
+    }
+    pub fn of(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// Answers kept for tickets not collected yet: past it the oldest go (a
+/// script that asks and never collects).
+const ANSWERS_KEPT: u64 = 4096;
+
 /// A region kept resident.
 #[derive(Clone, Copy, Debug)]
 struct Focus {
@@ -447,8 +463,13 @@ struct State {
     foci: FxHashMap<u64, Focus>,
     /// Bricks the foci (or reads) want and are not resident, nearest first
     /// when taken; and those taken by a worker.
-    wanted: FxHashSet<BrickKey>,
+    wanted: Wanted,
     sampling: FxHashSet<BrickKey>,
+    /// Foci whose bricks a worker is to list (they moved), and how many
+    /// listings are asked for or under way: a focus is not loaded before
+    /// its bricks are known.
+    listing: FxHashSet<u64>,
+    listings: usize,
     /// Bricks a newer snapshot must re-sample (they hold edits it now
     /// includes, or changed under them).
     stale: FxHashSet<BrickKey>,
@@ -461,6 +482,87 @@ struct State {
     watched: FxHashMap<u64, (Query, Answer)>,
     next_ticket: u64,
     stop: bool,
+}
+
+/// Fresh wanted bricks searched one by one before they are sorted in with
+/// the rest.
+const FRESH_WANTED: usize = 64;
+
+/// The bricks wanted and not resident, taken nearest a focus first.
+///
+/// A focus lists thousands of bricks and the workers take them one at a
+/// time, under the lock reads ask through: finding the nearest by going
+/// through all of them for every brick made loading a focus quadratic, and
+/// most of its time. They are kept sorted by distance instead, sorted again
+/// when a focus is listed (the distances changed); the few a read adds in
+/// between are looked through as they are until there are enough to sort
+/// in. Entries of bricks no longer wanted are skipped when met.
+#[derive(Default)]
+struct Wanted {
+    set: FxHashSet<BrickKey>,
+    /// Farthest first (the nearest is popped), as of the last sort.
+    sorted: Vec<(f64, BrickKey)>,
+    fresh: Vec<BrickKey>,
+    resort: bool,
+}
+
+impl Wanted {
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn insert(&mut self, key: BrickKey) -> bool {
+        let new = self.set.insert(key);
+        if new {
+            self.fresh.push(key);
+        }
+        new
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Take the wanted brick nearest by `distance` that `resident` does not
+    /// say is there already (those are dropped).
+    fn take_nearest(
+        &mut self,
+        distance: impl Fn(&BrickKey) -> f64,
+        resident: impl Fn(&BrickKey) -> bool,
+    ) -> Option<BrickKey> {
+        if self.resort || self.fresh.len() > FRESH_WANTED {
+            self.sorted = self.set.iter().map(|key| (distance(key), *key)).collect();
+            self.sorted.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            self.fresh.clear();
+            self.resort = false;
+        }
+        loop {
+            while self
+                .sorted
+                .last()
+                .is_some_and(|(_, key)| !self.set.contains(key))
+            {
+                self.sorted.pop();
+            }
+            let set = &self.set;
+            self.fresh.retain(|key| set.contains(key));
+            let fresh = self
+                .fresh
+                .iter()
+                .map(|key| (distance(key), *key))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let key = match (self.sorted.last().copied(), fresh) {
+                (Some(sorted), Some(fresh)) if fresh.0 < sorted.0 => fresh.1,
+                (Some(sorted), _) => sorted.1,
+                (None, Some(fresh)) => fresh.1,
+                (None, None) => return None,
+            };
+            self.set.remove(&key);
+            if !resident(&key) {
+                return Some(key);
+            }
+        }
+    }
 }
 
 impl State {
@@ -486,14 +588,14 @@ struct Shared {
     /// bookkeeping.
     planet: RwLock<Arc<Planet>>,
     tick: AtomicU64,
+    /// Resident bricks kept at most (about 1 KiB each, 17 with materials).
+    budget: usize,
 }
 
 /// See the module doc.
 pub struct WorldQueries {
     shared: Arc<Shared>,
     workers: Vec<helio_tasks::Service>,
-    /// Resident bricks kept at most (about 1 KiB each, 17 with materials).
-    budget: usize,
 }
 
 /// How far past a focus its bricks are kept.
@@ -513,6 +615,8 @@ impl WorldQueries {
                 inserted: Vec::new(),
                 foci: Default::default(),
                 wanted: Default::default(),
+                listing: Default::default(),
+                listings: 0,
                 sampling: Default::default(),
                 stale: Default::default(),
                 asks: VecDeque::new(),
@@ -526,6 +630,7 @@ impl WorldQueries {
             work: Condvar::new(),
             bricks: RwLock::new(Default::default()),
             tick: AtomicU64::new(1),
+            budget: 16_384,
         });
         let workers = (0..threads.max(1))
             .map(|n| {
@@ -543,11 +648,7 @@ impl WorldQueries {
                 .expect("spawn a voxel query worker")
             })
             .collect();
-        Self {
-            shared,
-            workers,
-            budget: 16_384,
-        }
+        Self { shared, workers }
     }
 
     /// The snapshot queries are answered against.
@@ -601,7 +702,7 @@ impl WorldQueries {
     /// replacing its last place): sampled nearest first, kept while any
     /// focus is near. Call as what it follows moves.
     pub fn focus(&self, id: u64, center: DVec3, radius: f64) {
-        let tick = self.shared.tick.fetch_add(1, Ordering::Relaxed) + 1;
+        self.shared.tick.fetch_add(1, Ordering::Relaxed);
         let mut state = self.shared.state.lock().expect("queries");
         let brick_m = f64::from(QUERY_BRICK) * state.planet.grid().voxel_size();
         let focus = state.foci.entry(id).or_insert(Focus {
@@ -614,22 +715,31 @@ impl WorldQueries {
         let moved = focus
             .listed_at
             .is_none_or(|at| at.distance(center) > brick_m * 0.5);
+        // Its bricks are listed by a worker (tens of thousands of points
+        // located on the grid: milliseconds), not by the thread that asks.
         if moved {
-            list_focus(&mut state, id, tick);
-            self.evict(&state, tick);
+            focus.listed_at = Some(center);
+            if state.listing.insert(id) {
+                state.listings += 1;
+            }
             self.shared.work.notify_all();
         }
     }
 
     /// Stop keeping focus `id`'s bricks.
     pub fn unfocus(&self, id: u64) {
-        self.shared.state.lock().expect("queries").foci.remove(&id);
+        let mut state = self.shared.state.lock().expect("queries");
+        state.foci.remove(&id);
+        if state.listing.remove(&id) {
+            state.listings -= 1;
+        }
     }
 
-    /// Bricks wanted and not resident yet (0: every focus is loaded).
+    /// Bricks wanted and not resident yet, and foci whose bricks are not
+    /// listed yet (0: every focus is loaded).
     pub fn loading(&self) -> usize {
         let state = self.shared.state.lock().expect("queries");
-        state.wanted.len() + state.sampling.len()
+        state.wanted.len() + state.sampling.len() + state.listings
     }
 
     /// Whether every brick within `radius` of `center` is resident; those
@@ -791,17 +901,19 @@ impl WorldQueries {
         state.watch_taken.remove(&id);
         state.watched.remove(&id);
     }
+}
 
-    /// Drop resident bricks over budget no focus wants, least recently used
-    /// first.
-    fn evict(&self, state: &State, tick: u64) {
-        let bricks_len = self.shared.bricks.read().expect("bricks").len();
-        if bricks_len <= self.budget {
+/// Drop resident bricks over budget no focus wants, least recently used
+/// first.
+fn evict(shared: &Shared, state: &State, tick: u64) {
+    {
+        let bricks_len = shared.bricks.read().expect("bricks").len();
+        if bricks_len <= shared.budget {
             return;
         }
         let planet = &state.planet;
         let brick_m = f64::from(QUERY_BRICK) * planet.grid().voxel_size();
-        let mut bricks = self.shared.bricks.write().expect("bricks");
+        let mut bricks = shared.bricks.write().expect("bricks");
         let mut far: Vec<(u64, BrickKey)> = bricks
             .iter()
             .filter(|(key, _)| {
@@ -814,7 +926,7 @@ impl WorldQueries {
             .map(|(key, brick)| (brick.used.load(Ordering::Relaxed), *key))
             .collect();
         far.sort_unstable_by_key(|(used, _)| *used);
-        let over = bricks.len().saturating_sub(self.budget);
+        let over = bricks.len().saturating_sub(shared.budget);
         for (used, key) in far.into_iter().take(over) {
             if used < tick {
                 bricks.remove(&key);
@@ -1001,16 +1113,34 @@ impl Drop for WorldQueries {
     }
 }
 
-/// List focus `id`'s bricks as wanted ([`region`]; resident ones are
-/// dropped when taken).
-fn list_focus(state: &mut State, id: u64, _tick: u64) {
-    let Some(focus) = state.foci.get_mut(&id) else {
-        return;
-    };
-    focus.listed_at = Some(focus.center);
-    let (center, radius) = (focus.center, focus.radius);
-    let planet = state.planet.clone();
-    state.wanted.extend(region(&planet, center, radius));
+/// Have focus `id`'s bricks listed by a worker ([`listed`]).
+fn list_focus(state: &mut State, id: u64) {
+    if state.foci.contains_key(&id) && state.listing.insert(id) {
+        state.listings += 1;
+    }
+}
+
+/// Focus `id`'s bricks around `center` (its place when a worker took the
+/// listing: [`region`], made with no lock held) are wanted, those not
+/// resident; bricks over budget that no focus keeps go. A focus that moved
+/// on meanwhile was asked to be listed again by the move.
+fn listed(shared: &Shared, id: u64, keys: FxHashSet<BrickKey>) {
+    let tick = shared.tick.load(Ordering::Relaxed);
+    let mut state = shared.state.lock().expect("queries");
+    state.listings -= 1;
+    if state.foci.contains_key(&id) {
+        let state = &mut *state;
+        let bricks = shared.bricks.read().expect("bricks");
+        for key in keys {
+            if !bricks.contains_key(&key) && !state.sampling.contains(&key) {
+                state.wanted.insert(key);
+            }
+        }
+        // The foci moved: distances are other than the queue's.
+        state.wanted.resort = true;
+    }
+    evict(shared, &state, tick);
+    shared.work.notify_all();
 }
 
 /// The bricks whose cells come within `radius` of `center`: those of a
@@ -1066,6 +1196,8 @@ enum Job {
     Change(Change, Arc<Planet>, Vec<Brush>),
     Watch(u64, Query, u64, Arc<Planet>),
     Ask(Ticket, Query, Arc<Planet>),
+    /// A focus's bricks listed around where it is, on a world.
+    List(u64, DVec3, f64, Arc<Planet>),
     /// A brick sampled from a snapshot, the brushes shown ahead of it
     /// applied, for a world of an epoch.
     Brick(BrickKey, Arc<Planet>, Vec<Brush>, u64),
@@ -1178,7 +1310,7 @@ fn make_change(shared: &Shared, change: Change, base: Arc<Planet>, pending: Vec<
                     adopted(shared, &mut state);
                     let foci: Vec<u64> = state.foci.keys().copied().collect();
                     for id in foci {
-                        list_focus(&mut state, id, 0);
+                        list_focus(&mut state, id);
                     }
                     state.changing = false;
                     shared.work.notify_all();
@@ -1320,12 +1452,15 @@ fn work(shared: &Shared, ctx: &helio_tasks::TaskContext) {
             }
             Job::Ask(ticket, query, planet) => {
                 let answer = query.answer(&planet);
-                shared
-                    .state
-                    .lock()
-                    .expect("queries")
-                    .answers
-                    .insert(ticket, answer);
+                let mut state = shared.state.lock().expect("queries");
+                state.answers.insert(ticket, answer);
+                if state.answers.len() as u64 > ANSWERS_KEPT {
+                    let oldest = ticket.0.saturating_sub(ANSWERS_KEPT);
+                    state.answers.retain(|kept, _| kept.0 > oldest);
+                }
+            }
+            Job::List(id, center, radius, planet) => {
+                listed(shared, id, region(&planet, center, radius))
             }
             Job::Brick(key, planet, pending, epoch) => {
                 sample(shared, key, &planet, &pending, epoch)
@@ -1410,6 +1545,14 @@ fn take(state: &mut State, shared: &Shared) -> Option<Job> {
         }
     }
     let planet = state.planet.clone();
+    // A focus that moved: its bricks, before any is taken.
+    if let Some(id) = state.listing.iter().next().copied() {
+        state.listing.remove(&id);
+        match state.foci.get(&id) {
+            Some(focus) => return Some(Job::List(id, focus.center, focus.radius, planet)),
+            None => state.listings -= 1,
+        }
+    }
     let due = state
         .watches
         .iter()
@@ -1423,9 +1566,19 @@ fn take(state: &mut State, shared: &Shared) -> Option<Job> {
     if let Some((ticket, query)) = state.asks.pop_front() {
         return Some(Job::Ask(ticket, query, planet));
     }
-    let resident = shared.bricks.read().expect("bricks");
-    state.wanted.retain(|key| !resident.contains_key(key));
-    drop(resident);
+    let key = {
+        let resident = shared.bricks.read().expect("bricks");
+        let foci = &state.foci;
+        state.wanted.take_nearest(
+            |key| {
+                let c = key.center(&planet);
+                foci.values()
+                    .map(|f| c.distance(f.center))
+                    .fold(f64::INFINITY, f64::min)
+            },
+            |key| resident.contains_key(key),
+        )
+    };
     let nearest = |keys: &FxHashSet<BrickKey>| {
         keys.iter()
             .map(|key| {
@@ -1440,10 +1593,6 @@ fn take(state: &mut State, shared: &Shared) -> Option<Job> {
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, key)| key)
     };
-    let key = nearest(&state.wanted).map(|k| {
-        state.wanted.remove(&k);
-        k
-    });
     let key = key.or_else(|| {
         let k = nearest(&state.stale)?;
         state.stale.remove(&k);
