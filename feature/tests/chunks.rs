@@ -7010,3 +7010,100 @@ fn wide_occlusion_rays_leave_the_ground() {
         );
     }
 }
+
+/// What a world costs from nothing to its settled view, as a host that has
+/// just opened a level pays it (Earth with its features, the engine's
+/// capacity and residency settings, 1280x720 from the ground): making the
+/// world (on the frame thread), the wait for its pipelines, the first chunk
+/// drawn, the settled view, and the longest frame's CPU on the way. A
+/// measurement: `--ignored --nocapture load_in`.
+#[test]
+#[ignore]
+fn load_in_from_a_new_world() {
+    let Some(gpu) = gpu() else { return };
+    let started = std::time::Instant::now();
+    let planet = Planet::new(PlanetRecipe {
+        terrain: helio_pass_voxel_planet::layers::TerrainLayers::earth().source(7),
+        features: helio_pass_voxel_planet::feature_recipe::FeatureRecipe::earth().grow(0.1, 7),
+        ..PlanetRecipe::default()
+    })
+    .unwrap();
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
+    eprintln!("LOADIN the CPU world built in {:.0} ms", ms(started));
+    let view = ground_view(&planet, land(&planet, 4, 0.37, 0.61), [1280, 720]);
+    let config = ResidencyConfig::default();
+    // As a host makes it: the world and its volume in one frame's prepare,
+    // their pipelines compiling off the frame while frames go on.
+    let made = std::time::Instant::now();
+    let mut chunks = ChunkWorld::with_capacity(&gpu.device, &gpu.queue, Capacity::default());
+    chunks.add_volume(
+        0,
+        &planet,
+        helio_pass_voxel_planet::VolumeTransform::IDENTITY,
+    );
+    let make = ms(made);
+    let mut world = World {
+        chunks,
+        frame: 0,
+        sun: Vec3::new(0.3, 0.8, 0.4).normalize(),
+        scene_depth: None,
+        lights: None,
+        sun_occlusion: false,
+        jitter: None,
+        last: None,
+    };
+    let (mut waiting_frames, mut longest_waiting) = (0u64, 0.0f64);
+    let (mut ready, mut first, mut longest, mut cpu) = (None, None, (0.0f64, 0u64), 0.0f64);
+    let mut generated = Vec::new();
+    loop {
+        let frame = std::time::Instant::now();
+        let stats = world.frame_with(gpu, &planet, &view, &config);
+        let took = ms(frame);
+        if took > longest.0 {
+            longest = (took, world.frame);
+        }
+        cpu = cpu.max(stats.cpu_ms.iter().sum());
+        if ready.is_none() {
+            if world.chunks.pipelines_ready() {
+                ready = Some((ms(made), world.frame));
+            } else {
+                // Frames while the pipelines compile: what a host's frame
+                // thread (and whatever else shares its device) pays.
+                waiting_frames += 1;
+                longest_waiting = longest_waiting.max(took);
+                longest = (0.0, 0);
+            }
+        }
+        let count = world.chunks.chunk_count();
+        if first.is_none() && count > 0 {
+            first = Some((ms(made), world.frame));
+        }
+        if world.frame.is_multiple_of(30) {
+            generated.push((ms(made) as u64, count));
+        }
+        if world.chunks.settled() {
+            break;
+        }
+        if ready.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        assert!(made.elapsed().as_secs() < 300, "the view did not settle");
+    }
+    let (ready, first) = (ready.unwrap(), first.unwrap());
+    eprintln!(
+        "LOADIN world made in {make:.1} ms (frame thread); pipelines ready at {:.0} ms (frame {}); first chunk at {:.0} ms (frame {}); settled at {:.0} ms (frame {}), {} chunks; longest frame {:.1} ms (frame {}); longest update CPU {cpu:.2} ms",
+        ready.0,
+        ready.1,
+        first.0,
+        first.1,
+        ms(made),
+        world.frame,
+        world.chunks.chunk_count(),
+        longest.0,
+        longest.1,
+    );
+    eprintln!(
+        "LOADIN while the pipelines compiled: {waiting_frames} frames, the longest {longest_waiting:.1} ms"
+    );
+    eprintln!("LOADIN chunks resident by time (ms, chunks): {generated:?}");
+}

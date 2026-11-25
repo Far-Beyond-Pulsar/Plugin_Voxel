@@ -63,24 +63,44 @@ impl GenPipelines {
                 },
             )
         };
+        let mut kernels = super::kernels::Kernels::new(device);
+        let tile_nodes = kernels.add(|| compute(gen_layout, "tile_nodes_main"));
+        let tile_columns = kernels.add(|| compute(gen_layout, "tile_columns_main"));
+        let tile_caves = kernels.add(|| compute(gen_layout, "tile_caves_main"));
+        let tile_volumes = kernels.add(|| compute(gen_layout, "tile_volumes_main"));
+        let tile_slope_nodes = kernels.add(|| compute(gen_layout, "tile_slope_nodes_main"));
+        let tile_slope_heights = kernels.add(|| compute(gen_layout, "tile_slope_heights_main"));
+        let tile_slopes = kernels.add(|| compute(gen_layout, "tile_slopes_main"));
+        let feature_block_quads = kernels.add(|| compute(gen_layout, "feature_block_quads_main"));
+        let feature_block_nodes = kernels.add(|| compute(gen_layout, "feature_block_nodes_main"));
+        let feature_block_candidates =
+            kernels.add(|| compute(gen_layout, "feature_block_candidates_main"));
+        let tile_features = kernels.add(|| compute(gen_layout, "tile_features_main"));
+        let chunk_columns = kernels.add(|| compute(gen_layout, "chunk_columns_main"));
+        let chunk_cells = kernels.add(|| compute(gen_layout, "chunk_cells_main"));
+        let chunk_build = kernels.add(|| compute(gen_layout, "chunk_build_main"));
+        let evict = kernels.add(|| compute(gen_layout, "evict"));
+        let pack = kernels.add(|| compute(keep_layout, "pack_main"));
+        let restore = kernels.add(|| compute(keep_layout, "restore_main"));
+        kernels.compile();
         Self {
-            tile_nodes: compute(gen_layout, "tile_nodes_main"),
-            tile_columns: compute(gen_layout, "tile_columns_main"),
-            tile_caves: compute(gen_layout, "tile_caves_main"),
-            tile_volumes: compute(gen_layout, "tile_volumes_main"),
-            tile_slope_nodes: compute(gen_layout, "tile_slope_nodes_main"),
-            tile_slope_heights: compute(gen_layout, "tile_slope_heights_main"),
-            tile_slopes: compute(gen_layout, "tile_slopes_main"),
-            feature_block_quads: compute(gen_layout, "feature_block_quads_main"),
-            feature_block_nodes: compute(gen_layout, "feature_block_nodes_main"),
-            feature_block_candidates: compute(gen_layout, "feature_block_candidates_main"),
-            tile_features: compute(gen_layout, "tile_features_main"),
-            chunk_columns: compute(gen_layout, "chunk_columns_main"),
-            chunk_cells: compute(gen_layout, "chunk_cells_main"),
-            chunk_build: compute(gen_layout, "chunk_build_main"),
-            evict: compute(gen_layout, "evict"),
-            pack: compute(keep_layout, "pack_main"),
-            restore: compute(keep_layout, "restore_main"),
+            tile_nodes: tile_nodes.take(),
+            tile_columns: tile_columns.take(),
+            tile_caves: tile_caves.take(),
+            tile_volumes: tile_volumes.take(),
+            tile_slope_nodes: tile_slope_nodes.take(),
+            tile_slope_heights: tile_slope_heights.take(),
+            tile_slopes: tile_slopes.take(),
+            feature_block_quads: feature_block_quads.take(),
+            feature_block_nodes: feature_block_nodes.take(),
+            feature_block_candidates: feature_block_candidates.take(),
+            tile_features: tile_features.take(),
+            chunk_columns: chunk_columns.take(),
+            chunk_cells: chunk_cells.take(),
+            chunk_build: chunk_build.take(),
+            evict: evict.take(),
+            pack: pack.take(),
+            restore: restore.take(),
         }
     }
 }
@@ -796,88 +816,13 @@ impl DrawPipelines {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         });
-        let publish = helio_core::shader::create_render_pipeline(
-            device,
-            wgpu::RenderPipelineDescriptor {
-                label: Some("chunk gbuffer"),
-                layout: Some(&layout(&layouts.resolve)),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("resolve_vertex"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                // `shadow` decided which hits show against the meshes' depth.
-                depth_stencil: depth(wgpu::CompareFunction::Always),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("publish"),
-                    compilation_options: Default::default(),
-                    targets: &gbuffer_targets,
-                }),
-                multiview_mask: None,
-                cache: None,
-            },
-        );
-        let exits_open = helio_core::shader::create_render_pipeline(
-            device,
-            wgpu::RenderPipelineDescriptor {
-                label: Some("chunk exits open"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[],
-                        immediate_size: 0,
-                    }),
-                ),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("resolve_vertex"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("exits_open"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::R32Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            },
-        );
-        // The publish again, textured by the host's scene materials, where
-        // the device has texture binding arrays.
-        let publish_scene = scene.map(|(textures, capacity, shore_params)| {
-            let capacity = *capacity;
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("chunk draw (scene materials)"),
-                source: wgpu::ShaderSource::Wgsl(scene::scene_source(source, capacity).into()),
-            });
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[
-                    Some(&layouts.draw),
-                    Some(&layouts.resolve),
-                    Some(textures),
-                    Some(shore_params),
-                ],
-                immediate_size: 0,
-            });
+        let mut kernels = super::kernels::Kernels::new(device);
+        let publish = kernels.add(|| {
             helio_core::shader::create_render_pipeline(
                 device,
                 wgpu::RenderPipelineDescriptor {
-                    label: Some("chunk gbuffer (scene materials)"),
-                    layout: Some(&pipeline_layout),
+                    label: Some("chunk gbuffer"),
+                    layout: Some(&layout(&layouts.resolve)),
                     vertex: wgpu::VertexState {
                         module: &module,
                         entry_point: Some("resolve_vertex"),
@@ -885,6 +830,7 @@ impl DrawPipelines {
                         buffers: &[],
                     },
                     primitive: Default::default(),
+                    // `shadow` decided which hits show against the meshes' depth.
                     depth_stencil: depth(wgpu::CompareFunction::Always),
                     multisample: Default::default(),
                     fragment: Some(wgpu::FragmentState {
@@ -898,96 +844,239 @@ impl DrawPipelines {
                 },
             )
         });
-        Self {
-            seed_outside: seed("seed_vertex", "seed_fragment"),
-            seed_inside: seed("seed_vertex_inside", "seed_fragment_inside"),
-            cull_bin: compute("cull_bin", &cull_layout, "cull_bin", false),
-            cull_offsets: compute("cull_offsets", &cull_layout, "cull_offsets", false),
-            cull_scatter: compute("cull_scatter", &cull_layout, "cull_scatter", false),
-            trace: compute("chunk trace", &trace_layout, "trace", false),
-            trace_ortho: compute("chunk ortho trace", &trace_layout, "trace_ortho", false),
-            trace_heat: compute("chunk heat trace", &trace_layout, "trace", true),
-            shadow_sample: compute("chunk sun samples", &sample_layout, "shadow_sample", false),
-            shadow_sample_far: compute(
+        let exits_open = kernels.add(|| {
+            helio_core::shader::create_render_pipeline(
+                device,
+                wgpu::RenderPipelineDescriptor {
+                    label: Some("chunk exits open"),
+                    layout: Some(
+                        &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: None,
+                            bind_group_layouts: &[],
+                            immediate_size: 0,
+                        }),
+                    ),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("resolve_vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("exits_open"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::R32Float,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            )
+        });
+        // The publish again, textured by the host's scene materials, where
+        // the device has texture binding arrays.
+        let publish_scene = kernels.add(|| {
+            scene.map(|(textures, capacity, shore_params)| {
+                let capacity = *capacity;
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("chunk draw (scene materials)"),
+                    source: wgpu::ShaderSource::Wgsl(scene::scene_source(source, capacity).into()),
+                });
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[
+                            Some(&layouts.draw),
+                            Some(&layouts.resolve),
+                            Some(textures),
+                            Some(shore_params),
+                        ],
+                        immediate_size: 0,
+                    });
+                helio_core::shader::create_render_pipeline(
+                    device,
+                    wgpu::RenderPipelineDescriptor {
+                        label: Some("chunk gbuffer (scene materials)"),
+                        layout: Some(&pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("resolve_vertex"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        primitive: Default::default(),
+                        depth_stencil: depth(wgpu::CompareFunction::Always),
+                        multisample: Default::default(),
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("publish"),
+                            compilation_options: Default::default(),
+                            targets: &gbuffer_targets,
+                        }),
+                        multiview_mask: None,
+                        cache: None,
+                    },
+                )
+            })
+        });
+        let seed_outside = kernels.add(|| seed("seed_vertex", "seed_fragment"));
+        let seed_inside = kernels.add(|| seed("seed_vertex_inside", "seed_fragment_inside"));
+        let cull_bin = kernels.add(|| compute("cull_bin", &cull_layout, "cull_bin", false));
+        let cull_offsets =
+            kernels.add(|| compute("cull_offsets", &cull_layout, "cull_offsets", false));
+        let cull_scatter =
+            kernels.add(|| compute("cull_scatter", &cull_layout, "cull_scatter", false));
+        let trace = kernels.add(|| compute("chunk trace", &trace_layout, "trace", false));
+        let trace_ortho =
+            kernels.add(|| compute("chunk ortho trace", &trace_layout, "trace_ortho", false));
+        let trace_heat = kernels.add(|| compute("chunk heat trace", &trace_layout, "trace", true));
+        let shadow_sample =
+            kernels.add(|| compute("chunk sun samples", &sample_layout, "shadow_sample", false));
+        let shadow_sample_far = kernels.add(|| {
+            compute(
                 "chunk far sun samples",
                 &sample_layout,
                 "shadow_sample_far",
                 false,
-            ),
-            sky_sample: compute("chunk sky samples", &sky_layout, "sky_sample", false),
-            sky_sample_far: compute(
+            )
+        });
+        let sky_sample =
+            kernels.add(|| compute("chunk sky samples", &sky_layout, "sky_sample", false));
+        let sky_sample_far = kernels.add(|| {
+            compute(
                 "chunk far sky samples",
                 &sky_layout,
                 "sky_sample_far",
                 false,
-            ),
-            shadow: compute("chunk shadow", &layout(&layouts.shadow), "shadow", false),
-            shadow_fallback: compute(
+            )
+        });
+        let shadow =
+            kernels.add(|| compute("chunk shadow", &layout(&layouts.shadow), "shadow", false));
+        let shadow_fallback = kernels.add(|| {
+            compute(
                 "chunk shadow fallbacks",
                 &layout(&layouts.shadow_fallback),
                 "shadow_fallback",
                 false,
-            ),
-            local_sample: compute(
+            )
+        });
+        let local_sample = kernels.add(|| {
+            compute(
                 "chunk local light samples",
                 &local_layout,
                 "local_sample",
                 false,
-            ),
-            local_sample_far: compute(
+            )
+        });
+        let local_sample_far = kernels.add(|| {
+            compute(
                 "chunk far local light samples",
                 &local_layout,
                 "local_sample_far",
                 false,
-            ),
-            local_shadow: compute("chunk local shadows", &local_layout, "local_shadow", false),
-            local_shadow_far: compute(
+            )
+        });
+        let local_shadow =
+            kernels.add(|| compute("chunk local shadows", &local_layout, "local_shadow", false));
+        let local_shadow_far = kernels.add(|| {
+            compute(
                 "chunk far local shadows",
                 &local_layout,
                 "local_shadow_far",
                 false,
-            ),
-            temporal: tiled(
+            )
+        });
+        let temporal = kernels.add(|| {
+            tiled(
                 "chunk shadow history",
                 &layout(&layouts.temporal),
                 "temporal",
-            ),
-            filter: [
+            )
+        });
+        let filter = kernels.add(|| {
+            [
                 tiled("chunk shadow filter", &filter_layout, "filter_first"),
                 tiled("chunk shadow filter", &filter_layout, "filter_second"),
-            ],
-            resolve_shadows: tiled(
+            ]
+        });
+        let resolve_shadows = kernels.add(|| {
+            tiled(
                 "chunk shadow resolve",
                 &layout(&layouts.resolve_shadows),
                 "resolve",
-            ),
-            local_gate: compute(
+            )
+        });
+        let local_gate = kernels.add(|| {
+            compute(
                 "chunk local light gate",
                 &layout(&layouts.local_denoise[2]),
                 "local_gate",
                 false,
-            ),
-            local_temporal: tiled(
+            )
+        });
+        let local_temporal = kernels.add(|| {
+            tiled(
                 "chunk local light history",
                 &layout(&layouts.local_denoise[0]),
                 "local_temporal",
-            ),
-            local_filter: compute(
+            )
+        });
+        let local_filter = kernels.add(|| {
+            compute(
                 "chunk local light filter",
                 &layout(&layouts.local_denoise[1]),
                 "local_filter",
                 false,
-            ),
-            ground_probe: compute(
+            )
+        });
+        let ground_probe = kernels.add(|| {
+            compute(
                 "chunk ground probes",
                 &layout(&layouts.ground),
                 "ground_probe",
                 false,
-            ),
-            feedback: tiled("chunk feedback", &layout(&layouts.feedback), "feedback"),
-            publish,
-            exits_open,
-            publish_scene,
+            )
+        });
+        let feedback =
+            kernels.add(|| tiled("chunk feedback", &layout(&layouts.feedback), "feedback"));
+        kernels.compile();
+        Self {
+            seed_outside: seed_outside.take(),
+            seed_inside: seed_inside.take(),
+            cull_bin: cull_bin.take(),
+            cull_offsets: cull_offsets.take(),
+            cull_scatter: cull_scatter.take(),
+            trace: trace.take(),
+            trace_ortho: trace_ortho.take(),
+            trace_heat: trace_heat.take(),
+            shadow_sample: shadow_sample.take(),
+            shadow_sample_far: shadow_sample_far.take(),
+            sky_sample: sky_sample.take(),
+            sky_sample_far: sky_sample_far.take(),
+            shadow: shadow.take(),
+            shadow_fallback: shadow_fallback.take(),
+            local_sample: local_sample.take(),
+            local_sample_far: local_sample_far.take(),
+            local_shadow: local_shadow.take(),
+            local_shadow_far: local_shadow_far.take(),
+            temporal: temporal.take(),
+            filter: filter.take(),
+            resolve_shadows: resolve_shadows.take(),
+            local_gate: local_gate.take(),
+            local_temporal: local_temporal.take(),
+            local_filter: local_filter.take(),
+            ground_probe: ground_probe.take(),
+            feedback: feedback.take(),
+            publish: publish.take(),
+            exits_open: exits_open.take(),
+            publish_scene: publish_scene.take(),
             module,
         }
     }
@@ -1017,17 +1106,25 @@ impl CrossPipelines {
                 },
             )
         };
-        Self {
-            shadow: compute(
+        let mut kernels = super::kernels::Kernels::new(device);
+        let shadow = kernels.add(|| {
+            compute(
                 "chunk shadows across volumes",
                 &layouts.shadow_fallback,
                 "shadow_cross",
-            ),
-            ground_probe: compute(
+            )
+        });
+        let ground_probe = kernels.add(|| {
+            compute(
                 "chunk ground probes across volumes",
                 &layouts.ground,
                 "ground_probe_cross",
-            ),
+            )
+        });
+        kernels.compile();
+        Self {
+            shadow: shadow.take(),
+            ground_probe: ground_probe.take(),
         }
     }
 }

@@ -14,6 +14,7 @@
 mod candidates;
 pub mod classify;
 mod drawn;
+mod kernels;
 mod sun_pages;
 mod volumes;
 pub use sun_pages::SunPageStats;
@@ -5130,6 +5131,11 @@ impl ChunkWorld {
             unseen |= vol
                 .planned_for
                 .is_none_or(|p| p.eye != local_eye || p.view != local_view);
+            // A planner that stopped takes no more events: none are kept
+            // for it (a frame's ray reports each frame, for good).
+            if self.worker.stopped() {
+                vol.events.clear();
+            }
             if !self.worker.busy() {
                 jobs.push(residency::VolumeJob {
                     volume: vol.index,
@@ -6347,6 +6353,13 @@ impl ChunkWorld {
                     || o.settled_since
                         .is_some_and(|f| o.drawn_frame + 1 >= f + PAGES_SETTLE_FRAMES)
             })
+    }
+
+    /// Whether the residency planner's thread ended (it panicked): the cut
+    /// drawn stays as it is and nothing streams any more, said once on
+    /// stderr. A host shows it, or drops this world and makes another.
+    pub fn planner_stopped(&self) -> bool {
+        self.worker.stopped()
     }
 
     /// Whether nothing waits to be generated or read back, no switch

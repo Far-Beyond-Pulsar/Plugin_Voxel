@@ -23,6 +23,7 @@ it. The Pulsar editor integration is documented in Pulsar-Native's
 7. [Tests](#tests)
 8. [Extending](#extending)
 9. [Known limits and open work](#known-limits-and-open-work)
+10. [Load-in, CPU queries and failures](#load-in-cpu-queries-and-failures)
 
 ## Goals
 
@@ -449,3 +450,109 @@ changes. See [`helio-voxel-world/docs/features.md`](../world/docs/features.md).
 
 - Generation's cost is mostly the terrain program per column, once per
   footprint while it stays in the footprint pool.
+
+## Load-in, CPU queries and failures
+
+Measured 2026-11-25 on the development machine (32 threads, Vulkan), release
+builds. The measurements are tests, so they can be taken again:
+`--ignored --nocapture` with `load_in_from_a_new_world` (`tests/chunks.rs`,
+GPU) and `query_costs_on_earth`, `bricks_sampled_side_by_side`,
+`a_focus_loads` (`../world/tests/query_cost.rs`, CPU).
+
+### From a new world to its first chunk
+
+A world costs nothing on the frame until its pipelines exist, and what keeps
+it from its first chunk is their compile: with the backend's shader cache
+cold, Earth's 17 generation kernels took 23.9 s one after another
+(`feature_block_candidates_main` 12.4 s, `tile_caves_main` 3.6 s,
+`tile_columns_main` 2.6 s, `chunk_columns_main` 2.2 s) and its draw bundle
+19 to 22 s, each bundle on one thread; warm, 0.1 to 0.2 s. Generation itself
+is not the wait: from the first chunk to the settled 1280x720 ground view
+(28 000 to 30 000 chunks) is 1.7 to 2.6 s within the 3 ms a frame budget,
+nearest first.
+
+A bundle's pipelines now compile side by side (`chunks/kernels.rs`: on the
+thread pool, a quarter of its threads at most, inside the bundle's own
+compile job), so a bundle takes about its longest kernel, not their sum:
+
+| World (cold shader cache) | Pipelines ready, before | After |
+|---|---|---|
+| Infinite plane, 0.25 m voxels, Earth layers and features | 15.4 s, 16.1 s | 7.4 s, 7.6 s, 8.6 s, 10.3 s |
+| Earth (sphere) | 23.3 s, 23.9 s, 29.1 s | not taken cold (the cache was warm by then); no less than its longest kernel, 12.4 s |
+
+Warm, Earth's first chunk came at 190 ms before and 116 to 122 ms after;
+frames kept their pace while pipelines compiled (the longest 12 to 25 ms).
+What is left is known and not this crate's alone:
+
+- The longest kernel bounds a cold start (12.4 s on Earth).
+- In the editor every compile bundle is a long task, and the task queue has
+  two long-task workers (`editor_task_queue`'s `DEFAULT_DEDICATED_WORKERS`):
+  the voxel bundles wait behind every other feature's, and other long tasks
+  behind them. More workers, or compile jobs on a pool of their own, is the
+  host's to decide.
+- Adding a volume costs the frame 30 to 68 ms once (`ChunkWorld::add_volume`:
+  the pack fingerprint hashes the terrain's 23.5 MB table byte by byte, on
+  the frame thread). Not changed: the hash is what saved kept chunks are
+  matched by, so it has to be made the same, off the frame.
+
+### World queries on the CPU
+
+Earth with its features, 0.1 m voxels (`Matter::All` counts features):
+
+| Query | Before | After |
+|---|---|---|
+| A player capsule's 684 cells | 5.5 to 5.6 ms | 0.19 to 0.25 ms |
+| One cell | 7.3 to 8.6 us | 0.3 to 0.4 us |
+| A 16^3 brick with features | 2.1 to 2.6 ms | 0.55 to 0.68 ms |
+| A 32^3 brick with features | 9.6 to 10.0 ms | 2.0 to 2.3 ms |
+| A 30 m ray, down and forward | 0.22 to 0.25 ms | 7 to 9 us |
+| A 100 m level ray through a forest | 20.0 to 20.5 ms | 9.6 to 10.0 ms |
+| `ground_height_of` (at 3 km) | 0.46 to 0.54 ms (1.2 to 1.6 ms) | 0.03 to 0.04 ms (0.13 to 0.16 ms) |
+| 64 bricks on 8 threads (one thread: 115 to 137 ms) | 26.5 to 35.3 ms | 22.1 to 24.3 ms |
+
+A base cell has no far form, but every cell no placement held evaluated its
+column's ground material for one; a decided placement square is one lookup; a
+stamp answers from its box. The terrain caches every copy of a world shares
+(heights, volume columns, cave networks) are sharded by key, held for a
+lookup or an insert only, and a shard that fills starts over alone (the whole
+cache used to be dropped at its limit). What is left: a new column costs its
+terrain evaluation (5 to 8 us), which is what a long ray over new ground pays.
+
+Tried and not kept (inside the run-to-run spread): clipping a brick's stamp
+loops to the stamp's layers; letting the placement cache go around each
+evaluation.
+
+### Failures that are reported, not waited for
+
+- A world build that panics is that terrain's error (the world shown stays,
+  the builder takes the next request); a builder that is gone is said so. The
+  terrain no longer stays "building" for good.
+- A residency planner thread that is gone is said once (stderr) and
+  `ChunkWorld::planner_stopped` answers true; the world keeps no events for
+  it (it kept a frame's ray reports each frame). The cut drawn stays; the
+  world is not rebuilt by itself: a host that wants it back drops it.
+- A thread that panics holding one of a world's caches does not take the
+  world's queries with it.
+- An edit snapshot whose checksum holds but whose bricks name a level or face
+  the grid lacks, or whose bounds are not numbers, is refused.
+
+### Open, with numbers
+
+- `WorldQueries::focus` lists its region on the thread that calls it, under
+  the queries' state lock: 2.8 to 4.5 ms each time a 16 m focus moves half a
+  brick (0.8 m), on a game's frame. The workers then take the nearest wanted
+  brick by scanning every wanted one, under the same lock: 6609 bricks load
+  in 1.39 s on 2 workers (0.21 ms a brick, where sampling one costs 0.06 ms
+  without features) and only 1.9 times sooner on 8, while the asking
+  thread's calls wait up to 4 ms. The design that removes both: the region
+  listed by a worker, and the wanted bricks kept as a list sorted by distance
+  when a focus moves, not searched per job.
+- The component's edit journal lists every edit since the last editor save
+  (64 bytes each): a game that edits for hours never folds it. The builder
+  thread could keep a snapshot of its world every few thousand edits and
+  hand the journal a base, as a save does.
+- Kept chunks are checked by checksum, fingerprint and history, not by
+  structure: a pack is copied to the GPU as it is.
+- `Planet::raycast` and the other direct queries walk on the calling thread
+  whatever the length (a 100 m ray over new ground 10 ms): scripts that cast
+  far should use the query workers (`WorldQueries::ask`).

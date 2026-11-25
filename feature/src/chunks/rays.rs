@@ -85,20 +85,26 @@ impl RayPipelines {
                 },
             )
         };
-        Self {
-            enter_nearest: compute(
+        let mut kernels = super::kernels::Kernels::new(device);
+        let enter_nearest = kernels.add(|| {
+            compute(
                 "voxel nearest ray starts",
                 &layouts.rays,
                 "ray_enter_nearest",
-            ),
-            nearest: compute("voxel nearest rays", &layouts.rays, "ray_nearest"),
-            occlusion: compute(
+            )
+        });
+        let nearest = kernels.add(|| compute("voxel nearest rays", &layouts.rays, "ray_nearest"));
+        let occlusion = kernels.add(|| {
+            compute(
                 "voxel occlusion rays",
                 &layouts.ray_occlusion,
                 "ray_occlusion",
-            ),
-            enter_runs: compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"),
-            surface: [
+            )
+        });
+        let enter_runs =
+            kernels.add(|| compute("voxel ray run starts", &layouts.rays, "ray_enter_runs"));
+        let surface = kernels.add(|| {
+            [
                 compute(
                     "voxel ray surfaces (diffuse)",
                     &layouts.ray_surfaces,
@@ -109,7 +115,15 @@ impl RayPipelines {
                     &layouts.ray_surfaces,
                     "ray_surface_full",
                 ),
-            ],
+            ]
+        });
+        kernels.compile();
+        Self {
+            enter_nearest: enter_nearest.take(),
+            nearest: nearest.take(),
+            occlusion: occlusion.take(),
+            enter_runs: enter_runs.take(),
+            surface: surface.take(),
         }
     }
 }
