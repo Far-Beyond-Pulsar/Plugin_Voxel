@@ -504,7 +504,10 @@ impl Planet {
             FeatureEval::new(&self.features, &self.grid, &*self.field, &top, &mut cache)
                 .coarse_cell(face, level, i, j, k)
         };
-        if near.is_some() {
+        // Far forms stand in for the spawns a level does not draw; level 0
+        // draws them all (`CompiledFeatures::far_cover`), so it reads no
+        // ground.
+        if near.is_some() || level == 0 {
             return near;
         }
         let ground = features::ground(
@@ -1040,31 +1043,14 @@ impl Planet {
         let mut out = Vec::with_capacity(cells);
         for j in j0..j0 + n {
             for i in i0..i0 + n {
-                let height = self.column_height(face, i, j, 0);
                 let large = self.large_brushes(face, i, j, None, 0);
                 let recent = Self::face_brushes(&self.edits.recent, face, i, j, None, 0);
-                // The far spawns' cover where no near placement holds a
-                // cell (`features_at`).
-                let far = with_features
-                    .then(|| {
-                        self.features.far_cover(
-                            &self.grid,
-                            &*self.field,
-                            face,
-                            0,
-                            i,
-                            j,
-                            features::ground(&self.grid, &*self.field, face, i, j, 0, height),
-                        )
-                    })
-                    .flatten();
                 let column = (((j - j0) * n + (i - i0)) * n) as usize;
                 let volume = self.volume_column(face, i, j, 0);
                 for k in k0..k0 + n {
                     let generated = self.column_kind(&volume, face, i, j, k, 0);
-                    let near = features[column + (k - k0) as usize];
-                    let cell_features = near
-                        .or_else(|| far.and_then(|cover| CompiledFeatures::far_cell(0, k, cover)));
+                    // Base cells have no far cover (`features_at`).
+                    let cell_features = features[column + (k - k0) as usize];
                     let center = [center_half(i, 0), center_half(j, 0), center_half(k, 0)];
                     let point = || self.grid.volume_point(face, i, j, k, 0);
                     let baked = self.edits.baked.cell(face, 0, i, j, k);

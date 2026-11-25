@@ -204,6 +204,12 @@ impl CompiledStamp {
     /// What it holds at offset `p` (its own frame): `None` nothing,
     /// `Some(None)` air.
     pub fn at(&self, p: [i32; 3]) -> Option<Option<u32>> {
+        // No part holds a cell outside its own box (`CompiledPart::holds`),
+        // so none outside their union: most cells a placement is asked for
+        // (its reach square, at any height) end here.
+        if (0..3).any(|a| p[a] < self.lo[a] || p[a] - self.lo[a] >= self.size[a]) {
+            return None;
+        }
         cell_of(&self.parts, p)
     }
 
@@ -928,17 +934,16 @@ impl<'a> FeatureEval<'a> {
     /// Spawn `s`'s placement on square `(gx, gy)` of `face`, if any: its raw
     /// candidate unless an earlier spawn's meets its footprint.
     pub fn placement(&mut self, s: usize, face: u8, gx: i32, gy: i32) -> Option<Placement> {
-        let p = self.raw(s, face, gx, gy)?;
         let key = (s as u32, face, gx, gy);
-        let placed = match self.cache.get(&key).and_then(|e| e.1) {
-            Some(placed) => placed,
-            None => {
-                let (fi, fj) = p.footprint(self.features);
-                let placed = !(0..s).any(|e| self.raw_meets(e, face, fi, fj));
-                self.cache.insert(key, (Some(p), Some(placed)));
-                placed
-            }
+        // A square decided before: one lookup.
+        let p = match self.cache.get(&key) {
+            Some(&(p, Some(placed))) => return p.filter(|_| placed),
+            Some(&(p, None)) => p?,
+            None => self.raw(s, face, gx, gy)?,
         };
+        let (fi, fj) = p.footprint(self.features);
+        let placed = !(0..s).any(|e| self.raw_meets(e, face, fi, fj));
+        self.cache.insert(key, (Some(p), Some(placed)));
         placed.then_some(p)
     }
 
@@ -946,26 +951,46 @@ impl<'a> FeatureEval<'a> {
     /// `[i0, i1)` x `[j0, j1)`.
     fn raw_meets(&mut self, s: usize, face: u8, i: [i32; 2], j: [i32; 2]) -> bool {
         let features = self.features;
-        self.squares_near(s, i, j)
-            .into_iter()
-            .filter_map(|(gx, gy)| self.raw(s, face, gx, gy))
-            .any(|p| {
-                let (fi, fj) = p.footprint(features);
-                fi[0] < i[1] && fi[1] > i[0] && fj[0] < j[1] && fj[1] > j[0]
+        let ([gx0, gx1], [gy0, gy1]) = self.squares_near(s, i, j);
+        (gy0..=gy1).any(|gy| {
+            (gx0..=gx1).any(|gx| {
+                self.raw(s, face, gx, gy).is_some_and(|p| {
+                    let (fi, fj) = p.footprint(features);
+                    fi[0] < i[1] && fi[1] > i[0] && fj[0] < j[1] && fj[1] > j[0]
+                })
             })
+        })
     }
 
     /// Spawn `s`'s squares that may reach base columns `[i0, i1)` x
-    /// `[j0, j1)` (within its reach of them), by row then column.
-    fn squares_near(&self, s: usize, i: [i32; 2], j: [i32; 2]) -> Vec<(i32, i32)> {
+    /// `[j0, j1)` (within its reach of them): the first and last, each way.
+    fn squares_near(&self, s: usize, i: [i32; 2], j: [i32; 2]) -> ([i32; 2], [i32; 2]) {
         let (spacing, r) = (
             self.features.spawns[s].spacing,
             self.features.spawns[s].reach,
         );
         let g = |v: i32| v.div_euclid(spacing);
-        (g(j[0] - r)..=g(j[1] - 1 + r))
-            .flat_map(|gy| (g(i[0] - r)..=g(i[1] - 1 + r)).map(move |gx| (gx, gy)))
-            .collect()
+        ([g(i[0] - r), g(i[1] - 1 + r)], [g(j[0] - r), g(j[1] - 1 + r)])
+    }
+
+    /// `visit` each of spawn `s`'s placements of the squares that may reach
+    /// base columns `[i0, i1)` x `[j0, j1)`, by row then column.
+    fn each_placement_near(
+        &mut self,
+        s: usize,
+        face: u8,
+        i: [i32; 2],
+        j: [i32; 2],
+        mut visit: impl FnMut(&Placement),
+    ) {
+        let ([gx0, gx1], [gy0, gy1]) = self.squares_near(s, i, j);
+        for gy in gy0..=gy1 {
+            for gx in gx0..=gx1 {
+                if let Some(p) = self.placement(s, face, gx, gy) {
+                    visit(&p);
+                }
+            }
+        }
     }
 
     /// Spawn `s`'s placements of the squares that may reach base columns
@@ -977,25 +1002,25 @@ impl<'a> FeatureEval<'a> {
         i: [i32; 2],
         j: [i32; 2],
     ) -> Vec<Placement> {
-        self.squares_near(s, i, j)
-            .into_iter()
-            .filter_map(|(gx, gy)| self.placement(s, face, gx, gy))
-            .collect()
+        let mut out = Vec::new();
+        self.each_placement_near(s, face, i, j, |p| out.push(*p));
+        out
     }
 
     /// What the features make of base cell `(i, j, k)` of `face` (the last
     /// placement holding it): `None` nothing, `Some(None)` air,
     /// `Some(Some(m))` material `m`.
     pub fn cell(&mut self, face: u8, i: i32, j: i32, k: i32) -> Option<Option<u32>> {
+        let features = self.features;
         let mut out = None;
-        for s in 0..self.features.spawns.len() {
-            for p in self.placements_near(s, face, [i, i + 1], [j, j + 1]) {
+        for s in 0..features.spawns.len() {
+            self.each_placement_near(s, face, [i, i + 1], [j, j + 1], |p| {
                 if let Some(v) =
-                    self.features.stamps[p.stamp as usize].at(p.local([i - p.i, k - p.k, j - p.j]))
+                    features.stamps[p.stamp as usize].at(p.local([i - p.i, k - p.k, j - p.j]))
                 {
                     out = Some(v);
                 }
-            }
+            });
         }
         out
     }
@@ -1144,6 +1169,39 @@ mod tests {
             above > 100 && below > 100,
             "{above} grow past the limit, {below} bare short of it"
         );
+    }
+
+    /// A compiled stamp answers from its box first: every cell in it and
+    /// three cells around it is what its parts make of it, for boxes, rough
+    /// and sparse capsules, cones and the Earth preset's grown stamps.
+    #[test]
+    fn a_stamp_holds_nothing_outside_its_box() {
+        let mut shapes = Stamp::new();
+        shapes.capsule([0.0, 0.0, 0.0], [3.5, 9.0, -2.0], [1.5, 0.6], 10);
+        shapes.ball([1.0, 11.0, 0.5], 4.3, 11);
+        shapes.cone([-6.0, 2.0, 3.0], [-6.0, 7.0, 3.0], [3.0, 0.5], 12);
+        let mut all = stamps();
+        all.push(shapes);
+        all.extend(
+            crate::feature_recipe::FeatureRecipe::earth()
+                .grow(0.1, 7)
+                .stamps,
+        );
+        let mut held = 0;
+        for (n, stamp) in all.iter().enumerate() {
+            let compiled = CompiledStamp::new(stamp).unwrap();
+            let (lo, size) = (compiled.lo, compiled.size);
+            for y in lo[1] - 3..lo[1] + size[1] + 3 {
+                for z in lo[2] - 3..lo[2] + size[2] + 3 {
+                    for x in lo[0] - 3..lo[0] + size[0] + 3 {
+                        let parts = cell_of(&compiled.parts, [x, y, z]);
+                        assert_eq!(compiled.at([x, y, z]), parts, "stamp {n} at {x} {y} {z}");
+                        held += usize::from(parts.is_some());
+                    }
+                }
+            }
+        }
+        assert!(held > 1000, "the stamps hold {held} cells");
     }
 
     /// A tree (trunk and crown) and a hut (walls, its inside and a door
