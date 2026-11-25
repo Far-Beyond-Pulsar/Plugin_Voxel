@@ -9158,7 +9158,7 @@ impl ChunkWorld {
         // The host's scene materials, when a map is written and the table is
         // the length the pipeline was built for.
         let scene = self.scene.as_ref().zip(inputs).filter(|(s, i)| {
-            s.map_written.is_some() && i.texture_views.len() == s.capacity as usize
+            s.map_written.is_some() && i.texture_views.len() <= s.capacity as usize
         });
         let scene_group = scene.as_ref().map(|(s, i)| {
             let mut cached = s.group.lock().unwrap();
