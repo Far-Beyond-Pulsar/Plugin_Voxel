@@ -35,6 +35,8 @@
 
 #[path = "../common.rs"]
 mod common;
+#[path = "../gi_ab.rs"]
+mod gi_ab;
 
 mod app;
 mod blocks;

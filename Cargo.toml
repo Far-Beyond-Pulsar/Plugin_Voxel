@@ -49,10 +49,13 @@ required-features = ["editor"]
 [dev-dependencies]
 # The plugin's integration tests (`tests/`) and the harness: the plugin as a
 # game links it, with the kinds a voxel world composes (sky, haze, wind,
-# ground cover, sun, look) linked through their roots; their component
-# crates for the instances the tests compare.
+# ground cover, sun, look, indirect light) and the pipelines a level runs
+# (the editor's: the default pipelines plugin's) linked through their roots;
+# their component crates for the instances the tests compare.
+default_pipelines_plugin = { workspace = true }
 fog_plugin = { workspace = true }
 foliage_plugin = { workspace = true }
+gi_plugin = { workspace = true }
 lights_plugin = { workspace = true }
 post_plugin = { workspace = true }
 sky_plugin = { workspace = true }

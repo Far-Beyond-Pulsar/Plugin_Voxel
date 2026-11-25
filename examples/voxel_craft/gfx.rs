@@ -60,6 +60,26 @@ pub struct Gfx {
     /// `VOXEL_CRAFT_TIMINGS=<frames>`: GPU milliseconds a pass, summed over
     /// that many frames and logged as their mean.
     timings: Option<PassTimings>,
+    /// Screenshots on their way to disk.
+    shots: Shots,
+}
+
+/// Screenshots on their way to disk: each one's copy read back without
+/// waiting for the GPU, then written on a thread. A burst measures frames as
+/// they are played, pipelined: a frame that waited for its own read let
+/// every asynchronous part of it (the sun pages' requests, residency) finish
+/// first, which play never does.
+#[derive(Default)]
+struct Shots {
+    /// Copies being read: the buffer, its row pitch, the path, and whether
+    /// it is mapped.
+    pending: Vec<(
+        wgpu::Buffer,
+        u32,
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
+    writers: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Per-pass GPU time over a window of frames.
@@ -96,6 +116,7 @@ impl PassTimings {
         snapshot: &helio::RenderTimingSnapshot,
         voxel: &[helio_pass_voxel_planet::chunks::FrameTimings],
         stats: Option<helio_pass_voxel_planet::chunks::UpdateStats>,
+        frame_stats: &helio_core::FrameStats,
         size: [u32; 2],
     ) {
         if let Some(render) = profiling::collect_events()
@@ -197,6 +218,11 @@ impl PassTimings {
         }
         self.generation = [0.0; 7];
         self.generated = [0; 2];
+        // The frame statistics last read back (the radiance cache's cells in
+        // use, new, evicted, lit and settled, rays a stream).
+        for (name, value) in frame_stats.latest().iter() {
+            log::info!("[stats] {name} {value}");
+        }
         if let Some(s) = self.last_stats {
             let [generated, evicted, unseen, switches] = self.residency;
             log::info!(
@@ -458,14 +484,15 @@ impl Gfx {
             .edit::<helio_pass_foliage_place::FoliageSettings>()
             .range = Some(meadow.range);
         // Open ground: GI's finest probes a metre apart (its default is
-        // half a metre, for rooms); the pixels' sky rays follow, stopping
-        // where the probes resolve occlusion (`indirect_occlusion`).
+        // half a metre, for rooms); the pixels' sky rays stop where GI's
+        // indirect diffuse resolves occlusion (`indirect_occlusion`).
         let renderer_config =
             renderer_config
                 .with_feature(terrain)
-                .with_feature(helio_pass_gi::GiSettings {
+                .with_feature(crate::gi_ab::gi_settings(helio_pass_gi::GiSettings {
                     probe_spacing: Some(1.0),
-                });
+                    ..Default::default()
+                }));
         let handle = scene_db_handle(&scene);
         let builder = RendererBuilder::new(renderer_config.clone(), handle).with_graph(
             // The voxel world, the leaf kinds (particles, sprites, decals,
@@ -559,6 +586,7 @@ impl Gfx {
             configured: Some([surface_config.width, surface_config.height]),
             clock: 0.0,
             timings,
+            shots: Shots::default(),
         }
     }
 
@@ -786,7 +814,27 @@ impl Gfx {
             match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(texture)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
-                _ => return,
+                other => {
+                    let why = match other {
+                        wgpu::CurrentSurfaceTexture::Timeout => "timeout",
+                        wgpu::CurrentSurfaceTexture::Occluded => "occluded",
+                        wgpu::CurrentSurfaceTexture::Outdated => "outdated",
+                        wgpu::CurrentSurfaceTexture::Lost => "lost",
+                        _ => "validation",
+                    };
+                    log::error!(
+                        "screenshot {:?}: no surface texture ({why})",
+                        view.screenshot
+                    );
+                    // A surface out of date or lost is configured again
+                    // (wgpu's rule); the next frame draws to it.
+                    if why == "outdated" || why == "lost" {
+                        let size = self.size;
+                        self.configured = None;
+                        self.configure(size);
+                    }
+                    return;
+                }
             }
         } else {
             None
@@ -828,7 +876,13 @@ impl Gfx {
                 .renderer
                 .find_pass::<ChunkPass>()
                 .map(|pass| *pass.stats());
-            timings.add(self.renderer.timing_snapshot(), &voxel, stats, self.size);
+            timings.add(
+                self.renderer.timing_snapshot(),
+                &voxel,
+                stats,
+                self.renderer.frame_stats(),
+                self.size,
+            );
         }
         if let (Some(path), Some(output)) = (view.screenshot, output.as_ref()) {
             self.save_screenshot(&output.texture, path);
@@ -849,17 +903,12 @@ impl Gfx {
         if let Some(output) = output {
             self.queue.present(output);
         }
+        self.collect_screenshots(false);
     }
 
-    /// Writes the frame just drawn to `path` (PNG).
-    fn save_screenshot(&self, texture: &wgpu::Texture, path: &str) {
-        let [w, h] = self.size;
-        let pixels = self.read_pixels(texture);
-        let _ = image::save_buffer(path, &pixels, w, h, image::ColorType::Rgba8);
-    }
-
-    /// The frame just drawn as RGBA8 rows.
-    fn read_pixels(&self, texture: &wgpu::Texture) -> Vec<u8> {
+    /// Starts writing the frame just drawn to `path` (PNG): its copy is
+    /// read back without waiting (`collect_screenshots`).
+    fn save_screenshot(&mut self, texture: &wgpu::Texture, path: &str) {
         let [w, h] = self.size;
         let row = (w * 4).div_ceil(256) * 256;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -886,29 +935,68 @@ impl Gfx {
             },
         );
         self.queue.submit([encoder.finish()]);
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
-        let data = buffer.slice(..).get_mapped_range().unwrap();
+        let mapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = mapped.clone();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            r.unwrap();
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        self.shots
+            .pending
+            .push((buffer, row, path.to_owned(), mapped));
+    }
+
+    /// Writes the screenshots whose copies have been read (on a thread
+    /// each); `wait`: all of them, waiting for the GPU (the tour's end).
+    pub fn collect_screenshots(&mut self, wait: bool) {
+        if self.shots.pending.is_empty() && self.shots.writers.is_empty() {
+            return;
+        }
+        let poll = if wait {
+            wgpu::PollType::wait_indefinitely()
+        } else {
+            wgpu::PollType::Poll
+        };
+        if let Err(error) = self.device.poll(poll) {
+            log::error!("screenshots: {error:?}");
+        }
+        let [w, h] = self.size;
         let bgra = matches!(
             self.surface_format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         );
-        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-        for line in data.chunks(row as usize).take(h as usize) {
-            for p in line[..(w * 4) as usize].chunks(4) {
-                pixels.extend_from_slice(&if bgra {
-                    [p[2], p[1], p[0], 255]
-                } else {
-                    [p[0], p[1], p[2], 255]
-                });
+        let (read, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shots.pending)
+            .into_iter()
+            .partition(|shot| shot.3.load(std::sync::atomic::Ordering::Acquire));
+        self.shots.pending = pending;
+        for (buffer, row, path, _) in read {
+            let data = buffer.slice(..).get_mapped_range().unwrap();
+            let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+            for line in data.chunks(row as usize).take(h as usize) {
+                for p in line[..(w * 4) as usize].chunks(4) {
+                    pixels.extend_from_slice(&if bgra {
+                        [p[2], p[1], p[0], 255]
+                    } else {
+                        [p[0], p[1], p[2], 255]
+                    });
+                }
             }
+            drop(data);
+            self.shots.writers.push(std::thread::spawn(move || {
+                if let Err(error) =
+                    image::save_buffer(&path, &pixels, w, h, image::ColorType::Rgba8)
+                {
+                    log::error!("screenshot {path}: {error}");
+                }
+            }));
         }
-        drop(data);
-        pixels
+        if wait {
+            for writer in self.shots.writers.drain(..) {
+                let _ = writer.join();
+            }
+        } else {
+            self.shots.writers.retain(|writer| !writer.is_finished());
+        }
     }
 }
 

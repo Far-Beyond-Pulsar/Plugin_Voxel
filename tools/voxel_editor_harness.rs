@@ -1,10 +1,14 @@
 //! The editor's own viewport renderer, driven headless: what the Pulsar
 //! editor shows, captured and timed, for voxel terrain work.
 //!
-//! It loads a level file into a SceneDB scene and renders it with
-//! [`HelioRenderer`] exactly as the editor viewport does (same graph,
-//! settings, post-process, TSR mode, idle and settling rules, pointer
-//! queue), so a capture is what a user sees. A view is captured when the
+//! It opens the level's project as the editor does (its plugins, its
+//! `.pulsar/project/` settings, the folders the plugins serve), loads the
+//! level file into a SceneDB scene and renders it with [`HelioRenderer`]
+//! exactly as the editor viewport does (the pipeline the level names, as
+//! World Settings migrates it; settings, post-process, TSR mode, idle and
+//! settling rules, pointer queue), so a capture is what a user sees. It
+//! links the roots of the kinds a voxel world composes; a level using
+//! another kind (meshes, water) renders without it here. A view is captured when the
 //! renderer goes idle (`render_frame` returns `None`): residency and TSR
 //! have settled and the editor would hold that frame on screen.
 //!
@@ -57,9 +61,12 @@
 
 // The plugin as a game links it: its root, with every registration.
 use voxel_plugin as _;
-// The kinds a voxel world composes register through their roots.
+// The kinds a voxel world composes register through their roots, and the
+// pipelines a level runs (the editor's) through the default pipelines'.
+use default_pipelines_plugin as _;
 use fog_plugin as _;
 use foliage_plugin as _;
+use gi_plugin as _;
 use lights_plugin as _;
 use post_plugin as _;
 use sky_plugin as _;
@@ -476,6 +483,20 @@ fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+    // The level's project opened as the editor opens it: its plugins, its
+    // settings (`.pulsar/project/`) and its folders (the pipelines the
+    // plugins serve). A level outside a project runs with the defaults.
+    engine_state::EngineContext::new().set_global();
+    let project = std::path::absolute(&level).ok().and_then(|level| {
+        level
+            .ancestors()
+            .find(|dir| dir.join(pulsar_plugins::PROJECT_FILE).is_file())
+            .map(Path::to_path_buf)
+    });
+    println!("HARNESS project: {project:?}");
+    if let Some(project) = &project {
+        engine_state::set_project_path(project.display().to_string());
+    }
     let (device, queue) = device();
     let scene: engine_backend::scene::SharedScene =
         std::sync::Arc::new(parking_lot::RwLock::new(engine_backend::scene::new_scene()));
@@ -568,6 +589,16 @@ fn main() {
         camera = setup.camera.or(camera);
     }
     let mut renderer = HelioRenderer::new(scene.clone());
+    // The pipeline the level names, migrated, as the editor's World Settings
+    // reads it (a level that names none runs the old default, the default
+    // pipelines plugin's deferred graph).
+    let pipeline = std::fs::read_to_string(&level).ok().and_then(|json| {
+        engine_backend::subsystems::render::helio_renderer::pipelines::render_pipeline_of_level(
+            &json,
+        )
+    });
+    println!("HARNESS pipeline: {pipeline:?}");
+    renderer.editor_mailbox().set_render_pipeline(pipeline);
     if let Some(camera) = camera {
         renderer.set_editor_camera_state(EditorCameraState {
             position: camera.position,

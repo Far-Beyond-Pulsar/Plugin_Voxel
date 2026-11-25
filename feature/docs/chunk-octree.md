@@ -600,7 +600,14 @@ once. A plan that changes a switch under way ends it at once.
    surface (view depth within its slope, normal within 37 degrees),
    bilinear where some are not, none past a disocclusion. A pixel's own
    sample (its walk, once a sample block's cycle) weighs 1, a neighbour's
-   lent one 0.05, so the history keeps to the pixel's own shadow. A long
+   lent one 0.05, so the history keeps to the pixel's own shadow. Past a
+   disocclusion (a turned view, a moved camera) the sun's history begins
+   from the mean of this frame's samples in the 9x9 pixels around, worth a
+   cycle of the pixel's own samples (ReBLUR's history fix, SVGF's spatial
+   estimate for short histories), not from its one sample: most often a
+   neighbour's lent one, which with nothing accumulated showed at full
+   weight until the pixel's own samples came (a lit leaf's sample lent into
+   a canopy's shade: speckles for a few frames after every camera move). A long
    history (32 frames for the sun, 64 for the sky, 16 for a light) and a
    short one (a cycle: 4, 8, 4) are kept; the sun's and the lights' are
    clamped to the range of this frame's samples in the 9x9 pixels around,
@@ -741,8 +748,23 @@ offers that to its graph (`stream::offer`).
   face back along the ray: no walk), and so is one that starts on a solid
   cell's face, within `ON_FACE` (1/1024) of a cell of it, whichever way it
   goes (`on_solid_face`: far past the frames' rounding, so the answer never
-  depends on it; as GI's probes on a mesh's surface count as inside).
-  Consumers start rays off the surfaces they leave.
+  depends on it; as GI's probes on a mesh's surface count as inside). At
+  every level: below the exact levels in the start chunk's frame; at them,
+  where a start is not placed in a chunk (`point_start`: the walk places
+  itself), in the drawn chunk at the point (`place_at`, as the walk finds
+  it) and the grid's own cells (`cell_point`, `exact_cell`), where the
+  frames only approximate the sphere.
+  Consumers start rays off the surfaces they leave. A cell that lets light
+  through (`lets_light_through`: its material's transmission, as
+  `voxel_surface` shades it, a thin two-sided surface) is the exception: a
+  ray from its face (the consumer lighting its back through it, a bounce
+  through it) starts where it leaves the cell (`cell_exit`, a hundredth of
+  a cell past its far face: by the frame below the exact levels, by the
+  grid's cell sides at them, `box_exit`; `THROUGH` in the start's row,
+  placed again there with `enter_volume`), and an occlusion
+  ray's pages answer from there too. A leaf's back thus takes what reaches
+  its far side, for rays as for the pixels' sun (`shadow`) and the local
+  lights' walks (`hit_walk`'s `through`); cells past it block as any.
 - **Runs from one origin** (`Stream::run`: a stream whose rays share an
   origin, r2's camera rays first; GI's probe rays are not runs, each starts
   behind its probe along its own direction). Where a ray starts depends on its direction only when its origin
@@ -763,11 +785,13 @@ offers that to its graph (`stream::offer`).
   (`Stream::detail`; the kernel is picked when the graph builds). Both find
   the face again the same way (`stream_face`): the face's normal toward
   where the ray came from (a ray from inside: back along it), the normal it
-  is lit with by `hit_face`'s rule without the screen (`face_rule`,
-  `face_lit`: natural steps by their stored slope, smooth worlds by
-  `smooth_normal`, cells under the ray's footprint, its width at the origin
-  plus its spread times the distance (`scene_ray_footprint`), by the
-  slope), the cell's material (`shown_material`).
+  is lit with by `hit_face`'s rule (`face_rule`, `face_lit`: natural steps
+  by their stored slope, smooth worlds by `smooth_normal`, cells under the
+  ray's footprint, its width at the origin plus its spread times the
+  distance (`scene_ray_footprint`), by the slope: the leaf's stored one,
+  else the column tops' around, as a pixel's hit is lit: one description of
+  a hit's slope for the screen and the rays), the cell's material
+  (`shown_material`).
   - `Full` (`ray_surface_full`): `voxel_surface`, the one shading of a
     face, which the publish calls too (below), at the ray's footprint; the
     material boundaries' jitter keyed by the ray's row as a pixel's by the
@@ -833,7 +857,8 @@ offers that to its graph (`stream::offer`).
     VoxelRays gi_shadow 0.20-0.23 ms against 0.41-0.42 walked (r1).
 - **Answered short** (`stream::Answers`): while the frame holds volumes
   and the cut cannot answer for them (none of their chunks drawn yet since
-  they came, or a form's ray kernels still compiling: `RayLink::complete`;
+  they came, or the kernels that stream needs still compiling:
+  `RayLink::complete`;
   a later view that draws none, looking away, is no shortfall), the
   trace pass marks the stream short, so a consumer that keeps history
   (GI's probes) holds instead of learning a world without the terrain.
@@ -842,6 +867,15 @@ offers that to its graph (`stream::offer`).
   frames while its ray kernels compile (`needs_frame`): a host that draws
   on demand would otherwise go idle with the residency settled and the
   streams still short, and nothing would wake it when the kernels arrive.
+- **Kernels compiled in the order the streams need them** (`RayKernel`,
+  `RayKernels::of`). Each ray kernel compiles as a job of its own
+  (`helio_core::compile`), only if a scheduled stream needs it: the trace
+  kernels (a nearest stream's entry and walk, a stream in runs' run
+  entry, an occlusion stream's walk) and the `Diffuse` surfaces first,
+  together, then the `Full` surfaces, the longest, which only a stream
+  asking `Full` waits for. A stream answers once its own kernels are ready
+  for every volume, and traces nothing before (its hits would get no
+  surface).
 - **Foliage's ground batches** are answered only when the probes ran
   (`ChunkWorld::probe_ground` says): while the pipelines compile or before
   the primary volume's cut is drawn the batch stays unanswered and
@@ -870,9 +904,10 @@ offers that to its graph (`stream::offer`).
   to 0.15 at their footprint. (2026-11-17, with the probe rays in runs from
   their probe: nearest 1.32, entry 0.17; the old in-draw `gi_trace` on the
   same rays 1.12; in one kernel the nearest pass took 1.39 ms.)
-- **Kernels** compile off the frame per form once a stream is traced
-  (`ChunkWorld::want_rays`: the link asks for them), like the cross-volume
-  passes; drawing never waits for them.
+- **Kernels** compile off the frame per form, each once a scheduled stream
+  needs it (`ChunkWorld::want_rays` with the link's `RayKernels`; their
+  order above), like the cross-volume passes; drawing never waits for
+  them.
 
 ## Costs
 

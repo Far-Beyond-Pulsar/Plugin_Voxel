@@ -5455,7 +5455,9 @@ use helio_frame_api::rays::stream::{
 /// A world drawn for ray streams: its ray kernels compiled.
 fn ray_world(gpu: &Gpu, planet: &Planet) -> World {
     let mut world = World::new(gpu, planet);
-    world.chunks.want_rays();
+    world
+        .chunks
+        .want_rays(helio_pass_voxel_planet::chunks::rays::RayKernels::ALL);
     world
         .chunks
         .wait_for_pipelines()
@@ -5780,15 +5782,27 @@ fn terrain_traces_stream_rays() {
         "{inside} rays from over a face start in rock"
     );
     // From exactly on those faces (no offset: the consumer's to give), out
-    // and in: in the cell at once, whichever way they go.
-    let on_face: Vec<SceneRay> = near_hits
+    // and in: in the cell at once, whichever way they go; but a cell that
+    // lets light through (the ball's, a thin two-sided surface) is passed,
+    // the ray starting where it leaves it: in, it meets the ball's next cell
+    // about a cell on; out, what the world shows past the face.
+    let faces: Vec<(DVec3, DVec3, bool)> = near_hits
         .iter()
         .step_by(4)
-        .flat_map(|&(o, d, cpu)| {
-            let at = o + d * cpu.distance;
+        .map(|&(o, d, cpu)| {
+            (
+                o + d * cpu.distance,
+                cpu.normal,
+                planet.material(cpu.cell) == material::BRICK,
+            )
+        })
+        .collect();
+    let on_face: Vec<SceneRay> = faces
+        .iter()
+        .flat_map(|&(at, n, _)| {
             [
-                common::scene_ray(frame, at, cpu.normal, 1e30, 0.0),
-                common::scene_ray(frame, at, -cpu.normal, 1e30, 0.0),
+                common::scene_ray(frame, at, n, 1e30, 0.0),
+                common::scene_ray(frame, at, -n, 1e30, 0.0),
             ]
         })
         .collect();
@@ -5801,18 +5815,52 @@ fn terrain_traces_stream_rays() {
         None,
         0,
     );
-    let not_inside = hits
-        .iter()
-        .filter(|h| !terrain_hit(h).is_some_and(|(t, inside)| inside && t < 1e-5))
-        .count();
+    let (mut opaque, mut not_inside, mut through, mut through_wrong) = (0, 0, 0, 0);
+    for (k, &(at, n, passes)) in faces.iter().enumerate() {
+        for (j, dir) in [n, -n].into_iter().enumerate() {
+            let got = terrain_hit(&hits[2 * k + j]);
+            if !passes {
+                opaque += 1;
+                not_inside += usize::from(!got.is_some_and(|(t, inside)| inside && t < 1e-5));
+                continue;
+            }
+            through += 1;
+            // Past the cell: in, through its far side (a cell on); out, off
+            // the face itself.
+            let past = if j == 1 { voxel } else { 0.0 };
+            let start = at + dir * (past + 0.02 * voxel);
+            // A solid cell past it is met where the ray leaves the first.
+            let cpu = if planet.solid(planet.grid().locate(start).0) {
+                Some(past)
+            } else {
+                planet
+                    .raycast(start, dir, 60.0)
+                    .map(|c| past + 0.02 * voxel + c.distance)
+            };
+            let ok = match (got, cpu) {
+                (Some((t, inside)), Some(want)) => !inside && (t - want).abs() <= 0.1 * voxel,
+                // Nothing within the CPU's 60 m: none, or a hit past them.
+                (got, None) => got.is_none_or(|(t, inside)| !inside && t > 60.0),
+                _ => false,
+            };
+            if !ok {
+                through_wrong += 1;
+                if through_wrong < 8 {
+                    eprintln!("through ray {k}.{j}: traced {got:?}, cpu {cpu:?}");
+                }
+            }
+        }
+    }
     eprintln!(
-        "rays from on faces: {} rays, {not_inside} not inside",
-        on_face.len()
+        "rays from on faces: {opaque} on opaque cells, {not_inside} not inside; {through} on cells that let light through, {through_wrong} wrong"
     );
     assert!(
-        not_inside * 100 <= on_face.len(),
-        "{not_inside} of {} on faces",
-        on_face.len()
+        not_inside * 100 <= opaque,
+        "{not_inside} of {opaque} on faces"
+    );
+    assert!(
+        through > 20 && through_wrong * 100 <= through,
+        "{through_wrong} of {through} through cells that let light through"
     );
     assert!(
         compared > 200 && wrong * 50 <= compared,
@@ -6010,6 +6058,157 @@ fn terrain_traces_stream_rays() {
     );
     assert!(n > 400 && kept_wrong * 100 <= n, "{kept_wrong} of {n}");
     assert_eq!(past_touched, 0);
+}
+
+/// A cell that lets light through is passed by a ray that starts in it at
+/// the exact levels too, where the tracer walks the grid's own cells (a
+/// smooth 3 km world: exact from level 2, 0.4 m cells, about the eye). From just
+/// inside the top cells the tracer drew there, rays go up and down: on
+/// opaque ground they are in their cell at once; when every material lets
+/// light through, up they leave the cell for the sky (as the CPU finds it
+/// from there: nothing), down they meet the cell under it, about a cell on.
+#[test]
+fn rays_pass_coarse_cells_that_let_light_through() {
+    let Some(gpu) = gpu() else { return };
+    let recipe = PlanetRecipe {
+        radius_m: 3_000.0,
+        // Smooth: a 3 km world's Earth heights are mountains its size.
+        terrain: TerrainLayers::flat().source(7),
+        ..Default::default()
+    };
+    let planet = Planet::new(recipe).unwrap();
+    let exact = helio_pass_voxel_planet::chunks::exact_level(planet.grid());
+    let ground = planet.surface_point(DVec3::new(0.3, 0.9, 0.2).normalize(), 0.0);
+    let up = planet.grid().up(ground);
+    let side = up.any_orthonormal_vector();
+    let eye = ground + up * 6.0;
+    // Looking down: a small view to resolve, the spots about it drawn at
+    // the coarse levels (out of view).
+    let view = View::new(eye, (side * 0.2 - up).normalize().as_vec3(), [256, 144]);
+    let mut world = ray_world(gpu, &planet);
+    world.settle(gpu, &planet, &view);
+    let frame = eye + DVec3::new(0.75, -0.5, 0.25);
+    let voxel = planet.grid().voxel_size();
+
+    // The drawn top cells about the eye: a probe ray down onto each spot.
+    // Rings 20 to 320 m out: the farther, the coarser the drawn cells.
+    let mut spots = Vec::new();
+    for ring in 0..5 {
+        let r = 20.0 * f64::from(1u32 << ring);
+        for k in 0..48 {
+            let (s, c) = (f64::from(k) * std::f64::consts::TAU / 48.0).sin_cos();
+            let over = planet.surface_point(ground + (side * c + up.cross(side) * s) * r, 0.0);
+            spots.push(over + planet.grid().up(over) * 8.0);
+        }
+    }
+    let probes: Vec<SceneRay> = spots
+        .iter()
+        .map(|&o| common::scene_ray(frame, o, -planet.grid().up(o), 1e30, 0.0))
+        .collect();
+    let (hits, _) = common::trace_stream(
+        gpu,
+        &world.chunks,
+        RayClass::Nearest,
+        frame,
+        &probes,
+        None,
+        0,
+    );
+    // A hundredth of the drawn cell into it: (origin, its up, cell size).
+    let mut starts = Vec::new();
+    let mut levels = [0usize; 16];
+    for (k, &o) in spots.iter().enumerate() {
+        let Some((t, inside)) = terrain_hit(&hits[k]) else {
+            continue;
+        };
+        let level = world
+            .chunks
+            .chunk_at(hits[k].b)
+            .map_or(0, |(key, _)| key.level);
+        levels[(level as usize).min(15)] += 1;
+        if inside || level < exact {
+            continue;
+        }
+        let cell = voxel * f64::from(1u32 << level);
+        let down = -planet.grid().up(o);
+        starts.push((o + down * (t + 0.01 * cell), -down, cell));
+    }
+    eprintln!(
+        "{} starts at the exact levels (from level {exact}); spots by drawn level {levels:?}",
+        starts.len()
+    );
+    assert!(
+        starts.len() > 50,
+        "{} starts at the exact levels",
+        starts.len()
+    );
+    let rays: Vec<SceneRay> = starts
+        .iter()
+        .flat_map(|&(o, u, _)| {
+            [
+                common::scene_ray(frame, o, u, 1e30, 0.0),
+                common::scene_ray(frame, o, -u, 1e30, 0.0),
+            ]
+        })
+        .collect();
+
+    // Opaque ground: in the cell at once, whichever way.
+    let (hits, _) =
+        common::trace_stream(gpu, &world.chunks, RayClass::Nearest, frame, &rays, None, 0);
+    let not_inside = hits
+        .iter()
+        .filter(|h| !terrain_hit(h).is_some_and(|(t, inside)| inside && t < 1e-5))
+        .count();
+    eprintln!("opaque: {not_inside} of {} not inside", rays.len());
+    assert!(
+        not_inside * 100 <= rays.len(),
+        "{not_inside} of {} not inside",
+        rays.len()
+    );
+
+    // Every material lets light through: past the cell.
+    let mut appearance = planet.field().appearance();
+    for m in appearance.materials.iter_mut() {
+        m.transmission = 0.5;
+    }
+    world.chunks.set_appearance(VolumeId(0), &appearance);
+    world.settle(gpu, &planet, &view);
+    let (hits, _) =
+        common::trace_stream(gpu, &world.chunks, RayClass::Nearest, frame, &rays, None, 0);
+    let (mut up_wrong, mut down_wrong) = (0, 0);
+    for (k, &(o, u, cell)) in starts.iter().enumerate() {
+        // Up: the sky past the cell, where the CPU finds nothing either.
+        let cpu = planet.raycast(o + u * (2.0 * cell), u, 200.0);
+        let up_hit = terrain_hit(&hits[2 * k]);
+        if cpu.is_none() && up_hit.is_some() {
+            up_wrong += 1;
+            if up_wrong < 8 {
+                eprintln!("up {k}: traced {up_hit:?} from a cell {cell} m");
+            }
+        }
+        // Down: the cell under it, past this one.
+        let down = terrain_hit(&hits[2 * k + 1]);
+        if !down.is_some_and(|(t, inside)| !inside && t > 0.005 * cell && t < 3.0 * cell) {
+            down_wrong += 1;
+            if down_wrong < 8 {
+                eprintln!("down {k}: traced {down:?} from a cell {cell} m");
+            }
+        }
+    }
+    eprintln!(
+        "letting light through: {} starts, up {up_wrong} wrong, down {down_wrong} wrong",
+        starts.len()
+    );
+    assert!(
+        up_wrong * 100 <= starts.len(),
+        "{up_wrong} of {} up",
+        starts.len()
+    );
+    assert!(
+        down_wrong * 100 <= starts.len(),
+        "{down_wrong} of {} down",
+        starts.len()
+    );
 }
 
 /// Occlusion streams agree with CPU casts: from hits near the eye (a

@@ -267,10 +267,14 @@ impl Game {
             }
         }
         let settled = self.gfx.settled() && self.world.loaded();
+        let sun = self.sun();
         let shot = self.tour.as_mut().and_then(|t| {
             t.world_ms = world_ms;
+            t.sun = sun;
             t.step(&mut self.player, &mut self.world, settled, &mut self.quit)
         });
+        // A moving pose's sun, a frame of play at a time.
+        self.time += self.tour.as_ref().map_or(0.0, |t| t.sun_step);
         let (eye, look) = self.player.camera(&self.world);
         #[cfg(not(target_arch = "wasm32"))]
         let (eye, look) = vr.as_ref().map_or((eye, look), |vr| {
@@ -279,7 +283,13 @@ impl Game {
                 vr.head.transform_vector3(DVec3::NEG_Z).normalize(),
             )
         });
-        let outline = self.interaction.outline(&self.world);
+        // A tour's shots show the world, not the block in the player's reach
+        // (its outline moves with a moving pose's camera).
+        let outline = if self.tour.is_some() {
+            Vec::new()
+        } else {
+            self.interaction.outline(&self.world)
+        };
         let view = View {
             #[cfg(not(target_arch = "wasm32"))]
             vr: vr.as_ref(),
@@ -389,7 +399,18 @@ struct Tour {
     /// frame's world milliseconds they log.
     strokes: Option<crate::strokes::Strokes>,
     world_ms: f64,
+    /// Game seconds the sun moves by this frame (a moving pose's burst).
+    sun_step: f64,
+    /// The player's heading when the tour started (`At::Spawn`).
+    heading: DVec3,
+    /// The direction to the sun this frame.
+    pub sun: DVec3,
+    /// Frames of the pose's swing turned so far.
+    swung: u32,
 }
+
+/// Frames a pose's swing takes, just before its burst.
+const SWING_FRAMES: u32 = 30;
 
 /// `VOXEL_CRAFT_FLIGHT=<frames>` with `VOXEL_CRAFT_SHOTS`: a sideways flight
 /// past glowstone, for ghosting (history that trails behind what moves on
@@ -414,18 +435,103 @@ struct Flight {
 /// Flight frames between still references.
 const FLIGHT_STILL_EVERY: u32 = 8;
 
-/// (turn about up in degrees, pitch, third person, metres above the start).
-const POSES: &[(f64, f64, bool, f64)] = &[
-    (0.0, -0.08, false, 0.0),
-    (90.0, 0.0, false, 0.0),
-    (90.0, 0.55, false, 0.0),
-    (90.0, -0.75, false, 0.0),
-    (0.0, -0.2, true, 0.0),
-    (90.0, -0.35, true, 0.0),
-    (0.0, -0.55, false, 45.0),
-    (180.0, 0.05, false, 0.0),
+/// A pose of the tour: turned about up (degrees) from the last one, its
+/// pitch, third person or not, metres above the last one; where it stands
+/// (`At`), facing the sun or not (towards its azimuth: backlit leaves); and
+/// what moves while its burst is shot (and how far the camera swings in
+/// the frames just before it, a look around that ends as the burst starts): the camera walking ahead
+/// (m/s) and turning (radians/s), the sun at play speed. A moving burst
+/// steps by 1/60 s a frame whatever the frame took, so every build shoots
+/// the same frames.
+struct Pose {
+    turn: f64,
+    pitch: f64,
+    third: bool,
+    lift: f64,
+    at: At,
+    into_sun: bool,
+    walk: f64,
+    turning: f64,
+    swing: f64,
+    sun: bool,
+}
+
+/// Where a pose stands: where the last one left the player; at the spawn
+/// (on its ground, facing as the tour started); or by the spawn's nearest
+/// tree trunk, two metres from it facing it (under its canopy).
+#[derive(Clone, Copy, PartialEq)]
+enum At {
+    Last,
+    Spawn,
+    UnderTree,
+}
+
+const fn still(turn: f64, pitch: f64, third: bool, lift: f64) -> Pose {
+    Pose {
+        turn,
+        pitch,
+        third,
+        lift,
+        at: At::Last,
+        into_sun: false,
+        walk: 0.0,
+        turning: 0.0,
+        swing: 0.0,
+        sun: false,
+    }
+}
+
+const POSES: &[Pose] = &[
+    still(0.0, -0.08, false, 0.0),
+    still(90.0, 0.0, false, 0.0),
+    still(90.0, 0.55, false, 0.0),
+    still(90.0, -0.75, false, 0.0),
+    still(0.0, -0.2, true, 0.0),
+    still(90.0, -0.35, true, 0.0),
+    still(0.0, -0.55, false, 45.0),
+    still(180.0, 0.05, false, 0.0),
     // 450 m up, looking out: forests to the horizon (their far canopies).
-    (30.0, -0.22, false, 400.0),
+    still(30.0, -0.22, false, 400.0),
+    // Under a tree, looking up into its shaded canopy: still, then walking
+    // slowly with the sun turning.
+    Pose {
+        at: At::UnderTree,
+        ..still(0.0, 1.05, false, 0.0)
+    },
+    Pose {
+        at: At::UnderTree,
+        walk: 0.5,
+        sun: true,
+        ..still(0.0, 1.05, false, 0.0)
+    },
+    // The forest's crowns from the meadow at the spawn, as a player stands
+    // looking at them while the day goes on, towards the sun (the leaves lit
+    // from behind, through themselves): the camera still, the sun turning at
+    // play speed; leaf cells from a few pixels wide to under one.
+    Pose {
+        at: At::Spawn,
+        into_sun: true,
+        sun: true,
+        ..still(0.0, 0.08, false, 0.0)
+    },
+    // The crowns again just after a look around: the camera swings a
+    // radian over the 30 frames before the burst and stops (young
+    // histories, pages of the new view still coming), the sun turning.
+    Pose {
+        at: At::Spawn,
+        swing: 1.0,
+        sun: true,
+        ..still(0.0, 0.08, false, 0.0)
+    },
+    // The same with a hand on the mouse turning the camera slowly (a third
+    // of a pixel a frame at 1080p).
+    Pose {
+        at: At::Spawn,
+        into_sun: true,
+        turning: 0.02,
+        sun: true,
+        ..still(0.0, 0.08, false, 0.0)
+    },
 ];
 
 impl Tour {
@@ -453,7 +559,12 @@ impl Tour {
             });
         Self {
             dir,
-            pose: 0,
+            // `VOXEL_CRAFT_FROM=<pose>`: the tour starts there.
+            pose: std::env::var("VOXEL_CRAFT_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0usize)
+                .min(POSES.len() - 1),
             waited: u32::MAX,
             settled_for: 0,
             trunk: std::env::var_os("VOXEL_CRAFT_TRUNK").is_some(),
@@ -462,6 +573,10 @@ impl Tour {
             flight,
             strokes: crate::strokes::Strokes::from_env(),
             world_ms: 0.0,
+            sun_step: 0.0,
+            heading: DVec3::ZERO,
+            sun: DVec3::ZERO,
+            swung: 0,
         }
     }
 
@@ -565,8 +680,12 @@ impl Tour {
             strokes.step(player, world, settled, self.world_ms, quit);
             return None;
         }
+        self.sun_step = 0.0;
+        if self.heading == DVec3::ZERO {
+            self.heading = player.heading;
+        }
         if self.waited == u32::MAX {
-            self.set_pose(player);
+            self.set_pose(player, world);
         }
         self.waited += 1;
         self.settled_for = if settled { self.settled_for + 1 } else { 0 };
@@ -581,9 +700,26 @@ impl Tour {
                 .unwrap_or(default)
         };
         let minimum = frames("VOXEL_CRAFT_WAIT", 120);
-        let ready = self.settled_for >= minimum
+        // A burst, once started, shoots every frame (a moving pose's camera
+        // unsettles the view it shoots).
+        let ready = self.shots > 0
+            || self.settled_for >= minimum
             || self.waited >= minimum.max(frames("VOXEL_CRAFT_WAIT_MAX", 900));
         if !ready {
+            return None;
+        }
+        // A swing before the burst: the camera turns towards the pose's
+        // heading over SWING_FRAMES frames, and the burst starts as it stops.
+        let pose = &POSES[self.pose];
+        if pose.swing != 0.0 && self.shots == 0 && self.swung < SWING_FRAMES {
+            if self.swung == 0 {
+                player.turn(-pose.swing);
+            }
+            player.turn(pose.swing / f64::from(SWING_FRAMES));
+            self.swung += 1;
+            if pose.sun {
+                self.sun_step = 1.0 / 60.0;
+            }
             return None;
         }
         let path = if self.burst == 1 {
@@ -597,6 +733,16 @@ impl Tour {
             self.waited,
             self.settled_for
         );
+        // The pose's motion from this shot to the next: a frame of 1/60 s.
+        if pose.walk != 0.0 {
+            player.position += player.heading * (pose.walk / 60.0);
+        }
+        if pose.turning != 0.0 {
+            player.turn(pose.turning / 60.0);
+        }
+        if pose.sun {
+            self.sun_step = 1.0 / 60.0;
+        }
         self.shots += 1;
         if self.shots < self.burst {
             return Some(path);
@@ -617,20 +763,52 @@ impl Tour {
         Some(path)
     }
 
-    fn set_pose(&mut self, player: &mut Player) {
-        let (turn, pitch, third, lift) = POSES[self.pose];
+    fn set_pose(&mut self, player: &mut Player, world: &World) {
+        let pose = &POSES[self.pose];
+        if pose.at == At::Spawn {
+            player.position = player.spawn;
+            player.heading = self.heading;
+        }
+        if pose.at == At::UnderTree {
+            let spawn = player.spawn;
+            match nearest_wood(
+                world,
+                world.cell_at(spawn),
+                (15.0 / crate::config::VOXEL_M) as i32,
+            ) {
+                Some((cell, _)) => {
+                    let trunk = world.cell_centre(cell);
+                    let up = trunk.normalize();
+                    let away = spawn - trunk;
+                    let side = (away - up * away.dot(up))
+                        .try_normalize()
+                        .unwrap_or_else(|| up.any_orthonormal_vector());
+                    player.position = trunk + side * 2.0 - up * (0.5 * crate::config::VOXEL_M);
+                    player.heading = -side;
+                }
+                None => log::info!("pose {}: no tree near the spawn", self.pose),
+            }
+        }
+        if pose.into_sun {
+            let up = player.position.normalize();
+            if let Some(toward) = (self.sun - up * self.sun.dot(up)).try_normalize() {
+                player.heading = toward;
+            }
+        }
         let frame = player.frame();
-        let (s, c) = turn.to_radians().sin_cos();
+        let (s, c) = pose.turn.to_radians().sin_cos();
         player.heading = frame.forward * c + frame.right * s;
-        player.pitch = pitch;
-        player.third_person = third;
-        player.flying = lift > 0.0;
-        if lift > 0.0 && self.pose > 0 {
-            player.position += frame.up * lift;
+        player.pitch = pose.pitch;
+        player.third_person = pose.third;
+        // Off the ground, or held where it is put.
+        player.flying = pose.lift > 0.0 || pose.at != At::Last;
+        if pose.lift > 0.0 && self.pose > 0 {
+            player.position += frame.up * pose.lift;
         }
         player.velocity = DVec3::ZERO;
         self.waited = 0;
         self.settled_for = 0;
+        self.swung = 0;
     }
 }
 

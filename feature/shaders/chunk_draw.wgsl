@@ -2464,33 +2464,6 @@ fn smooth_normal(slot: u32, key: vec4<i32>, cell: vec3<i32>, local: vec3<f32>, c
     return n * inverseSqrt(l);
 }
 
-// The ground's normal at pixel `q` (hit at distance `t`) from the hits two
-// pixels each way: on each axis the side nearer in distance (not across a
-// silhouette), facing the eye; zero where an axis has no hit near. Over
-// cells of a pixel or less it spans more than a cell: the slope, not the
-// steps.
-fn screen_ground(q: vec2<u32>, size: vec2<u32>, t: f32) -> vec3<f32> {
-    let p = pixel_ray(q, size) * t;
-    var d = array<vec3<f32>, 2>(vec3<f32>(0.0), vec3<f32>(0.0));
-    for (var axis = 0u; axis < 2u; axis++) {
-        var best = 1e30;
-        for (var side = -1; side <= 1; side += 2) {
-            var at = vec2<i32>(q);
-            at[axis] += 2 * side;
-            if any(at < vec2<i32>(0)) || any(at >= vec2<i32>(size)) { continue; }
-            let tn = textureLoad(hit_distance, at, 0).r;
-            if tn <= 0.0 || abs(tn - t) >= best { continue; }
-            best = abs(tn - t);
-            d[axis] = (pixel_ray(vec2<u32>(at), size) * tn - p) * f32(side);
-        }
-        if best > 0.25 * t { return vec3<f32>(0.0); }
-    }
-    let n = cross(d[0], d[1]);
-    let l = dot(n, n);
-    if !(l > 1e-20) { return vec3<f32>(0.0); }
-    return n * inverseSqrt(l) * select(1.0, -1.0, dot(n, p) > 0.0);
-}
-
 // Hit `v` (pixels `pixel_m` wide there). Voxels a few pixels wide are lit
 // by their own faces (a slope reads as its steps, each shadowing the next);
 // a natural step (air above it, its leaf storing the heightfield's slope) is
@@ -2502,16 +2475,15 @@ fn screen_ground(q: vec2<u32>, size: vec2<u32>, t: f32) -> vec3<f32> {
 // steps (each a cell tall, their shadows long under a low sun) never show
 // as stripes. A cell larger than its cut wants (`under_refined`) is lit by
 // the slope's normal too. The slope's normal is `ground` when given (a
-// nearby sample's), else measured here.
+// nearby sample's), else the world's (`face_rule`, `face_lit`: the leaf's
+// stored slope, then the column tops), the one a ray's hit takes: the
+// screen and the rays light a hit by one description of its slope.
 fn hit_face(v: vec2<u32>, ground_hint: vec3<f32>, q: vec2<u32>, size: vec2<u32>, t: f32) -> Face {
     let pixel_m = pixel_width(q, size, t);
     let cell = vec3<i32>(vec3<u32>(v.y, v.y >> 6u, v.y >> 12u) & vec3<u32>(63u));
     let rule = face_rule(v.x, cell, (v.y >> 18u) & 3u, (v.y >> 20u) & 1u, pixel_ray(q, size) * t, pixel_m, ground_hint);
     if rule.done { return rule.f; }
-    var ground = rule.ground;
-    // Cells of a pixel or less: the slope the hits around make (a few loads).
-    if dot(ground, ground) == 0.0 && length(rule.c.m0.xyz) <= 1.5 * pixel_m { ground = screen_ground(q, size, t); }
-    return face_lit(rule, v.x, cell, ground);
+    return face_lit(rule, v.x, cell, rule.ground);
 }
 
 // What lights hit face `axis` (`sign` 1 its positive side) of cell `cell`
@@ -3944,11 +3916,13 @@ fn history_at(r: Reprojection, n: vec3<f32>, size: vec2<u32>) -> History {
 const GROUP: i32 = 16;
 
 // The clamp's tile: this frame's walked sun about the workgroup (-1: no
-// terrain hit), then each tile row's range over the window's width.
+// terrain hit), then each tile row's range, sum and count over the
+// window's width.
 const CLAMP_TILE: i32 = GROUP + 2 * CLAMP_RADIUS;
 var<workgroup> w_sun: array<f32, 576>;
 var<workgroup> w_lo: array<f32, 384>;
 var<workgroup> w_hi: array<f32, 384>;
+var<workgroup> w_sum: array<vec2<f32>, 384>;
 
 // The sun's and the sky's history (`history_prev`, `history_short_prev`
 // along the hits' motion, the sun's clamped to the range of this frame's
@@ -3978,15 +3952,18 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
         let column = i32(i) % GROUP;
         var lo = 1.0;
         var hi = 0.0;
+        var sum = vec2<f32>(0.0);
         for (var k = 0; k <= 2 * CLAMP_RADIUS; k++) {
             let v = w_sun[row * CLAMP_TILE + column + k];
             if v >= 0.0 {
                 lo = min(lo, v);
                 hi = max(hi, v);
+                sum += vec2<f32>(v, 1.0);
             }
         }
         w_lo[i] = lo;
         w_hi[i] = hi;
+        w_sum[i] = sum;
     }
     workgroupBarrier();
     if id.x >= size.x || id.y >= size.y { return; }
@@ -4006,11 +3983,15 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
     let sky = textureLoad(hit_normals, p, 0).w;
     var lo = sun;
     var hi = sun;
+    var sum = vec2<f32>(0.0);
     for (var k = 0; k <= 2 * CLAMP_RADIUS; k++) {
         let i = (i32(local.y) + k) * GROUP + i32(local.x);
         lo = min(lo, w_lo[i]);
         hi = max(hi, w_hi[i]);
+        sum += w_sum[i];
     }
+    // This frame's samples around, their mean (the pixel's own among them).
+    let around = sum.x / max(sum.y, 1.0);
     // The histories along the motion (none: this frame's samples).
     // Along the hit's volume's motion (`previous_projection`).
     let slot = textureLoad(hit_visibility, p, 0).x;
@@ -4024,6 +4005,18 @@ fn temporal(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id)
         sun_weight = last.short.z;
         h.x = clamp(h.x, lo, hi);
         short.x = clamp(short.x, lo, hi);
+    } else {
+        // A history begun this frame (a disocclusion, a view that turned)
+        // starts from what this frame's samples around say, worth a cycle
+        // of the pixel's own samples (as ReBLUR's history fix and SVGF's
+        // spatial estimate start short histories), not from its one sample:
+        // most often a neighbour's lent one, worth a twentieth of its own,
+        // which with nothing accumulated showed at full weight until its own
+        // samples came (a lit leaf's sample lent into a canopy's shade: the
+        // speckles after the camera moves).
+        h.x = around;
+        short.x = around;
+        sun_weight = SUN_SHORT * SUN_FRAME_WEIGHT;
     }
     // The short histories: the sun's weighted as the long one (a cycle's
     // weight), so both keep to the same mean.
@@ -4914,19 +4907,43 @@ fn cell_pair(slot: u32, c: vec3<i32>) -> u32 {
     return leaf_pair(index);
 }
 
-// The solid cell eye-relative `org` lies in or on a face of, of the chunk
-// it starts in (`start`, a chunk finer than the exact levels): its own cell
-// when solid (no walk then: the walk's first cell would end it at once),
-// else within ON_FACE of a side whose neighbour across is solid; x 64 where
-// none. Its hit pair in w (a neighbour in the chunk beside: none known, 0).
-fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
-    let none = vec4<i32>(64, 0, 0, 0);
-    if !start.real || exact_level(key_level(start.key.x)) { return none; }
-    let f = chunk_frame(start.slot);
-    let o = vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, org), dot(f.i1.xyz, org), dot(f.i2.xyz, org));
+// The solid cell eye-relative `org` lies in or on a face of, of the drawn
+// chunk holding it (`slot`, `key`; `cell` in its cells, past its sides for
+// a neighbour in the chunk beside; `pair` its hit pair, 0 for a neighbour
+// in the chunk beside: none known): its own cell when solid (no walk then:
+// the walk's first cell would end it at once), else within ON_FACE of a
+// side whose neighbour across is solid; `found` false where none. A start
+// placed in a chunk is that chunk's; at the exact levels a start is not
+// placed (`point_start`: the walk places itself), and the chunk is the
+// drawn one at the point (`place_at`, as the walk finds it), its cells the
+// grid's own (`cell_point`).
+struct SolidFace {
+    slot: u32,
+    key: vec4<i32>,
+    cell: vec3<i32>,
+    pair: u32,
+    found: bool,
+}
+
+fn on_solid_face(start: Walk, org: vec3<f32>, r: i32) -> SolidFace {
+    var out = SolidFace(start.slot, start.key, vec3<i32>(0), 0u, false);
+    if !start.real {
+        let level = key_level(start.key.x);
+        if !exact_level(level) { return out; }
+        let face = start.key.x & 7;
+        let q = exact_cell(exact_ray(org, vec3<f32>(0.0, 0.0, 1.0)), face, level, 0.0);
+        let at = place_at(face, level, vec3<i32>(floor(q)), clamp(fract(q), vec3<f32>(0.0), vec3<f32>(0.999)), r, false);
+        if at.slot == NONE { return out; }
+        out.slot = at.slot;
+        out.key = chunk_keys[at.slot];
+    }
+    let o = cell_point(out.slot, out.key, org);
     let c = vec3<i32>(floor(o));
-    if all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(63)) && solid_at(start.slot, c) {
-        return vec4<i32>(c, i32(cell_pair(start.slot, c)));
+    if all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(63)) && solid_at(out.slot, c) {
+        out.cell = c;
+        out.pair = cell_pair(out.slot, c);
+        out.found = true;
+        return out;
     }
     let into = o - vec3<f32>(c);
     for (var axis = 0u; axis < 3u; axis++) {
@@ -4939,12 +4956,69 @@ fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
             continue;
         }
         let n = c + step;
-        if solid_near(start.slot, start.key, n) {
+        if solid_near(out.slot, out.key, n) {
             let inside = all(n >= vec3<i32>(0)) && all(n <= vec3<i32>(63));
-            return vec4<i32>(clamp(n, vec3<i32>(0), vec3<i32>(63)), select(0, i32(cell_pair(start.slot, n)), inside));
+            out.cell = n;
+            out.pair = select(0u, cell_pair(out.slot, n), inside);
+            out.found = true;
+            return out;
         }
     }
-    return none;
+    return out;
+}
+
+// Whether cell `c` of chunk `slot` (key `key`; past its sides, the drawn
+// chunk's beside it at its level) lets light through: a thin two-sided
+// surface (`voxel_surface`) whose face takes from behind what reaches its
+// far side, as the pixels' sun (`shadow`) and local lights' walks
+// (`hit_walk`'s `through`) take it.
+fn lets_light_through(slot: u32, key: vec4<i32>, c: vec3<i32>) -> bool {
+    var s = slot;
+    var at = c;
+    if any(c < vec3<i32>(0)) || any(c > vec3<i32>(63)) {
+        let world = key.yzw * 64 + c;
+        let e = find_entry(vec4<i32>(key.x, world >> vec3<u32>(6u)));
+        if e == NONE { return false; }
+        let v = chunk_table[e * 2u + 1u];
+        let kind = entry_kind(v);
+        if kind == KIND_SOLID || kind == KIND_BURIED || v.x < 0 { return false; }
+        s = bitcast<u32>(v.x);
+        at = world & vec3<i32>(63);
+    }
+    return material_transmission(slot_material(shown_material(cell_pair(s, at), s, at, false))) > 0.0;
+}
+
+// Eye-relative point `p` in the cells of chunk `slot` (key `key`),
+// continuous: in its frame below the exact levels, in the grid's own cells
+// at them (`exact_cell`: the frame there only approximates the sphere's
+// cells, as `walk` crosses them).
+fn cell_point(slot: u32, key: vec4<i32>, p: vec3<f32>) -> vec3<f32> {
+    let level = key_level(key.x);
+    if exact_level(level) {
+        // At its own point a ray's direction does not matter.
+        return exact_cell(exact_ray(p, vec3<f32>(0.0, 0.0, 1.0)), key.x & 7, level, 0.0) - vec3<f32>(key.yzw * 64);
+    }
+    let f = chunk_frame(slot);
+    return vec3<f32>(f.i0.w, f.i1.w, f.i2.w) + vec3<f32>(dot(f.i0.xyz, p), dot(f.i1.xyz, p), dot(f.i2.xyz, p));
+}
+
+// Where a ray from eye-relative `org` along `dir` (the volume's frame)
+// leaves cell `c` of chunk `slot` (key `key`; `c` may lie past its sides),
+// a hundredth of a cell past its face: in the chunk's frame below the
+// exact levels, by the grid's own cell sides at them (`box_exit`).
+fn cell_exit(slot: u32, key: vec4<i32>, c: vec3<i32>, org: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let level = key_level(key.x);
+    if exact_level(level) {
+        let at = key.yzw * 64 + c;
+        let s = box_exit(exact_ray(org, dir), key.x & 7, level, at, at + vec3<i32>(1), 0.0);
+        return max(s.t1, 0.0) + 0.01 * params.planet.y * f32(1u << u32(level));
+    }
+    let f = chunk_frame(slot);
+    let o = cell_point(slot, key, org);
+    let d = vec3<f32>(dot(f.i0.xyz, dir), dot(f.i1.xyz, dir), dot(f.i2.xyz, dir));
+    let side = vec3<f32>(c) + select(vec3<f32>(0.0), vec3<f32>(1.0), d > vec3<f32>(0.0));
+    let far = select((side - o) / d, vec3<f32>(1e30), d == vec3<f32>(0.0));
+    return max(min(far.x, min(far.y, far.z)), 0.0) + 0.01 * length(f.m0.xyz);
 }
 
 // Where each ray of a nearest-hit stream starts in this volume
@@ -4955,7 +5029,8 @@ fn on_solid_face(start: Walk, org: vec3<f32>) -> vec4<i32> {
 // the old GI probe walk's (1.39 ms fused, 1.32 ms split, on 174 080 GI rays). `key`, `lo.xyz`,
 // `hi.xyz`: the walk's start (`Walk`), `lo.w` its chunk, `hi.w` what it is
 // (`START_*`); `at`: the time it starts at (bits), its hit pair, its cell
-// (6 bits an axis), and whether the walk starts in a chunk (`Walk::real`).
+// (6 bits an axis), and whether the walk starts in a chunk (`Walk::real`,
+// bit 0; THROUGH: past a cell that lets light through, from its face).
 struct RayStart {
     key: vec4<i32>,
     lo: vec4<i32>,
@@ -4978,6 +5053,9 @@ const START_FACE: i32 = 3;
 // A run's rows: its origin is outside the volume, so where each ray enters
 // it is the ray's own (`ray_enter_nearest`).
 const START_RAYS: i32 = 4;
+// `RayStart::at.w`'s bit for a walk that starts past a cell that lets light
+// through (`stream_enter`).
+const THROUGH: u32 = 2u;
 
 fn start_missed() -> RayStart {
     return RayStart(vec4<i32>(0), vec4<i32>(0), vec4<i32>(0, 0, 0, START_MISS), vec4<u32>(0u));
@@ -4996,21 +5074,45 @@ fn stream_enter(index: u32, ray: SceneRay, reach: f32) -> RayStart {
         return out;
     }
     // From the origin itself (it starts in the volume) on a solid cell's
-    // face: in the cell.
+    // face: in the cell; a cell that lets light through (`lets_light_through`)
+    // is passed, the walk starting where the ray leaves it (THROUGH).
+    var w = e.walk;
+    var start = e.t;
+    var through = 0u;
     if e.t <= 0.0 {
-        let face = on_solid_face(e.walk, org);
-        if face.x < 64 {
-            let c = vec3<u32>(face.xyz);
-            out.hi.w = START_FACE;
-            out.lo.w = i32(e.walk.slot);
-            out.at = vec4<u32>(0u, u32(face.w), c.x | (c.y << 6u) | (c.z << 12u), 0u);
-            return out;
+        let face = on_solid_face(e.walk, org, fade_dither(vec2<u32>(index & 63u, index >> 6u)));
+        if face.found {
+            if lets_light_through(face.slot, face.key, face.cell) {
+                // Placed again where the ray leaves the cell (in the chunk
+                // beside, for a cell past the start chunk's side).
+                let dir = to_local(ray.dir);
+                let past = cell_exit(face.slot, face.key, face.cell, org, dir);
+                if past >= reach { return out; }
+                let p = enter_volume(org + dir * past, dir, reach - past, fade_dither(vec2<u32>(index & 63u, index >> 6u)));
+                if p.kind == 2u { return out; }
+                if p.kind == 1u {
+                    out.at.x = bitcast<u32>(past + p.t);
+                    if past + p.t < reach { out.hi.w = START_ROCK; }
+                    out.at.y = p.rock;
+                    return out;
+                }
+                w = p.walk;
+                start = past + p.t;
+                through = THROUGH;
+            } else {
+                let c = vec3<u32>(clamp(face.cell, vec3<i32>(0), vec3<i32>(63)));
+                out.hi.w = START_FACE;
+                out.lo.w = i32(face.slot);
+                out.at = vec4<u32>(0u, face.pair, c.x | (c.y << 6u) | (c.z << 12u), 0u);
+                return out;
+            }
         }
     }
-    out.key = e.walk.key;
-    out.lo = vec4<i32>(e.walk.lo, i32(e.walk.slot));
-    out.hi = vec4<i32>(e.walk.hi, START_WALK);
-    out.at.w = u32(e.walk.real);
+    out.at.x = bitcast<u32>(start);
+    out.key = w.key;
+    out.lo = vec4<i32>(w.lo, i32(w.slot));
+    out.hi = vec4<i32>(w.hi, START_WALK);
+    out.at.w = u32(w.real) | through;
     return out;
 }
 
@@ -5030,7 +5132,7 @@ fn stream_walk(index: u32, ray: SceneRay, s: RayStart, reach: f32) -> StreamEnd 
         return StreamEnd(s.hi.w != START_MISS && t < reach, WalkEnd(true, t, slot, c, 0u, 0u, s.at.y), s.hi.w == START_FACE || t <= 0.0);
     }
     let q = vec2<u32>(index & 63u, index >> 6u);
-    let start = Walk(u32(s.lo.w), s.key, s.lo.xyz, s.hi.xyz, s.at.w != 0u);
+    let start = Walk(u32(s.lo.w), s.key, s.lo.xyz, s.hi.xyz, (s.at.w & 1u) != 0u);
     let end = walk(start, stream_origin(ray), to_local(ray.dir), t, reach, fade_dither(q), 96u, false, q);
     // Its first cell solid where it starts: from inside.
     return StreamEnd(end.hit && end.t < reach, end, end.t <= 0.0);
@@ -5193,10 +5295,14 @@ fn ray_occlusion(@builtin(global_invocation_id) id: vec3<u32>) {
     if !stream_sees(ray) || row.t > 0.0 { return; }
     // The origin camera-relative in the world's axes (the pages').
     let p = ray.origin + (ray_frame.origin_hi.xyz - ray_eye.hi.xyz) + (ray_frame.origin_lo.xyz - ray_eye.lo.xyz);
-    let paged = paged_occlusion(ray, p);
+    // A ray from a cell that lets light through starts past it: the pages
+    // answer from there too.
+    let start = stream_enter(id.x, ray, ray.t_max);
+    let past = select(0.0, bitcast<f32>(start.at.x), start.hi.w == START_WALK && (start.at.w & THROUGH) != 0u);
+    let paged = paged_occlusion(ray, p + ray.dir * past);
     var reach = ray.t_max;
-    if paged.y > 0.0 { reach = min(reach, PAGE_WALK_TEXELS * paged.y); }
-    if stream_walk(id.x, ray, stream_enter(id.x, ray, reach), reach).hit {
+    if paged.y > 0.0 { reach = min(reach, past + PAGE_WALK_TEXELS * paged.y); }
+    if stream_walk(id.x, ray, start, reach).hit {
         stream_hits[id.x] = scene_occlusion(vec3<f32>(0.0));
         return;
     }
