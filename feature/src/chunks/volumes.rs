@@ -154,7 +154,7 @@ pub(super) struct Volume {
     /// The world's height range in base layers (the roots' estimate).
     pub height_layers: (i32, i32),
     /// What its packs depend on (`kept_chunks`).
-    pub fingerprint: u64,
+    pub fingerprint: PackFingerprint,
     pub gen: std::sync::Arc<helio_core::compile::Compiling<GenPipelines>>,
     pub world: wgpu::Buffer,
     pub terrain: wgpu::Buffer,
@@ -1137,6 +1137,44 @@ pub(super) struct CrossPipelines {
     pub ground_probe: wgpu::ComputePipeline,
 }
 
+/// What a volume's packs depend on (`ChunkWorld::kept_chunks`): a hash of
+/// the generation shaders, the terrain's constants and tables, the volume
+/// layer's constants and the world. A terrain's tables are tens of megabytes
+/// (a planet's maps), so it is hashed on the thread pool from when the
+/// volume comes, not in the frame that adds it; only a save and a load of
+/// kept chunks read it, and wait the few milliseconds it may still take.
+pub(super) struct PackFingerprint(
+    std::sync::Arc<(std::sync::Mutex<Option<u64>>, std::sync::Condvar)>,
+);
+
+impl PackFingerprint {
+    /// The hash of `before`, `tables` and `after`, one after another (as of
+    /// their bytes in one run: what saved kept chunks were made with).
+    fn start(before: Vec<u8>, tables: std::sync::Arc<[u32]>, after: Vec<u8>) -> Self {
+        let shared = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let out = shared.clone();
+        rayon::spawn(move || {
+            let hash = [&before[..], bytemuck::cast_slice(&tables), &after[..]]
+                .into_iter()
+                .fold(crate::record::FNV64, crate::record::fnv64_more);
+            *out.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+            out.1.notify_all();
+        });
+        Self(shared)
+    }
+
+    /// The hash, waited for if it is not made yet.
+    pub fn get(&self) -> u64 {
+        let mut hash = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match *hash {
+                Some(hash) => return hash,
+                None => hash = self.0 .1.wait(hash).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+    }
+}
+
 /// Footprints a world of `grid` has at every level (its pool never needs
 /// more slots).
 fn footprints_of(grid: &Grid) -> u64 {
@@ -1228,13 +1266,12 @@ impl ChunkWorld {
         // (`kept_chunks`).
         let volume_constants = crate::engine::volume_constants(planet);
         let fingerprint = {
-            let mut bytes =
+            let mut before =
                 format!("chunk packs {KEPT_FORMAT} {DETAIL_LEVELS} {}", gen_source).into_bytes();
-            bytes.extend_from_slice(&terrain_bytes(&program));
-            bytes.extend_from_slice(bytemuck::cast_slice(&program.tables));
-            bytes.extend_from_slice(bytemuck::bytes_of(&volume_constants));
-            bytes.extend_from_slice(bytemuck::bytes_of(&WorldGpu::new(planet)));
-            crate::record::fnv64(&bytes)
+            before.extend_from_slice(&terrain_bytes(&program));
+            let mut after = bytemuck::bytes_of(&volume_constants).to_vec();
+            after.extend_from_slice(bytemuck::bytes_of(&WorldGpu::new(planet)));
+            PackFingerprint::start(before, program.tables.clone(), after)
         };
         let buffer = |label: &str, size: u64, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {

@@ -2349,6 +2349,16 @@ impl Worker {
         }
     }
 
+    /// A worker whose thread is gone: what a planner that panicked leaves
+    /// (tests of the world's recovery).
+    pub(super) fn gone() -> Self {
+        let (jobs, _) = std::sync::mpsc::channel();
+        let (_, results) = std::sync::mpsc::channel();
+        let mut worker = Self::over(jobs, results);
+        worker.stop();
+        worker
+    }
+
     /// Plan volume `volume` (of `grid`, its height range `range` in base
     /// layers, its edits `edits`) from the next job on.
     pub fn add_volume(
@@ -2405,12 +2415,11 @@ impl Worker {
     }
 
     /// The planners' thread is gone: said once, and busy from now on
-    /// (nothing is submitted to it).
+    /// (nothing is submitted to it; the world starts another,
+    /// `ChunkWorld::restart_planner`).
     fn stop(&mut self) {
         if !self.stopped {
-            eprintln!(
-                "VOXEL error: the residency planner stopped; the terrain keeps the detail it has and streams no more"
-            );
+            eprintln!("VOXEL error: the residency planner's thread ended");
         }
         self.stopped = true;
         self.busy = true;

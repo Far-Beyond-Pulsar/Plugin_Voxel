@@ -1810,6 +1810,11 @@ pub struct FrameTimings {
 /// walks).
 const QUERIES: u32 = 18;
 
+/// Times a world starts its planner again after its thread ended: a plan
+/// that panics on what the world holds would panic again each time, so past
+/// these the world keeps its cut and says the planner stopped.
+const MAX_PLANNER_RESTARTS: u32 = 3;
+
 /// `Buried`'s size: a count and 4095 keys.
 const BURIED_BYTES: u64 = 16 * 4096;
 
@@ -2346,6 +2351,8 @@ pub struct ChunkWorld {
     removed_drawn: Vec<NodeKey>,
     /// Every volume's planner, on its thread.
     worker: residency::Worker,
+    /// Times the planner was started again after its thread ended.
+    planner_restarts: u32,
     /// The volume generating next: volumes with work take turns.
     gen_turn: usize,
     /// What the latest plans were made for (structural events and frames of
@@ -3664,6 +3671,7 @@ impl ChunkWorld {
             unplanned: Vec::new(),
             removed_drawn: Vec::new(),
             worker: residency::Worker::spawn(),
+            planner_restarts: 0,
             gen_turn: 0,
             planned: None,
             plan_made: (0, 0.0, [0.0; 3], 0),
@@ -4703,6 +4711,76 @@ impl ChunkWorld {
         }
     }
 
+    /// A new planner after the last one's thread ended (it panicked), and
+    /// every volume handed to it as new: its chunks go back to the pool, its
+    /// nodes leave the cut and its footprints are measured again, as when a
+    /// volume is removed and added (what the lost planner knew of them
+    /// cannot be told to the new one event by event). Kept edited chunks
+    /// stay and come back by copy. The terrain streams in again from the
+    /// eye; without this it kept the cut it had and never streamed again.
+    fn restart_planner(&mut self) {
+        self.planner_restarts += 1;
+        eprintln!(
+            "VOXEL warning: the residency planner is started again ({} of {MAX_PLANNER_RESTARTS}); the terrain streams in anew",
+            self.planner_restarts
+        );
+        self.worker = residency::Worker::spawn();
+        self.planned = None;
+        self.plan_made = (0, 0.0, [0.0; 3], 0);
+        self.seen.clear();
+        self.reached.clear();
+        self.reports_unsent = 0;
+        self.quiet_from = 0;
+        let volumes: Vec<u16> = self.volumes.iter().flatten().map(|v| v.index).collect();
+        for index in volumes {
+            let keys: Vec<NodeKey> = self
+                .nodes
+                .keys()
+                .filter(|k| k.volume == index)
+                .copied()
+                .collect();
+            for key in keys {
+                if let Some(old) = self.remove_resident(key) {
+                    self.dropped.push(old.slot);
+                }
+                self.changed_nodes.insert(key);
+                self.packed_since.remove(&key);
+                self.detail_starved.remove(&key);
+            }
+            let drawn: Vec<NodeKey> = self.drawn_set.nodes_of(index);
+            self.removed_drawn.extend(drawn);
+            self.to_pack.retain(|k| k.volume != index);
+            if let Some(vol) = self.volumes[usize::from(index)].as_mut() {
+                vol.events.clear();
+                vol.plan = Default::default();
+                vol.planned_for = None;
+                vol.urgent.clear();
+                vol.urgent_distance.clear();
+                vol.stale.clear();
+                vol.edits_unsent = None;
+                vol.pool = SlotPool::new(vol.pool.len());
+                vol.pool_measured.iter_mut().for_each(|m| *m = None);
+            }
+            if !self.unplanned.contains(&index) {
+                self.unplanned.push(index);
+            }
+        }
+        self.motion_version += 1;
+    }
+
+    /// End the residency planner's thread as a panic in it would (tests of
+    /// the world's recovery).
+    #[doc(hidden)]
+    pub fn fail_planner(&mut self) {
+        self.worker = residency::Worker::gone();
+    }
+
+    /// How many times the planner was started again
+    /// ([`Self::planner_stopped`] once it no longer is).
+    pub fn planner_restarts(&self) -> u32 {
+        self.planner_restarts
+    }
+
     /// One frame of residency for an eye at world point `eye` moving at
     /// `velocity` (world) and looking along `view`, recorded into `encoder`
     /// (submit it before the next update): take back finished generation
@@ -4727,6 +4805,9 @@ impl ChunkWorld {
         }
         self.claim_timing(frame);
         self.frame_now = frame;
+        if self.worker.stopped() && self.planner_restarts < MAX_PLANNER_RESTARTS {
+            self.restart_planner();
+        }
         let mut stats = UpdateStats::default();
         // The primary volume follows the eye (`follow_eye`): in a new one,
         // foliage near the eye is placed again.
@@ -5131,8 +5212,9 @@ impl ChunkWorld {
             unseen |= vol
                 .planned_for
                 .is_none_or(|p| p.eye != local_eye || p.view != local_view);
-            // A planner that stopped takes no more events: none are kept
-            // for it (a frame's ray reports each frame, for good).
+            // A planner that stopped for good (`restart_planner` gave up)
+            // takes no more events: none are kept for it (a frame's ray
+            // reports each frame, for good).
             if self.worker.stopped() {
                 vol.events.clear();
             }
@@ -6355,7 +6437,8 @@ impl ChunkWorld {
             })
     }
 
-    /// Whether the residency planner's thread ended (it panicked): the cut
+    /// Whether the residency planner's thread ended (it panicked) and was
+    /// not started again (`MAX_PLANNER_RESTARTS` times already): the cut
     /// drawn stays as it is and nothing streams any more, said once on
     /// stderr. A host shows it, or drops this world and makes another.
     pub fn planner_stopped(&self) -> bool {
@@ -9298,7 +9381,7 @@ impl ChunkWorld {
             .collect();
         chunks.sort_unstable_by_key(|(k, ..)| (k.face, k.level, k.cx, k.cy, k.cz));
         KeptChunks {
-            fingerprint: self.volume(id).map_or(0, |v| v.fingerprint),
+            fingerprint: self.volume(id).map_or(0, |v| v.fingerprint.get()),
             history: (edits.len() as u64, edits.hash()),
             chunks,
         }
@@ -9317,7 +9400,7 @@ impl ChunkWorld {
         let Some(vol) = self.volume(id) else {
             return Err("no such volume".into());
         };
-        if kept.fingerprint != vol.fingerprint {
+        if kept.fingerprint != vol.fingerprint.get() {
             return Err("kept chunks of other generation code, terrain or world".into());
         }
         let edits = planet.edits();

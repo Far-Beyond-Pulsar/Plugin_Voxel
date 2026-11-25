@@ -7107,3 +7107,45 @@ fn load_in_from_a_new_world() {
     );
     eprintln!("LOADIN chunks resident by time (ms, chunks): {generated:?}");
 }
+
+/// A planner whose thread ends (a panic in it) is started again: the world
+/// hands it every volume as new and the view streams back in to the same
+/// hits. It used to keep the cut it had and never stream again.
+#[test]
+fn a_planner_that_dies_is_started_again_and_the_view_comes_back() {
+    let Some(gpu) = gpu() else { return };
+    let planet = Planet::new(PlanetRecipe::default()).unwrap();
+    let view = ground_view(&planet, land(&planet, 4, 0.37, 0.61), [320, 180]);
+    let mut world = World::new(gpu, &planet);
+    let before = world.settle(gpu, &planet, &view);
+    let chunks = world.chunks.chunk_count();
+    assert!(chunks > 0 && world.chunks.planner_restarts() == 0);
+
+    world.chunks.fail_planner();
+    let after = world.settle(gpu, &planet, &view);
+    assert_eq!(world.chunks.planner_restarts(), 1);
+    assert!(!world.chunks.planner_stopped());
+    let hit = before.iter().filter(|h| h.is_some()).count();
+    let same = before
+        .iter()
+        .zip(&after)
+        .filter(|(a, b)| a.is_some() && a.map(|h| h.cell) == b.map(|h| h.cell))
+        .count();
+    assert!(hit > 1000, "{hit} pixels hit");
+    assert!(
+        same * 1000 >= hit * 995,
+        "{same} of {hit} hits came back the same"
+    );
+    // And it goes on streaming: another view settles too.
+    let turned = View::new(view.eye, -view.forward, view.size);
+    world.settle(gpu, &planet, &turned);
+    assert!(world.chunks.chunk_count() > 0);
+
+    // A planner that keeps dying is given up on, and said so.
+    for _ in 0..4 {
+        world.chunks.fail_planner();
+        world.frame(gpu, &planet, &view, None);
+    }
+    assert!(world.chunks.planner_stopped());
+    assert_eq!(world.chunks.planner_restarts(), 3);
+}

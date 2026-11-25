@@ -20,7 +20,16 @@ pub fn recipe_fingerprint(recipe: &PlanetRecipe) -> u64 {
 
 /// FNV-1a of `bytes`: the fingerprints of recipes, sources and saved chunks.
 pub fn fnv64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+    fnv64_more(FNV64, bytes)
+}
+
+/// [`fnv64`] of no bytes: where a hash made in parts starts.
+pub const FNV64: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// `hash` (of the bytes so far) continued over `bytes`: the parts of a run
+/// hashed one after another give [`fnv64`] of the run.
+pub fn fnv64_more(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
@@ -116,6 +125,21 @@ mod tests {
             op: BrushOp::Add,
             material: 7,
             height: 2.5,
+        }
+    }
+
+    /// A hash made in parts is the hash of the parts' bytes in one run
+    /// (what a volume's pack fingerprint relies on to stay what saves hold).
+    #[test]
+    fn a_hash_in_parts_is_the_hash_of_the_run() {
+        let bytes: Vec<u8> = (0..10_000u32).map(|n| (n * 31 + 7) as u8).collect();
+        for cuts in [[0, 0], [1, 9_999], [4_096, 4_097], [10_000, 10_000]] {
+            let parts = [
+                &bytes[..cuts[0]],
+                &bytes[cuts[0]..cuts[1]],
+                &bytes[cuts[1]..],
+            ];
+            assert_eq!(parts.into_iter().fold(FNV64, fnv64_more), fnv64(&bytes));
         }
     }
 
