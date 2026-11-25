@@ -490,10 +490,53 @@ What is left is known and not this crate's alone:
   the voxel bundles wait behind every other feature's, and other long tasks
   behind them. More workers, or compile jobs on a pool of their own, is the
   host's to decide.
-- Adding a volume costs the frame 30 to 68 ms once (`ChunkWorld::add_volume`:
-  the pack fingerprint hashes the terrain's 23.5 MB table byte by byte, on
-  the frame thread). Not changed: the hash is what saved kept chunks are
-  matched by, so it has to be made the same, off the frame.
+
+### In the editor (measured 2026-11-25)
+
+The editor itself, release, with the voxel plugin as its own library, opening
+a project whose level is an Earth-sized voxel planet (the task queue's own
+log lines and `PULSAR_VOXEL_STATS`; seconds from "Opening project"; two runs
+each, interleaved, the plugin's library at `90f4944` and at this change):
+
+| | Before | After |
+|---|---|---|
+| The CPU world built (planet maps cached after the first run: 1.96 s, then 0.08 s) | 3.5 s | 3.5 s |
+| The volume reaches the voxel pass (the renderer is up) | 15.8 s, 16.5 s | 15.5 s, 15.9 s |
+| Draw pipelines built in | 15.2 s, 15.2 s | 2.7 s, 2.8 s |
+| Generation pipelines waited for a worker, then built in | 12.3 s + 17.7 s, 12.4 s + 17.7 s | 2.9 s + 5.9 s, 3.0 s + 5.7 s |
+| First chunk drawn | 46.2 s, 46.8 s | 24.6 s, 25.1 s |
+| View settled (14 400 chunks drawn) | 48.2 s, 48.8 s | 26.6 s, 27.1 s |
+| Longest UI-thread hold while loading | 203 ms, 221 ms | 221 ms, 241 ms |
+
+The UI holds are the editor's own, 2.5 s after the project opens ("effects
+(observers, subscriptions, notifications)"), before any voxel work; no hold
+of 50 ms or more was logged while the terrain compiled or streamed in, before
+or after. The voxel plugin publishes nothing to the UI per chunk or per
+frame: the scene changes once when a terrain gets its runtime and once per
+edit's block events.
+
+What the remaining 25 s are, in order: 15.5 s until the renderer exists and
+takes the volume (not voxel work); then the draw bundle (2.8 s) and the
+generation bundle (5.7 s) one after the other on one long-task worker, as the
+other is held for 12.5 s by "Rebuild render pipeline
+plugins/Default Pipelines/default/Deferred.rendergraph"; then 2 s of
+generation. Two things would take most of the 9 s off, neither in this
+plugin: a third long-task worker (or compiles on a pool of their own), and
+starting the voxel bundles when the world is built (3.5 s) rather than when
+the pass first sees it, which needs a device handed to the plugin before the
+renderer is up.
+
+The 3.1 s and 0.75 s main-thread stalls seen in earlier recordings were
+inside `ui_core::app::nav_sidebar::NavSidebar`'s render while "Helio: rebuild
+graph" ran for 12.3 s on the Helio Runtimes thread, in the same interval:
+the sidebar waits on the renderer there, not on voxels (the voxel passes
+build no pipeline with the graph). That graph rebuild now runs as the
+long task above.
+
+The packaged game was not measured: the one at hand has no voxel terrain in
+its level, and packaging another needs the editor's Build & Run driven
+through its MCP server, whose endpoint file a second editor would have taken
+from the session using it.
 
 ### World queries on the CPU
 
@@ -527,32 +570,44 @@ evaluation.
 - A world build that panics is that terrain's error (the world shown stays,
   the builder takes the next request); a builder that is gone is said so. The
   terrain no longer stays "building" for good.
-- A residency planner thread that is gone is said once (stderr) and
-  `ChunkWorld::planner_stopped` answers true; the world keeps no events for
-  it (it kept a frame's ray reports each frame). The cut drawn stays; the
-  world is not rebuilt by itself: a host that wants it back drops it.
+- A residency planner thread that is gone is said once (stderr) and started
+  again, three times at most, every volume handed to the new one as new;
+  past that `ChunkWorld::planner_stopped` answers true and the world keeps
+  no events for it (it kept a frame's ray reports each frame).
 - A thread that panics holding one of a world's caches does not take the
   world's queries with it.
 - An edit snapshot whose checksum holds but whose bricks name a level or face
   the grid lacks, or whose bounds are not numbers, is refused.
 
+### Since the first round
+
+- A volume's pack fingerprint is hashed on the thread pool, not in the frame
+  that adds the volume: making Earth's world on the frame thread 61.7 to
+  68.1 ms, now 36.5 to 39.6 ms (buffers and the tables' upload are the rest).
+- `WorldQueries::focus` only says where a focus is; a worker lists its
+  bricks, and the workers take wanted bricks from a queue sorted by distance.
+  `focus()` 2.8 to 4.5 ms on the caller, now 0.01 ms; a 16 m focus (6609
+  bricks) on 2 workers 1390 ms, now 1087 to 1129 ms (what sampling costs), on
+  8 workers 743 ms, now 392 ms; the asking thread's longest wait 0.43 to
+  4.0 ms, now 0.13 to 0.58 ms.
+- `raycast_distance` reads the resident bricks when they hold exactly the
+  world shown; `cast_ray` and `ray_distance` ask a ray of the query workers
+  and collect its answer, for rays long enough to matter on a frame.
+- A planner whose thread ends is started again (three times at most) and
+  the view streams back in to the same hits; only then is it given up on.
+
 ### Open, with numbers
 
-- `WorldQueries::focus` lists its region on the thread that calls it, under
-  the queries' state lock: 2.8 to 4.5 ms each time a 16 m focus moves half a
-  brick (0.8 m), on a game's frame. The workers then take the nearest wanted
-  brick by scanning every wanted one, under the same lock: 6609 bricks load
-  in 1.39 s on 2 workers (0.21 ms a brick, where sampling one costs 0.06 ms
-  without features) and only 1.9 times sooner on 8, while the asking
-  thread's calls wait up to 4 ms. The design that removes both: the region
-  listed by a worker, and the wanted bricks kept as a list sorted by distance
-  when a focus moves, not searched per job.
+- A cold start is bounded by a bundle's longest kernel and by the host's two
+  long-task workers (see "In the editor").
+- `Planet::raycast` and the other direct queries still walk on the calling
+  thread when a ray leaves the resident bricks (a 100 m ray over new ground
+  10 ms): `raycast_distance` cannot give half an answer, so long rays are
+  `cast_ray`'s.
 - The component's edit journal lists every edit since the last editor save
   (64 bytes each): a game that edits for hours never folds it. The builder
   thread could keep a snapshot of its world every few thousand edits and
   hand the journal a base, as a save does.
 - Kept chunks are checked by checksum, fingerprint and history, not by
   structure: a pack is copied to the GPU as it is.
-- `Planet::raycast` and the other direct queries walk on the calling thread
-  whatever the length (a 100 m ray over new ground 10 ms): scripts that cast
-  far should use the query workers (`WorldQueries::ask`).
+- The packaged game's load-in is not measured (see "In the editor").
